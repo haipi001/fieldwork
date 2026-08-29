@@ -179,6 +179,11 @@ def init_final_db() -> None:
               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, label TEXT NOT NULL,
               role TEXT NOT NULL, tenant TEXT, credential_ref TEXT, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS identity_profiles (
+              identity_id TEXT PRIMARY KEY, auth_type TEXT NOT NULL,
+              session_status TEXT NOT NULL, expires_at TEXT, last_validated_at TEXT,
+              notes TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS coverage_v2 (
               id TEXT PRIMARY KEY, run_id TEXT NOT NULL, surface_key TEXT NOT NULL,
               state TEXT NOT NULL, reason TEXT NOT NULL, observation_ids TEXT NOT NULL,
@@ -285,10 +290,25 @@ class Web3ExecutionCheck(BaseModel):
 
 
 class IdentityInput(BaseModel):
-    label: str
-    role: str
+    label: str = Field(min_length=1, max_length=120)
+    role: str = Field(min_length=1, max_length=80)
     tenant: str | None = None
     credential_ref: str | None = None
+    auth_type: Literal["cookie", "bearer", "basic", "oauth", "totp", "keychain_reference", "none"] = "none"
+    session_status: Literal["ready", "needs_login", "expired", "disabled"] = "needs_login"
+    expires_at: str | None = None
+    notes: str = Field(default="", max_length=1000)
+
+
+class IdentityUpdateInput(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=120)
+    role: str | None = Field(default=None, min_length=1, max_length=80)
+    tenant: str | None = None
+    credential_ref: str | None = None
+    auth_type: Literal["cookie", "bearer", "basic", "oauth", "totp", "keychain_reference", "none"] | None = None
+    session_status: Literal["ready", "needs_login", "expired", "disabled"] | None = None
+    expires_at: str | None = None
+    notes: str | None = Field(default=None, max_length=1000)
 
 
 class CandidateInput(BaseModel):
@@ -1402,7 +1422,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
     backup_path.chmod(0o600)
     tables = (
         "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
-        "graveyard", "coverage_v2", "identities", "program_snapshots", "submission_packages_v2",
+        "graveyard", "coverage_v2", "identity_profiles", "identities", "program_snapshots", "submission_packages_v2",
         "report_previews", "canonical_findings", "verification_attempts", "candidate_findings",
         "relationships", "entities", "evidence_v2", "artifacts", "observations", "checkpoints",
         "run_events_v2", "analysis_runs", "execution_policies", "scope_snapshots", "engagements_v2", "target_specs",
@@ -1460,11 +1480,76 @@ def create_identity(engagement_id: str, body: IdentityInput):
     get_engagement(engagement_id)
     identity_id = uid("identity")
     # credential_ref is an opaque local reference; raw credentials are never accepted here.
-    if body.credential_ref and any(x in body.credential_ref.lower() for x in ("bearer ", "password=", "private_key=")):
+    if body.credential_ref and any(x in body.credential_ref.lower() for x in ("bearer ", "password=", "private_key=", "cookie:", "token=")):
         raise HTTPException(422, "credential_ref 必须是脱敏引用，不能包含凭据原文")
     with connect() as db:
         db.execute("INSERT INTO identities VALUES(?,?,?,?,?,?,?)", (identity_id, engagement_id, body.label, body.role, body.tenant, body.credential_ref, utcnow()))
-    return {"id": identity_id, "engagement_id": engagement_id, **body.model_dump()}
+        db.execute("INSERT INTO identity_profiles VALUES(?,?,?,?,?,?,?)", (identity_id, body.auth_type, body.session_status, body.expires_at, None, body.notes, utcnow()))
+    return get_identity(identity_id)
+
+
+def get_identity(identity_id: str) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute("""SELECT i.*,p.auth_type,p.session_status,p.expires_at,p.last_validated_at,p.notes,p.updated_at
+          FROM identities i JOIN identity_profiles p ON p.identity_id=i.id WHERE i.id=?""", (identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "测试身份不存在")
+    value = dict(row)
+    value["credential_configured"] = bool(value.pop("credential_ref", None))
+    return value
+
+
+@router.get("/engagements/{engagement_id}/identities")
+def list_identities(engagement_id: str):
+    get_engagement(engagement_id)
+    with connect() as db:
+        ids = [row["id"] for row in db.execute("SELECT id FROM identities WHERE engagement_id=? ORDER BY created_at", (engagement_id,))]
+    return [get_identity(identity_id) for identity_id in ids]
+
+
+@router.patch("/identities/{identity_id}")
+def update_identity(identity_id: str, body: IdentityUpdateInput):
+    current = get_identity(identity_id)
+    values = body.model_dump(exclude_unset=True)
+    if values.get("credential_ref") and any(x in values["credential_ref"].lower() for x in ("bearer ", "password=", "private_key=", "cookie:", "token=")):
+        raise HTTPException(422, "credential_ref 必须是脱敏引用，不能包含凭据原文")
+    base = {key: values[key] for key in ("label", "role", "tenant", "credential_ref") if key in values}
+    profile = {key: values[key] for key in ("auth_type", "session_status", "expires_at", "notes") if key in values}
+    with connect() as db:
+        if base:
+            db.execute(f"UPDATE identities SET {','.join(f'{key}=?' for key in base)} WHERE id=?", (*base.values(), identity_id))
+        if profile:
+            profile["updated_at"] = utcnow()
+            if profile.get("session_status") == "ready":
+                profile["last_validated_at"] = utcnow()
+            db.execute(f"UPDATE identity_profiles SET {','.join(f'{key}=?' for key in profile)} WHERE identity_id=?", (*profile.values(), identity_id))
+    return get_identity(identity_id)
+
+
+@router.delete("/identities/{identity_id}")
+def delete_identity(identity_id: str):
+    get_identity(identity_id)
+    with connect() as db:
+        db.execute("DELETE FROM identity_profiles WHERE identity_id=?", (identity_id,))
+        db.execute("DELETE FROM identities WHERE id=?", (identity_id,))
+    return {"id": identity_id, "status": "deleted"}
+
+
+@router.get("/engagements/{engagement_id}/role-matrix")
+def role_matrix(engagement_id: str):
+    identities = list_identities(engagement_id)
+    pairs = []
+    for left in identities:
+        for right in identities:
+            if left["id"] >= right["id"]:
+                continue
+            pairs.append({
+                "left_id": left["id"], "right_id": right["id"],
+                "cross_role": left["role"] != right["role"],
+                "cross_tenant": bool(left.get("tenant") and right.get("tenant") and left["tenant"] != right["tenant"]),
+                "ready": left["session_status"] == right["session_status"] == "ready",
+            })
+    return {"engagement_id": engagement_id, "identities": identities, "pairs": pairs, "ready_pairs": sum(1 for pair in pairs if pair["ready"])}
 
 
 @router.post("/program-snapshots", status_code=201)

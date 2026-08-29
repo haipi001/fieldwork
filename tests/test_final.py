@@ -63,6 +63,42 @@ def test_traditional_local_and_git_repository_targets_keep_repository_identity(c
     assert remote.json()["normalized_target"].endswith("/acme/project.git")
 
 
+def test_identity_workspace_crud_and_role_matrix_never_echoes_credentials(client):
+    engagement = create_ready(client, target="https://roles.test")
+    first = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+        "label": "Tenant A admin", "role": "admin", "tenant": "tenant-a",
+        "credential_ref": "keychain://fieldwork/tenant-a-admin",
+        "auth_type": "keychain_reference", "session_status": "ready",
+    })
+    second = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+        "label": "Tenant B viewer", "role": "viewer", "tenant": "tenant-b",
+        "auth_type": "cookie", "session_status": "needs_login",
+    })
+    assert first.status_code == second.status_code == 201
+    assert first.json()["credential_configured"] is True
+    assert "credential_ref" not in first.json()
+
+    matrix = client.get(f"/api/v1/engagements/{engagement['id']}/role-matrix").json()
+    assert len(matrix["identities"]) == 2
+    assert len(matrix["pairs"]) == 1
+    assert {matrix["pairs"][0]["left_id"], matrix["pairs"][0]["right_id"]} == {first.json()["id"], second.json()["id"]}
+    assert matrix["pairs"][0] | {"left_id": "", "right_id": ""} == {
+        "left_id": "", "right_id": "", "cross_role": True, "cross_tenant": True, "ready": False,
+    }
+    assert matrix["ready_pairs"] == 0
+
+    updated = client.patch(f"/api/v1/identities/{second.json()['id']}", json={"session_status": "ready"})
+    assert updated.status_code == 200 and updated.json()["last_validated_at"]
+    assert client.get(f"/api/v1/engagements/{engagement['id']}/role-matrix").json()["ready_pairs"] == 1
+    assert client.delete(f"/api/v1/identities/{second.json()['id']}").status_code == 200
+    assert len(client.get(f"/api/v1/engagements/{engagement['id']}/identities").json()) == 1
+
+    secret = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+        "label": "Unsafe", "role": "admin", "credential_ref": "password=plain-text",
+    })
+    assert secret.status_code == 422
+
+
 def test_scope_required_and_run_checkpoints(client):
     draft = client.post("/api/v1/engagements", json={"name": "Draft target", "target": "https://draft.test", "mode": "traditional"}).json()
     denied = client.post(f"/api/v1/engagements/{draft['id']}/start")

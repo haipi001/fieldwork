@@ -1,0 +1,20 @@
+(() => {
+  const dialog = document.createElement('dialog');
+  dialog.id = 'identityDialog';
+  dialog.className = 'identity-dialog';
+  dialog.innerHTML = `<div class="identity-shell"><header><div><p class="eyebrow">ROLE & TENANT MATRIX</p><h2>测试账号工作台</h2><p>这里只保存脱敏凭据引用，不接收 Cookie、Token 或密码原文。</p></div><button class="close-button" aria-label="关闭">×</button></header><section id="identityMatrix" class="identity-matrix"></section><form id="identityForm" class="identity-form"><input type="hidden" id="identityEngagement"><label>账号名称<input id="identityLabel" required placeholder="例如：Tenant A 普通用户"></label><label>角色<input id="identityRole" required placeholder="guest / user / admin"></label><label>租户<input id="identityTenant" placeholder="tenant-a"></label><label>认证类型<select id="identityAuth"><option value="none">未配置</option><option value="cookie">Cookie</option><option value="bearer">Bearer Token</option><option value="basic">Basic Auth</option><option value="oauth">OAuth</option><option value="totp">TOTP</option><option value="keychain_reference">macOS Keychain 引用</option></select></label><label>凭据引用<input id="identityCredentialRef" placeholder="keychain://fieldwork/account-a"><small>只填写引用名称，不要粘贴真实凭据。</small></label><label>会话状态<select id="identityStatus"><option value="needs_login">需要登录</option><option value="ready">已验证可用</option><option value="expired">已失效</option><option value="disabled">停用</option></select></label><label class="wide">备注<input id="identityNotes" placeholder="测试权限、账号限制或刷新说明"></label><button class="primary-action compact" type="submit"><span>添加测试身份</span><b>→</b></button></form></div>`;
+  document.body.append(dialog);
+  let engagementId = null;
+
+  async function render() {
+    const matrix = await api(`/api/v1/engagements/${engagementId}/role-matrix`);
+    $('#identityMatrix').innerHTML = matrix.identities.length ? `<div class="identity-summary"><b>${matrix.identities.length} 个身份</b><span>${matrix.ready_pairs}/${matrix.pairs.length} 个角色组合可测试</span></div>${matrix.identities.map(item => `<article><div><strong>${esc(item.label)}</strong><p>${esc(item.role)} · ${esc(item.tenant || '无租户')} · ${esc(item.auth_type)}</p><small>${item.credential_configured ? '凭据引用已配置' : '未配置凭据引用'}</small></div><select data-identity-status="${esc(item.id)}"><option value="ready" ${item.session_status==='ready'?'selected':''}>已验证可用</option><option value="needs_login" ${item.session_status==='needs_login'?'selected':''}>需要登录</option><option value="expired" ${item.session_status==='expired'?'selected':''}>已失效</option><option value="disabled" ${item.session_status==='disabled'?'selected':''}>停用</option></select><button class="text-action danger-text" data-delete-identity="${esc(item.id)}">删除</button></article>`).join('')}` : '<div class="empty-state">还没有测试身份。至少添加两个不同角色或租户，才能进行权限差异测试。</div>';
+    $$('[data-identity-status]').forEach(select => select.onchange = async () => { await api(`/api/v1/identities/${select.dataset.identityStatus}`, {method:'PATCH', body:JSON.stringify({session_status:select.value})}); await render(); });
+    $$('[data-delete-identity]').forEach(button => button.onclick = async () => { if (!confirm('删除这个测试身份？不会删除外部账号。')) return; await api(`/api/v1/identities/${button.dataset.deleteIdentity}`, {method:'DELETE'}); await render(); });
+  }
+
+  window.openIdentityWorkspace = async id => { engagementId=id; $('#identityEngagement').value=id; dialog.showModal(); try { await render(); } catch (error) { toast(error.message); } };
+  dialog.querySelector('.close-button').onclick = () => dialog.close();
+  $('#identityForm').onsubmit = async event => { event.preventDefault(); try { await api(`/api/v1/engagements/${engagementId}/identities`, {method:'POST', body:JSON.stringify({label:$('#identityLabel').value.trim(),role:$('#identityRole').value.trim(),tenant:$('#identityTenant').value.trim()||null,auth_type:$('#identityAuth').value,credential_ref:$('#identityCredentialRef').value.trim()||null,session_status:$('#identityStatus').value,notes:$('#identityNotes').value.trim()})}); event.target.reset(); await render(); toast('测试身份已加入角色矩阵'); } catch (error) { toast(error.message); } };
+})();
+

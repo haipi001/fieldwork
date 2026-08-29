@@ -48,7 +48,7 @@
       <section class="status-cell"><small>Native Agent</small><strong>${health(agent.ready, agent.available)}${agent.ready ? 'Ready' : agent.available ? '等待模型' : '不可用'}</strong><p>系统 Chrome · ${agent.safety === 'read_only_navigation_scope_budget_guarded' ? '全请求受控' : '状态未知'}</p></section>
       <section class="status-cell"><small>模型连接</small><strong>${health(provider.connected, provider.configured)}${provider.connected ? '已连接' : provider.configured ? '连接失败' : '未配置'}</strong><p>${esc(provider.model || '填写模型 ID')}${provider.endpoint ? ` · ${esc(provider.endpoint)}` : ''}</p></section>
       <section class="status-cell"><small>外部网络</small><strong>${health(status.network.connected)}${status.network.connected ? 'Online' : 'Offline'}</strong><p>${status.network.latency_ms == null ? '连接不可用' : `${status.network.latency_ms} ms · 仅授权目标`}</p></section>
-      <section class="status-cell"><small>本地存储</small><strong>${health(status.storage.free_percent > 5)}${bytes(status.storage.free_bytes)}</strong><p>${status.storage.free_percent}% 可用 · Docker ${status.docker.running ? '运行中' : status.docker.installed ? '未启动' : '未安装'}</p></section>`;
+      <section class="status-cell"><small>本地存储</small><strong>${health(status.storage.free_bytes >= 10737418240)}${bytes(status.storage.free_bytes)}</strong><p>${status.storage.free_percent}% 可用 · Docker ${status.docker.running ? '运行中' : status.docker.installed ? '未启动' : '未安装'}</p></section>`;
   }
 
   function conditionsFor(tool) {

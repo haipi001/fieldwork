@@ -21,12 +21,25 @@ from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, StreamingResponse
 from reporting import export_bundle, redact, render, universal_model
 from capability_registry import inventory as capability_inventory
+from lifecycle import database_integrity, list_backups
+from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "data" / "src_control.db"
 LOCAL_DATA_ROOT = ROOT / "data"
 router = APIRouter(prefix="/api/v1", tags=["FINAL v1"])
+
+
+@router.get("/system/version")
+def system_version():
+    return {
+        "app_version": APP_VERSION,
+        "build_number": BUILD_NUMBER,
+        "schema_version": SCHEMA_VERSION,
+        "database_integrity": database_integrity(DB),
+        "backups": len([item for item in list_backups(LOCAL_DATA_ROOT / "backups") if item["valid"]]),
+    }
 
 
 def utcnow() -> str:
@@ -1227,7 +1240,7 @@ def runtime_readiness():
     items = capabilities()
     by_id = {item["id"]: item for item in items}
     traditional_core = ["httpx", "katana", "nuclei", "semgrep", "gitleaks", "trivy"]
-    web3_core = ["forge", "anvil", "cast", "slither", "echidna", "medusa"]
+    web3_core = ["forge", "anvil", "cast", "slither", "aderyn", "echidna", "medusa", "halmos"]
     required = list(dict.fromkeys([*traditional_core, *web3_core]))
     available = [name for name in required if by_id.get(name, {}).get("available")]
     from native_agent import readiness as native_agent_readiness
@@ -1294,6 +1307,53 @@ def runtime_status():
         "docker": {"installed": bool(docker_path), "running": docker_running, "required": False},
         "storage": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free / usage.total * 100, 1)},
     }
+
+
+def onboarding_checks(run_fixture_tests: bool = False) -> dict[str, Any]:
+    readiness = runtime_readiness()
+    status = runtime_status()
+    version = system_version()
+    chrome = status["native_agent"].get("available", False)
+    traditional_fixture = ROOT / "fixtures" / "traditional-vulnerable"
+    web3_fixture = ROOT / "fixtures" / "web3-vault"
+    fixture = {
+        "traditional": {"available": traditional_fixture.is_dir() and (traditional_fixture / ".semgrep.yml").is_file(), "tested": False, "detail": "夹具与规则文件已找到"},
+        "web3": {"available": web3_fixture.is_dir() and (web3_fixture / "foundry.toml").is_file(), "tested": False, "detail": "Foundry 测试夹具已找到"},
+    }
+    if run_fixture_tests:
+        import capability_registry
+        from web3_analysis import run_forge_build
+        if fixture["traditional"]["available"]:
+            result = capability_registry.execute(
+                "semgrep", ["scan", "--json", "--config", str(traditional_fixture / ".semgrep.yml"), str(traditional_fixture)], ROOT, timeout=60,
+            )
+            fixture["traditional"].update({"tested": result.status == "completed", "detail": f"Semgrep 本地夹具 exit={result.exit_code}"})
+        if fixture["web3"]["available"]:
+            result = run_forge_build(web3_fixture)
+            fixture["web3"].update({"tested": result.get("status") == "compiled", "detail": f"Forge 本地夹具 {result.get('status')}"})
+    checks = [
+        {"id": "tools", "label": "工具版本", "required": True, "ok": readiness["ready"], "detail": f"{readiness['available_core']}/{readiness['required_core']} 原生核心工具"},
+        {"id": "model", "label": "模型连接", "required": True, "ok": bool(status["provider"]["connected"]), "detail": "Provider 已连接" if status["provider"]["connected"] else "请在设置页配置并验证模型 API"},
+        {"id": "chrome", "label": "系统 Chrome", "required": True, "ok": bool(chrome), "detail": status["native_agent"].get("browser", "missing")},
+        {"id": "storage", "label": "磁盘空间", "required": True, "ok": status["storage"]["free_bytes"] >= 10 * 1024**3, "detail": f"剩余 {status['storage']['free_bytes'] / 1024**3:.1f} GB（{status['storage']['free_percent']}%）"},
+        {"id": "traditional", "label": "Traditional 能力", "required": True, "ok": all(readiness["traditional"].values()), "detail": "6 项本机能力"},
+        {"id": "web3", "label": "Web3 能力", "required": True, "ok": all(readiness["web3"].values()), "detail": "8 项本机能力"},
+        {"id": "database", "label": "本地数据库", "required": True, "ok": version["database_integrity"], "detail": f"Schema {version['schema_version']} · {version['backups']} 个可恢复备份"},
+        {"id": "fixture_traditional", "label": "Traditional 测试项目", "required": True, "ok": fixture["traditional"]["tested"] if run_fixture_tests else fixture["traditional"]["available"], "detail": fixture["traditional"]["detail"]},
+        {"id": "fixture_web3", "label": "Web3 测试项目", "required": True, "ok": fixture["web3"]["tested"] if run_fixture_tests else fixture["web3"]["available"], "detail": fixture["web3"]["detail"]},
+    ]
+    blockers = [item for item in checks if item["required"] and not item["ok"]]
+    return {"ready": not blockers, "checks": checks, "blockers": blockers, "self_tested": run_fixture_tests, "version": version}
+
+
+@router.get("/onboarding/status")
+def onboarding_status():
+    return onboarding_checks(False)
+
+
+@router.post("/onboarding/self-test")
+def onboarding_self_test():
+    return onboarding_checks(True)
 
 
 def _directory_usage(path: Path) -> tuple[int, int]:

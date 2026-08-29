@@ -389,7 +389,7 @@ def test_capability_registry_is_truthful_and_versioned(client):
 
     readiness = client.get("/api/v1/runtime/readiness").json()
     assert readiness["backend"] == "local_native" and readiness["docker_required"] is False
-    assert readiness["required_core"] == 12
+    assert readiness["required_core"] == 14
     assert set(readiness["optional_docker_agents"]) == {"strix", "shannon"}
     assert readiness["native_agent"]["requires_docker"] is False
     assert readiness["native_agent"]["execution_backend"] == "local_native"
@@ -647,8 +647,14 @@ def test_real_mode_starts_non_synthetic_toolchain(client, monkeypatch):
     started = client.post(f"/api/v1/engagements/{ready['id']}/start", json={"execution_mode": "real", "include_recon": True})
     assert started.status_code == 202 and started.json()["synthetic"] is False
     import time
-    time.sleep(.2)
-    run = client.get(f"/api/v1/runs/{started.json()['id']}").json()
+    deadline = time.monotonic() + 3
+    while True:
+        run = client.get(f"/api/v1/runs/{started.json()['id']}").json()
+        if any(event["kind"] == "run.completed" for event in run["events"]):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(.05)
     assert run["synthetic"] is False
     assert any(event["kind"] == "capability.degraded" for event in run["events"])
     assert any(event["kind"] == "run.completed" and event["payload"].get("synthetic") is False for event in run["events"])

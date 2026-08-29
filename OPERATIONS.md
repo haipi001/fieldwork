@@ -30,6 +30,14 @@ cp data/src_control.db data/src_control.backup.db
 
 恢复前先保留当前数据库副本，再替换目标文件。报告 ZIP 和 Artifact 目录应与数据库一并备份。
 
+每次数据库 Schema 升级前，应用会先在 `data/backups/` 使用 SQLite Backup API 创建权限 `600` 的一致性备份，并保存 SHA-256、应用版本、Schema 版本和 Git commit 清单。快速回滚到最近一个已校验版本：
+
+```bash
+./scripts/rollback_last_version.sh
+```
+
+回滚在存在运行/暂停任务、备份校验失败或 Git 工作区有未提交修改时拒绝执行；执行前还会创建一份 `pre-rollback-safety` 安全备份。
+
 ## Web3 local fork
 
 Forge/Anvil 安装于 `~/.foundry/bin` 时会被自动探测。系统创建本地上游链和真实 Anvil fork；写入只发生在 fork RPC。生产网、公共测试网写入以及真实私钥都会被拒绝。

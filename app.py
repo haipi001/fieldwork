@@ -26,6 +26,8 @@ from web3_lab import router as web3_router, shutdown_labs
 from web3_analysis import router as web3_analysis_router
 from traditional_runtime import router as traditional_router
 from traditional_tools import router as traditional_tools_router
+from lifecycle import finalize_database_version, prepare_database_upgrade
+from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -165,13 +167,15 @@ def init_db() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    prepare_database_upgrade(DB, DATA / "backups", ROOT)
     init_db()
     init_final_db()
+    finalize_database_version(DB)
     yield
     shutdown_labs()
 
 
-app = FastAPI(title="Security Research OS", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Security Research OS", version=APP_VERSION, lifespan=lifespan)
 app.include_router(final_router)
 app.include_router(web3_router)
 app.include_router(web3_analysis_router)

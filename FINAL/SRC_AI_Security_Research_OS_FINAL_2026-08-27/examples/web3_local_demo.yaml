@@ -1,0 +1,24 @@
+name: local-web3-demo
+mode: web3
+target:
+  kind: local_project
+  value: ./fixtures/demo-vault
+
+scope:
+  repositories:
+    - ./fixtures/demo-vault
+
+execution:
+  production_network:
+    write: deny
+  public_testnet:
+    write: deny
+  local_fork:
+    write: allow
+  local_devnet:
+    write: allow
+  real_private_keys: deny
+
+report:
+  platform: immunefi
+  auto_submit: false

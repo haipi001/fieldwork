@@ -1,0 +1,113 @@
+openapi: 3.1.0
+info:
+  title: Security Research OS API
+  version: 1.0.0
+paths:
+  /api/v1/targets/resolve:
+    post:
+      summary: Resolve and classify a target
+      responses:
+        "200": { description: Resolved target }
+
+  /api/v1/engagements:
+    post:
+      summary: Create scoped engagement
+      responses:
+        "201": { description: Created }
+
+  /api/v1/engagements/{id}/start:
+    post:
+      summary: Start analysis run
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "202": { description: Started }
+
+  /api/v1/runs/{id}:
+    get:
+      summary: Run state/timeline
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/v1/runs/{id}/events:
+    get:
+      summary: SSE/WebSocket-compatible event source contract
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Event stream }
+
+  /api/v1/findings:
+    get:
+      summary: List canonical findings
+      responses:
+        "200": { description: OK }
+
+  /api/v1/findings/{id}:
+    get:
+      summary: Get canonical finding and evidence pointers
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/v1/findings/{id}/verify:
+    post:
+      summary: Re-run verification within policy
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "202": { description: Queued }
+
+  /api/v1/findings/{id}/reports/{platform}/preview:
+    post:
+      summary: Render report preview and completeness
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: platform
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Preview }
+
+  /api/v1/findings/{id}/reports/{platform}/export:
+    post:
+      summary: Export submission package; no external submission
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: platform
+          required: true
+          schema: { type: string }
+      responses:
+        "202": { description: Export queued }
+
+  /api/v1/capabilities:
+    get:
+      summary: Installed/available capabilities
+      responses:
+        "200": { description: OK }

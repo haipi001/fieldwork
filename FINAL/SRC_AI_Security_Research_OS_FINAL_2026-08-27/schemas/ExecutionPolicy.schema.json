@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ExecutionPolicy.schema.json",
+  "title": "ExecutionPolicy",
+  "type": "object",
+  "required": [
+    "active_testing",
+    "rate_limit",
+    "network"
+  ],
+  "properties": {
+    "active_testing": {
+      "type": "boolean"
+    },
+    "rate_limit": {
+      "type": "object"
+    },
+    "network": {
+      "type": "object",
+      "properties": {
+        "production_write": {
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        },
+        "public_testnet_write": {
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        },
+        "local_fork_write": {
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        }
+      }
+    },
+    "denied_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "approval_required_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "SubmissionPackage.schema.json",
+  "title": "SubmissionPackage",
+  "type": "object",
+  "required": [
+    "finding_id",
+    "platform",
+    "generated_at",
+    "files",
+    "completeness"
+  ],
+  "properties": {
+    "finding_id": {
+      "type": "string"
+    },
+    "platform": {
+      "enum": [
+        "generic_src",
+        "cn_src_generic",
+        "hackerone",
+        "bugcrowd",
+        "intigriti",
+        "immunefi",
+        "markdown",
+        "html",
+        "json",
+        "sarif"
+      ]
+    },
+    "program_snapshot_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "completeness": {
+      "type": "object"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

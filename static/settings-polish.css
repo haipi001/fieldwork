@@ -1,0 +1,4 @@
+.workspace[data-workspace="settings"] .tool-grid{gap:0;background:transparent}
+.workspace[data-workspace="settings"] .tool-card{border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+
+.web3-launch-config{border:1px solid var(--ink);padding:20px;display:grid;grid-template-columns:1.5fr 1fr 1fr;gap:16px;background:rgba(213,255,86,.08)}.web3-launch-config>div:first-child{grid-column:1/-1}.web3-launch-config h3{margin:5px 0 6px;font-size:20px}.web3-launch-config p{margin:0;color:var(--muted);font-size:13px}.web3-tool-line{grid-column:1/-1;display:flex!important;flex-wrap:wrap;gap:7px!important}.web3-tool-line span{border:1px solid var(--line);background:var(--panel);padding:6px 9px;font:10px monospace;text-transform:uppercase}.web3-launch-config[hidden]{display:none!important}@media(max-width:900px){.web3-launch-config{grid-template-columns:1fr}.web3-launch-config>div:first-child,.web3-tool-line{grid-column:auto}}

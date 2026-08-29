@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "TargetSpec.schema.json",
+  "title": "TargetSpec",
+  "type": "object",
+  "required": [
+    "kind",
+    "value"
+  ],
+  "properties": {
+    "kind": {
+      "enum": [
+        "url",
+        "domain",
+        "ip",
+        "cidr",
+        "api_spec",
+        "git_repo",
+        "source_archive",
+        "web_app",
+        "immunefi_program",
+        "web3_contract",
+        "web3_repo",
+        "local_project"
+      ]
+    },
+    "value": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode_hint": {
+      "enum": [
+        "traditional_src",
+        "web3",
+        null
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+rules:
+  - id: fixture-dangerous-eval
+    message: Dynamic evaluation reaches an executable sink
+    severity: WARNING
+    languages: [python]
+    pattern: eval(...)

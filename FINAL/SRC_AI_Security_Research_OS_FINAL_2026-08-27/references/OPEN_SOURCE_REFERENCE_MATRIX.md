@@ -1,0 +1,89 @@
+# Open-source Reference Matrix
+
+- **Strix** — https://github.com/usestrix/strix
+  - Role: Agent/runtime/sandbox/browser/report reference
+  - License gate: Apache-2.0 per current skill metadata; re-check
+- **pentest-ai** — https://github.com/0xSteph/pentest-ai
+  - Role: Machine oracle, proof capsule, tool registry
+  - License gate: MIT shown in current repository material; re-check
+- **PentAGI** — https://github.com/vxcontrol/pentagi
+  - Role: Autonomous pentest orchestration/control plane
+  - License gate: MIT shown by current repository result; re-check
+- **SWE-agent** — https://github.com/SWE-agent/SWE-agent
+  - Role: ACI / context-efficient agent-computer interface
+  - License gate: re-check before reuse
+- **Argus** — https://github.com/R0x7e/Argus
+  - Role: Search/decision ideas
+  - License gate: re-check
+- **Anthropic Cybersecurity Skills** — https://github.com/mukul975/Anthropic-Cybersecurity-Skills
+  - Role: Skill library ideas
+  - License gate: re-check
+- **Nuclei** — https://github.com/projectdiscovery/nuclei
+  - Role: Template scanner adapter
+  - License gate: re-check
+- **Nuclei Templates** — https://github.com/projectdiscovery/nuclei-templates
+  - Role: Detection templates
+  - License gate: re-check
+- **Katana** — https://github.com/projectdiscovery/katana
+  - Role: Crawler
+  - License gate: re-check
+- **httpx** — https://github.com/projectdiscovery/httpx
+  - Role: HTTP probing / inventory
+  - License gate: re-check
+- **subfinder** — https://github.com/projectdiscovery/subfinder
+  - Role: Passive subdomain discovery
+  - License gate: re-check
+- **OWASP ZAP** — https://github.com/zaproxy/zaproxy
+  - Role: Web automation/API security scanner
+  - License gate: re-check
+- **Semgrep** — https://github.com/semgrep/semgrep
+  - Role: Static analysis
+  - License gate: re-check
+- **CodeQL** — https://github.com/github/codeql
+  - Role: Code analysis/SARIF
+  - License gate: license/use restrictions must be reviewed
+- **Gitleaks** — https://github.com/gitleaks/gitleaks
+  - Role: Secret detection
+  - License gate: re-check
+- **Trivy** — https://github.com/aquasecurity/trivy
+  - Role: Dependency/container/misconfig scanner
+  - License gate: re-check
+- **OSV-Scanner** — https://github.com/google/osv-scanner
+  - Role: Open-source dependency vulnerability data
+  - License gate: re-check
+- **Foundry** — https://github.com/foundry-rs/foundry
+  - Role: Forge/Anvil EVM testing
+  - License gate: re-check
+- **crytic-compile** — https://github.com/crytic/crytic-compile
+  - Role: Solidity project compilation normalization
+  - License gate: re-check
+- **Slither** — https://github.com/crytic/slither
+  - Role: Smart contract static analysis
+  - License gate: re-check
+- **Aderyn** — https://github.com/Cyfrin/aderyn
+  - Role: Alternative smart contract static analysis
+  - License gate: re-check
+- **Echidna** — https://github.com/crytic/echidna
+  - Role: Property/stateful fuzzing
+  - License gate: re-check
+- **Medusa** — https://github.com/crytic/medusa
+  - Role: Coverage-guided EVM fuzzing
+  - License gate: re-check
+- **Chimera** — https://github.com/Recon-Fuzz/chimera
+  - Role: Portable invariant/fuzzer harness concepts
+  - License gate: re-check
+- **crytic/properties** — https://github.com/crytic/properties
+  - Role: Reusable smart-contract properties
+  - License gate: re-check
+- **Halmos** — https://github.com/a16z/halmos
+  - Role: Symbolic testing
+  - License gate: re-check
+- **Kontrol** — https://github.com/runtimeverification/kontrol
+  - Role: Formal verification
+  - License gate: re-check
+- **revm** — https://github.com/bluealloy/revm
+  - Role: Embedded high-performance EVM option
+  - License gate: re-check
+- **OpenZeppelin Contracts** — https://github.com/OpenZeppelin/openzeppelin-contracts
+  - Role: Contract baseline/reference
+  - License gate: re-check

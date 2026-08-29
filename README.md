@@ -1,0 +1,51 @@
+# Security Research OS
+
+本地优先的授权安全研究工作台。产品规范以 `FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27` 为唯一权威。
+
+主线：
+
+`Target → Scoped Run → Observations → Verification → CanonicalFinding → Evidence Capsule → Report Preview → Submission Package`
+
+前端只有五个一级工作区：新建分析、分析过程、漏洞结果、报告中心、设置与工具；顶栏切换 Traditional SRC 与 Web3 / Immunefi。
+
+## 本地启动
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+打开 <http://127.0.0.1:8000/new>。
+
+## 验证
+
+```bash
+PYTHONPATH=. pytest -q
+python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/verify_package.py
+python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contract_check.py
+```
+
+## 事实边界
+
+- UI 内置流程是明确标记的 `synthetic` 安全演示，不代表真实扫描或漏洞验证。
+- 默认生产路径为 Docker-free 的本机原生执行：Traditional 使用 Nuclei、Katana、httpx、Subfinder、Semgrep、Gitleaks、Trivy 与 pentest-ai；Web3 使用 Foundry、Slither、Echidna、Medusa 等原生工具。Strix / Shannon 仅作为可选容器 Agent 保留，不进入默认任务，也不影响产品 Ready 状态。
+- Native Agent 使用系统 Chrome 与 Playwright 进行只读页面研究，不下载独立浏览器。每个 HTTP(S) 请求均经过不可变 Scope、DNS/IP 和原子请求预算检查；不开放任意 Shell、表单提交、文件上传、下载或状态修改。模型未配置时明确降级，确定性工具链继续运行。
+- “设置与工具”提供自定义 OpenAI-compatible API Base、模型 ID 和 API Key。本机 Key 只写入 `~/.strix/cli-config.json`（权限 `600`），不进入 SQLite、事件、报告或 API 响应。
+- Scanner / tool output 必须先成为 Observation，不能直接生成 Verified Finding。
+- Candidate 必须通过至少两次独立重放、反证检查、已确认 ScopeSnapshot 和 Evidence 绑定，才能成为 CanonicalFinding。
+- 报告编译器只读取 CanonicalFinding；缺字段输出 `MISSING_REQUIRED_FIELD`，不会编造内容。
+- 导出只生成本地 Submission Package，不自动登录或提交任何漏洞平台。
+- 生产网与公共测试网 Web3 写入失败关闭；写入只允许真实 Anvil local fork / local devnet，不需要真实私钥。
+- Heavy tools 是可选能力；缺失时 Settings 显示 `MISSING/degraded`，不伪造可用状态。
+
+## 数据与恢复
+
+- SQLite：`data/src_control.db`
+- 报告包：`data/exports/`
+- 结构化 Artifact：`data/artifacts/`
+- Native Agent 任务隔离目录：`data/agent_workspaces/<run_id>/`（目录权限 `700`，文件权限 `600`）
+- v1 Run 在进程异常退出后进入 `paused`，保留 checkpoint；用户点击恢复后从首个缺失阶段继续。
+
+操作与故障恢复详见 [OPERATIONS.md](./OPERATIONS.md)。

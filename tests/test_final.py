@@ -876,6 +876,55 @@ def test_real_http_replay_oracle_with_negative_control(client):
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
+def test_http_workbench_records_redacts_replays_diffs_and_creates_candidate(client):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload = b'{"state":"changed"}' if self.path == "/changed" else b'{"state":"baseline"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", "session=server-secret")
+            self.end_headers()
+            self.wfile.write(payload)
+        def log_message(self, *_):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        port = server.server_port
+        engagement = client.post("/api/v1/engagements", json={
+            "name": "HTTP workbench", "target": f"http://127.0.0.1:{port}", "mode": "traditional",
+            "scope": {"allow_private_ips": True}, "policy": {"max_requests_per_second": 200},
+        }).json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/confirm")
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start", json={"execution_mode": "demo"}).json()["id"]
+        first = client.post(f"/api/v1/traditional/runs/{run_id}/http-exchanges", json={
+            "url": f"http://127.0.0.1:{port}/baseline", "method": "GET",
+            "headers": {"Authorization": "Bearer super-secret-value", "Cookie": "session=client-secret"},
+        })
+        assert first.status_code == 201, first.text
+        exchange = first.json()
+        assert exchange["response_status"] == 200
+        assert "super-secret-value" not in json.dumps(exchange) and "client-secret" not in json.dumps(exchange)
+        replay = client.post(f"/api/v1/traditional/http-exchanges/{exchange['id']}/replay", json={
+            "url": f"http://127.0.0.1:{port}/changed", "headers": {},
+        })
+        assert replay.status_code == 201, replay.text
+        assert replay.json()["diff"]["body_changed"] is True
+        assert replay.json()["parent_exchange_id"] == exchange["id"]
+        listed = client.get(f"/api/v1/traditional/runs/{run_id}/http-exchanges").json()
+        assert len(listed) == 2 and listed[0]["source"] == "replay"
+        promoted = client.post(f"/api/v1/traditional/http-exchanges/{replay.json()['id']}/candidate", json={
+            "title": "Role boundary differs", "category": "authorization",
+            "hypothesis": "The changed response may expose a cross-role object boundary",
+        })
+        assert promoted.status_code == 201
+        assert promoted.json()["candidate"]["status"] == "candidate"
+        assert "super-secret-value" not in final_core.DB.read_bytes().decode(errors="ignore")
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
 def test_ptai_capsule_replay_requires_integrity_scope_and_live_oracle(client, monkeypatch):
     created = client.post("/api/v1/engagements", json={
         "name": "ptai replay", "target": "http://127.0.0.1:8765", "mode": "traditional",

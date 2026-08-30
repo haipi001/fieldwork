@@ -216,6 +216,16 @@ def init_final_db() -> None:
             CREATE TABLE IF NOT EXISTS run_configs_v2 (
               run_id TEXT PRIMARY KEY, config TEXT NOT NULL, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS http_exchanges (
+              id TEXT PRIMARY KEY, run_id TEXT NOT NULL, engagement_id TEXT NOT NULL,
+              identity_id TEXT, method TEXT NOT NULL, url TEXT NOT NULL,
+              request_headers TEXT NOT NULL, request_body TEXT,
+              response_status INTEGER NOT NULL, response_headers TEXT NOT NULL,
+              response_body_preview TEXT NOT NULL, response_sha256 TEXT NOT NULL,
+              response_bytes INTEGER NOT NULL, source TEXT NOT NULL,
+              parent_exchange_id TEXT, created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS http_exchanges_run_created_idx ON http_exchanges(run_id,created_at);
             """
         )
         migrate_legacy_findings(db)
@@ -1545,7 +1555,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         source.close()
     backup_path.chmod(0o600)
     tables = (
-        "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
+        "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
         "graveyard", "coverage_v2", "identity_profiles", "identities", "program_snapshots", "submission_packages_v2",
         "report_previews", "canonical_findings", "verification_attempts", "candidate_findings",
         "relationships", "entities", "evidence_v2", "artifacts", "observations", "checkpoints",

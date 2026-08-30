@@ -29,9 +29,10 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 
 ## 事实边界
 
-- UI 内置流程是明确标记的 `synthetic` 安全演示，不代表真实扫描或漏洞验证。
+- 默认任务运行真实本机工具链；每个测试项分别记录 `tested / not tested / blocked / degraded`，不得用合成结果冒充真实覆盖。
 - 默认生产路径为 Docker-free 的本机原生执行：Traditional 使用 Nuclei、Katana、httpx、Subfinder、Semgrep、Gitleaks、Trivy 与 pentest-ai；Web3 使用 Foundry、Slither、Echidna、Medusa 等原生工具。Strix / Shannon 仅作为可选容器 Agent 保留，不进入默认任务，也不影响产品 Ready 状态。
 - Native Agent 使用系统 Chrome 与 Playwright 进行只读页面研究，不下载独立浏览器。每个 HTTP(S) 请求均经过不可变 Scope、DNS/IP 和原子请求预算检查；不开放任意 Shell、表单提交、文件上传、下载或状态修改。模型未配置时明确降级，确定性工具链继续运行。
+- Traditional Run 内置受控 HTTP 工作台，支持请求/响应历史、编辑后重放、响应 Diff、身份关联和加入 Candidate。所有发送继续通过 Scope、DNS/IP、方法和请求预算门禁；Authorization、Cookie 等敏感 Header 只用于当次请求，持久化时强制脱敏。
 - “设置与工具”提供自定义 OpenAI-compatible API Base、模型 ID 和 API Key。本机 Key 只写入 `~/.strix/cli-config.json`（权限 `600`），不进入 SQLite、事件、报告或 API 响应。
 - Scanner / tool output 必须先成为 Observation，不能直接生成 Verified Finding。
 - Candidate 必须通过至少两次独立重放、反证检查、已确认 ScopeSnapshot 和 Evidence 绑定，才能成为 CanonicalFinding。

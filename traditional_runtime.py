@@ -9,6 +9,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import difflib
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -51,6 +52,28 @@ class PtaiReplayInput(BaseModel):
     timeout_seconds: int = Field(default=120, ge=10, le=600)
 
 
+class ExchangeRequestInput(BaseModel):
+    url: str
+    method: str = "GET"
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: str | None = Field(default=None, max_length=65536)
+    identity_id: str | None = None
+
+
+class ExchangeReplayInput(BaseModel):
+    url: str | None = None
+    method: str | None = None
+    headers: dict[str, str] | None = None
+    body: str | None = Field(default=None, max_length=65536)
+    identity_id: str | None = None
+
+
+class ExchangeCandidateInput(BaseModel):
+    title: str = Field(min_length=3, max_length=240)
+    category: str = Field(min_length=2, max_length=120)
+    hypothesis: str = Field(min_length=3, max_length=4000)
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -58,8 +81,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def network_guard(engagement: dict, request: ReplayRequest) -> None:
     import final_core
+    destructive = request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
     result = final_core.execution_policy_check(final_core.PolicyCheckInput(
-        engagement_id=engagement["id"], target=request.url, action="read",
+        engagement_id=engagement["id"], target=request.url,
+        action="analyze" if destructive else "read", destructive=destructive,
     ))
     if not result["allowed"]:
         raise HTTPException(409, result["reason"])
@@ -97,6 +122,120 @@ def request_once(spec: ReplayRequest) -> dict:
         "headers": {k: redact(v) for k, v in headers.items() if k.lower() in {"content-type", "location", "etag"}},
         "body_preview": redact(body_text[:1000]),
     }
+
+
+def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
+    sensitive = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key"}
+    return {
+        str(key): "[REDACTED]" if str(key).lower() in sensitive else redact(str(item))
+        for key, item in headers.items()
+    }
+
+
+def _get_exchange(exchange_id: str) -> dict:
+    import final_core
+    with final_core.connect() as db:
+        row = db.execute("SELECT * FROM http_exchanges WHERE id=?", (exchange_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "HTTP Exchange 不存在")
+    value = dict(row)
+    value["request_headers"] = final_core.load(value["request_headers"], {})
+    value["response_headers"] = final_core.load(value["response_headers"], {})
+    return value
+
+
+def _record_exchange(run: dict, spec: ReplayRequest, result: dict, identity_id: str | None, source: str, parent_exchange_id: str | None = None) -> dict:
+    import final_core
+    if identity_id:
+        identity = final_core.get_identity(identity_id)
+        if identity["engagement_id"] != run["engagement_id"]:
+            raise HTTPException(409, "测试身份不属于当前项目")
+        if identity["session_status"] != "ready":
+            raise HTTPException(409, "测试身份会话未就绪，请先刷新登录态")
+    exchange_id = final_core.uid("http")
+    with final_core.connect() as db:
+        db.execute("INSERT INTO http_exchanges VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            exchange_id, run["id"], run["engagement_id"], identity_id,
+            spec.method.upper(), spec.url, final_core.dump(_safe_headers(spec.headers)),
+            redact(spec.body) if spec.body else None, int(result["status"]),
+            final_core.dump(result["headers"]), result["body_preview"], result["body_sha256"],
+            int(result["body_bytes"]), source, parent_exchange_id, final_core.utcnow(),
+        ))
+    return _get_exchange(exchange_id)
+
+
+def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, parent_exchange_id: str | None = None) -> dict:
+    import final_core
+    method = body.method.upper()
+    if method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
+        raise HTTPException(422, "不支持的 HTTP 方法")
+    with final_core.connect() as db:
+        run_row = db.execute("SELECT * FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+    if not run_row or run_row["mode"] != "traditional":
+        raise HTTPException(409, "HTTP 工作台必须绑定 Traditional Run")
+    run = dict(run_row)
+    if run["status"] not in {"running", "paused", "completed"}:
+        raise HTTPException(409, "当前 Run 状态不允许 HTTP 研究操作")
+    engagement = final_core.get_engagement(run["engagement_id"])
+    spec = ReplayRequest(url=body.url, method=method, headers=body.headers, body=body.body)
+    network_guard(engagement, spec)
+    consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
+    if not consumed:
+        raise HTTPException(409, reason)
+    result = request_once(spec)
+    exchange = _record_exchange(run, spec, result, body.identity_id, source, parent_exchange_id)
+    final_core.add_event(run_id, "verification", "http.exchange_recorded", f"{method} {urlparse(body.url).path or '/'} → {result['status']}", {"exchange_id": exchange["id"], "source": source})
+    return exchange
+
+
+@router.get("/runs/{run_id}/http-exchanges")
+def list_http_exchanges(run_id: str):
+    import final_core
+    with final_core.connect() as db:
+        if not db.execute("SELECT 1 FROM analysis_runs WHERE id=?", (run_id,)).fetchone():
+            raise HTTPException(404, "Run 不存在")
+        ids = [row["id"] for row in db.execute("SELECT id FROM http_exchanges WHERE run_id=? ORDER BY created_at DESC", (run_id,))]
+    return [_get_exchange(exchange_id) for exchange_id in ids]
+
+
+@router.post("/runs/{run_id}/http-exchanges", status_code=201)
+def create_http_exchange(run_id: str, body: ExchangeRequestInput):
+    return _execute_exchange(run_id, body, "manual")
+
+
+@router.post("/http-exchanges/{exchange_id}/replay", status_code=201)
+def replay_http_exchange(exchange_id: str, body: ExchangeReplayInput):
+    original = _get_exchange(exchange_id)
+    replay = _execute_exchange(original["run_id"], ExchangeRequestInput(
+        url=body.url or original["url"], method=body.method or original["method"],
+        headers=body.headers if body.headers is not None else original["request_headers"],
+        body=body.body if body.body is not None else original["request_body"],
+        identity_id=body.identity_id if body.identity_id is not None else original["identity_id"],
+    ), "replay", exchange_id)
+    before, after = original["response_body_preview"].splitlines(), replay["response_body_preview"].splitlines()
+    replay["diff"] = {
+        "status_changed": original["response_status"] != replay["response_status"],
+        "body_changed": original["response_sha256"] != replay["response_sha256"],
+        "bytes_delta": replay["response_bytes"] - original["response_bytes"],
+        "preview": "\n".join(difflib.unified_diff(before, after, fromfile=original["id"], tofile=replay["id"], lineterm=""))[:8000],
+    }
+    return replay
+
+
+@router.post("/http-exchanges/{exchange_id}/candidate", status_code=201)
+def exchange_to_candidate(exchange_id: str, body: ExchangeCandidateInput):
+    import final_core
+    exchange = _get_exchange(exchange_id)
+    observation = final_core.record_observation(exchange["run_id"], final_core.ObservationInput(
+        observation_type="http.exchange", subject=f"{exchange['method']} {exchange['url']}",
+        summary=f"HTTP {exchange['response_status']} · sha256 {exchange['response_sha256'][:12]}",
+        source_capability="http-workbench", confidence=.65, raw_ref=exchange["id"],
+    ))
+    candidate = final_core.create_candidate(exchange["run_id"], final_core.CandidateInput(
+        title=body.title, category=body.category, target=exchange["url"],
+        hypothesis=body.hypothesis, observation_ids=[observation["id"]],
+    ))
+    return {"exchange_id": exchange_id, "observation": observation, "candidate": candidate}
 
 
 def signature(result: dict) -> tuple[int, str]:

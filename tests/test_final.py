@@ -172,6 +172,62 @@ def test_business_workflow_rejects_out_of_scope_and_read_only_post(client):
     blockers = rejected.json()["detail"]["blocked_steps"]
     assert {item["reason"] for item in blockers} == {"out_of_scope", "non_read_method_requires_reversible_or_state_changing_risk_class"}
 
+
+def test_campaign_iteration_executes_guarded_cross_identity_and_duplicate_replay(client, monkeypatch):
+    class LogicHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            tenant = self.headers.get("X-Test-Tenant", "anonymous")
+            body = json.dumps({"tenant": tenant, "object": 42}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *_):
+            pass
+    server = HTTPServer(("127.0.0.1", 0), LogicHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        target = f"http://127.0.0.1:{server.server_port}"
+        created = client.post("/api/v1/engagements", json={
+            "name": "Local logic fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True}, "policy": {"max_requests_per_second": 100, "max_requests": 1000},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
+        identity_ids = []
+        for label, role, tenant in (("A user", "user", "tenant-a"), ("B admin", "admin", "tenant-b")):
+            identity = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+                "label": label, "role": role, "tenant": tenant, "auth_type": "keychain_reference",
+                "credential_ref": f"keychain://fieldwork/{tenant}", "session_status": "ready",
+            }).json()
+            identity_ids.append(identity["id"])
+        header_map = {identity_ids[0]: {"X-Test-Tenant": "tenant-a"}, identity_ids[1]: {"X-Test-Tenant": "tenant-b"}}
+        monkeypatch.setattr(traditional_runtime, "resolve_identity_headers", lambda identity_id: header_map[identity_id])
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Object boundary campaign", "objective": "Continuously compare tenant object authorization decisions",
+        }).json()
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Order detail", "objective": "Compare the same object through distinct tenant sessions",
+            "steps": [{"name": "Read object", "method": "GET", "url": f"{target}/api/orders/42", "actor_role": "user", "replay_safe": True}],
+            "invariants": ["A tenant must not receive another tenant's object"], "risk_class": "read_only",
+        })
+        assert workflow.status_code == 201
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        executed = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={"run_id": run_id, "max_tests": 10})
+        assert executed.status_code == 200
+        result = executed.json()
+        assert result["tested"] == 3 and result["blocked"] == 0
+        cross = next(item for item in result["results"] if item["kind"] == "cross_identity_replay")
+        assert cross["same_response"] is False and cross["hypothesis_id"]
+        details = client.get(f"/api/v1/runs/{run_id}/details").json()
+        assert len([item for item in details["observations"] if item["source_capability"] == "campaign-logic-runner"]) == 3
+        coverage = client.get(f"/api/v1/runs/{run_id}/coverage").json()["coverage"]
+        assert any(item["surface_key"].startswith(f"campaign:{campaign['id']}") and item["state"] == "tested" for item in coverage)
+        campaign_detail = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
+        assert campaign_detail["iterations_completed"] == 1
+        assert any(item["category"] == "access_control_differential" for item in campaign_detail["hypotheses"])
+    finally:
+        server.shutdown(); server.server_close()
+
 def test_execution_plan_exposes_real_tools_budgets_degradation_and_scope_blockers(client, monkeypatch):
     monkeypatch.setattr(final_core, "capability_inventory", lambda: [
         {"id": "subfinder", "available": True, "configured": True, "ready": True, "version": "v1"},

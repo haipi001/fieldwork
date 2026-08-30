@@ -132,6 +132,51 @@ def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
     }
 
 
+def resolve_identity_headers(identity_id: str) -> dict[str, str]:
+    """Resolve an opaque macOS Keychain reference only for the live request."""
+    import final_core
+    with final_core.connect() as db:
+        row = db.execute("""SELECT i.engagement_id,i.credential_ref,p.auth_type,p.session_status
+          FROM identities i JOIN identity_profiles p ON p.identity_id=i.id WHERE i.id=?""", (identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "测试身份不存在")
+    if row["session_status"] != "ready":
+        raise HTTPException(409, "测试身份会话未就绪，请先刷新登录态")
+    reference = row["credential_ref"] or ""
+    if not reference.startswith("keychain://"):
+        if row["auth_type"] == "none":
+            return {}
+        raise HTTPException(409, "真实跨身份测试要求 macOS Keychain 引用")
+    parts = reference.removeprefix("keychain://").split("/", 1)
+    if len(parts) != 2 or not all(parts):
+        raise HTTPException(422, "Keychain 引用格式应为 keychain://service/account")
+    service, account = parts
+    try:
+        result = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise HTTPException(409, f"keychain_session_unavailable: {type(error).__name__}") from error
+    if result.returncode != 0:
+        raise HTTPException(409, "Keychain 中找不到该测试会话，请重新采集登录态")
+    try:
+        secret = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise HTTPException(409, "Keychain 会话必须是包含 headers 对象的 JSON") from error
+    headers = secret.get("headers") if isinstance(secret, dict) else None
+    if not isinstance(headers, dict) or not headers:
+        raise HTTPException(409, "Keychain 会话缺少 headers 对象")
+    clean = {}
+    for key, value in headers.items():
+        if not isinstance(key, str) or not isinstance(value, str) or len(key) > 120 or len(value) > 16384:
+            raise HTTPException(409, "Keychain 会话 Header 格式不合法")
+        if any(char in key + value for char in ("\r", "\n")):
+            raise HTTPException(409, "Keychain 会话 Header 包含非法换行")
+        clean[key] = value
+    return clean
+
+
 def _get_exchange(exchange_id: str) -> dict:
     import final_core
     with final_core.connect() as db:
@@ -177,7 +222,8 @@ def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, pare
     if run["status"] not in {"running", "paused", "completed"}:
         raise HTTPException(409, "当前 Run 状态不允许 HTTP 研究操作")
     engagement = final_core.get_engagement(run["engagement_id"])
-    spec = ReplayRequest(url=body.url, method=method, headers=body.headers, body=body.body)
+    identity_headers = resolve_identity_headers(body.identity_id) if body.identity_id else {}
+    spec = ReplayRequest(url=body.url, method=method, headers={**body.headers, **identity_headers}, body=body.body)
     network_guard(engagement, spec)
     consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
     if not consumed:

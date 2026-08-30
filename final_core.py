@@ -456,6 +456,11 @@ class ResearchHypothesisInput(BaseModel):
     next_action: str = Field(default="等待测试计划", max_length=2000)
 
 
+class CampaignExecuteInput(BaseModel):
+    run_id: str
+    max_tests: int = Field(default=10, ge=1, le=50)
+
+
 def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) -> list[str]:
     repository = engagement.get("target_type") == "repository"
     if engagement["mode"] == "web3":
@@ -2012,7 +2017,7 @@ def plan_campaign_iteration(campaign_id: str):
                     if left["role"] != right["role"] or left.get("tenant") != right.get("tenant"):
                         matrix.append({"kind": "cross_identity_replay", "workflow_id": workflow["id"], "step": step_index + 1, "source_identity_id": left["id"], "replay_identity_id": right["id"], "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
             if step.get("replay_safe"):
-                matrix.append({"kind": "duplicate_replay", "workflow_id": workflow["id"], "step": step_index + 1, "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
+                matrix.append({"kind": "duplicate_replay", "workflow_id": workflow["id"], "step": step_index + 1, "identity_id": eligible[0]["id"], "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
         if len(workflow["steps"]) > 1:
             matrix.append({"kind": "sequence_violation", "workflow_id": workflow["id"], "sequence": list(reversed(range(1, len(workflow["steps"]) + 1))), "assertions": workflow["invariants"]})
     sequence = len(campaign["iterations"]) + 1
@@ -2022,6 +2027,117 @@ def plan_campaign_iteration(campaign_id: str):
         db.execute("INSERT INTO campaign_iterations VALUES(?,?,?,?,?,?,?,?,?,?)", (iteration_id, campaign_id, None, sequence, "planned", dump(plan), dump({}), None, None, timestamp))
         db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
     return {"id": iteration_id, "campaign_id": campaign_id, "sequence": sequence, "status": "planned", **plan}
+
+
+def _campaign_hypothesis(campaign_id: str, workflow_id: str, category: str, statement: str, evidence_ids: list[str], next_action: str) -> str:
+    fingerprint = hashlib.sha256(f"{workflow_id}:{category}:{' '.join(statement.lower().split())}".encode()).hexdigest()
+    timestamp = utcnow()
+    with connect() as db:
+        row = db.execute("SELECT id,evidence_ids,attempts FROM research_hypotheses WHERE campaign_id=? AND fingerprint=?", (campaign_id, fingerprint)).fetchone()
+        if row:
+            merged = list(dict.fromkeys(load(row["evidence_ids"], []) + evidence_ids))
+            db.execute("UPDATE research_hypotheses SET evidence_ids=?,attempts=?,last_tested_at=?,next_action=?,updated_at=? WHERE id=?", (dump(merged), row["attempts"] + 1, timestamp, next_action, timestamp, row["id"]))
+            return row["id"]
+        hypothesis_id = uid("hypothesis")
+        db.execute("INSERT INTO research_hypotheses VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            hypothesis_id, campaign_id, workflow_id, fingerprint, category, statement, "open_proof_gap", 70,
+            dump(evidence_ids), dump([]), 1, timestamp, next_action, timestamp, timestamp,
+        ))
+    return hypothesis_id
+
+
+@router.post("/campaigns/{campaign_id}/iterations/{iteration_id}/execute")
+def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: CampaignExecuteInput):
+    """Execute bounded read-only logic probes through the existing guarded HTTP runtime."""
+    import traditional_runtime
+    campaign = get_research_campaign(campaign_id)
+    with connect() as db:
+        iteration = db.execute("SELECT * FROM campaign_iterations WHERE id=? AND campaign_id=?", (iteration_id, campaign_id)).fetchone()
+        run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (body.run_id,)).fetchone()
+    if not iteration:
+        raise HTTPException(404, "Campaign iteration 不存在")
+    if iteration["status"] not in {"planned", "failed"}:
+        raise HTTPException(409, "该研究轮次不能重复执行")
+    if not run or run["engagement_id"] != campaign["engagement_id"] or run["mode"] != "traditional":
+        raise HTTPException(409, "执行 Run 必须属于同一 Traditional 项目")
+    if run["status"] not in {"running", "paused", "completed"}:
+        raise HTTPException(409, "当前 Run 状态不允许深度 HTTP 研究")
+    plan = load(iteration["plan"], {})
+    tests = plan.get("tests", [])[:body.max_tests]
+    timestamp = utcnow()
+    with connect() as db:
+        db.execute("UPDATE campaign_iterations SET status='executing',run_id=?,started_at=? WHERE id=?", (body.run_id, timestamp, iteration_id))
+    results, observation_ids = [], []
+    engagement = get_engagement(campaign["engagement_id"])
+    delay = 1 / max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
+
+    def request(test: dict, identity_key: str = "identity_id") -> dict:
+        return traditional_runtime._execute_exchange(body.run_id, traditional_runtime.ExchangeRequestInput(
+            url=test["url"], method=test.get("method", "GET"), headers={}, body=None,
+            identity_id=test.get(identity_key),
+        ), f"campaign:{campaign_id}:{test['kind']}")
+
+    for test in tests:
+        kind, workflow_id = test.get("kind"), test.get("workflow_id")
+        if kind == "sequence_violation":
+            results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "sequence_execution_requires_explicit_reversible_state_authorization"})
+            continue
+        if test.get("method") not in {"GET", "HEAD", "OPTIONS"}:
+            results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "state_change_not_enabled_for_campaign_executor"})
+            continue
+        try:
+            if kind == "cross_identity_replay":
+                left = request({**test, "identity_id": test["source_identity_id"]})
+                time.sleep(min(delay, 2))
+                right = request({**test, "identity_id": test["replay_identity_id"]})
+                same = left["response_status"] == right["response_status"] and left["response_sha256"] == right["response_sha256"]
+                summary = f"跨身份响应 {'完全相同' if same else '存在差异'}：HTTP {left['response_status']} / {right['response_status']}"
+                observation = record_observation(body.run_id, ObservationInput(
+                    observation_type="business_logic.cross_identity", subject=f"{test['method']} {test['url']}",
+                    summary=summary, source_capability="campaign-logic-runner", confidence=.55,
+                    raw_ref=f"{left['id']}:{right['id']}",
+                ))
+                observation_ids.append(observation["id"])
+                hypothesis_id = _campaign_hypothesis(campaign_id, workflow_id, "access_control_differential", f"{summary}；需要依据业务不变量进行独立重放和负对照", [observation["id"]], "使用对象所有者与非所有者执行两轮确定性重放")
+                results.append({"kind": kind, "workflow_id": workflow_id, "status": "observed", "same_response": same, "exchange_ids": [left["id"], right["id"]], "observation_id": observation["id"], "hypothesis_id": hypothesis_id})
+            elif kind == "duplicate_replay":
+                first = request(test)
+                time.sleep(min(delay, 2))
+                second = request(test)
+                stable = first["response_status"] == second["response_status"] and first["response_sha256"] == second["response_sha256"]
+                observation = record_observation(body.run_id, ObservationInput(
+                    observation_type="business_logic.duplicate_replay", subject=f"{test['method']} {test['url']}",
+                    summary=f"重复执行响应 {'稳定' if stable else '发生变化'}", source_capability="campaign-logic-runner", confidence=.65,
+                    raw_ref=f"{first['id']}:{second['id']}",
+                ))
+                observation_ids.append(observation["id"])
+                results.append({"kind": kind, "workflow_id": workflow_id, "status": "observed", "stable": stable, "exchange_ids": [first["id"], second["id"]], "observation_id": observation["id"]})
+            else:
+                exchange = request(test)
+                observation = record_observation(body.run_id, ObservationInput(
+                    observation_type="business_logic.baseline", subject=f"{test['method']} {test['url']}",
+                    summary=f"基线请求返回 HTTP {exchange['response_status']}", source_capability="campaign-logic-runner", confidence=.7,
+                    raw_ref=exchange["id"],
+                ))
+                observation_ids.append(observation["id"])
+                results.append({"kind": kind, "workflow_id": workflow_id, "status": "observed", "exchange_ids": [exchange["id"]], "observation_id": observation["id"]})
+        except HTTPException as error:
+            results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": str(error.detail)})
+        if delay:
+            time.sleep(min(delay, 2))
+    tested = sum(item["status"] == "observed" for item in results)
+    blocked = len(results) - tested
+    coverage_key = f"campaign:{campaign_id}:iteration:{iteration['sequence']}"
+    with connect() as db:
+        db.execute("""INSERT INTO coverage_v2 VALUES(?,?,?,?,?,?,?)
+          ON CONFLICT(run_id,surface_key) DO UPDATE SET state=excluded.state,reason=excluded.reason,observation_ids=excluded.observation_ids,updated_at=excluded.updated_at""", (
+            uid("coverage"), body.run_id, coverage_key, "tested" if tested else "blocked",
+            f"长期业务逻辑轮次：{tested} 已执行，{blocked} 阻塞", dump(observation_ids), utcnow(),
+        ))
+        db.execute("UPDATE campaign_iterations SET status='completed',results=?,completed_at=? WHERE id=?", (dump({"tests": results, "tested": tested, "blocked": blocked}), utcnow(), iteration_id))
+        db.execute("UPDATE research_campaigns SET iterations_completed=iterations_completed+1,updated_at=? WHERE id=?", (utcnow(), campaign_id))
+    add_event(body.run_id, "verification", "campaign.iteration_completed", f"长期研究第 {iteration['sequence']} 轮完成：{tested} 已执行，{blocked} 阻塞", {"campaign_id": campaign_id, "iteration_id": iteration_id})
+    return {"campaign_id": campaign_id, "iteration_id": iteration_id, "run_id": body.run_id, "status": "completed", "tested": tested, "blocked": blocked, "results": results, "observation_ids": observation_ids}
 
 
 @router.post("/program-snapshots", status_code=201)

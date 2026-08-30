@@ -16,6 +16,7 @@ import web3_analysis
 import capability_registry
 import traditional_tools
 import traditional_runtime
+import native_agent
 
 
 @pytest.fixture()
@@ -97,6 +98,45 @@ def test_identity_workspace_crud_and_role_matrix_never_echoes_credentials(client
         "label": "Unsafe", "role": "admin", "credential_ref": "password=plain-text",
     })
     assert secret.status_code == 422
+
+
+def test_execution_plan_exposes_real_tools_budgets_degradation_and_scope_blockers(client, monkeypatch):
+    monkeypatch.setattr(final_core, "capability_inventory", lambda: [
+        {"id": "subfinder", "available": True, "configured": True, "ready": True, "version": "v1"},
+        {"id": "httpx", "available": True, "configured": True, "ready": True, "version": "v2"},
+        {"id": "katana", "available": False, "configured": False, "ready": False},
+        {"id": "nuclei", "available": True, "configured": True, "ready": True, "version": "v3"},
+    ])
+    monkeypatch.setattr(native_agent, "readiness", lambda: {
+        "available": True, "configured": False, "ready": False, "browser": "system_chrome",
+    })
+    draft = client.post("/api/v1/engagements", json={
+        "name": "Plan target", "target": "https://plan.test", "mode": "traditional",
+        "policy": {"max_requests": 77, "max_runtime_minutes": 12},
+    }).json()
+    blocked = client.post(f"/api/v1/engagements/{draft['id']}/execution-plan", json={"include_native_agent": True})
+    assert blocked.status_code == 200 and blocked.json()["ready"] is False
+    assert {item["id"] for item in blocked.json()["blockers"]} == {"scope"}
+    client.post(f"/api/v1/engagements/{draft['id']}/confirm")
+    plan = client.post(f"/api/v1/engagements/{draft['id']}/execution-plan", json={"include_native_agent": True}).json()
+    assert plan["ready"] is True
+    assert plan["budget"]["requests"] == 77 and plan["budget"]["runtime_minutes"] == 12
+    assert [item["id"] for item in plan["tools"]] == ["subfinder", "httpx", "katana", "nuclei", "native-agent"]
+    assert {item["id"] for item in plan["warnings"]} >= {"katana", "native-agent", "role_coverage"}
+    assert "production_write" in plan["denied_actions"]
+
+
+def test_task_center_reports_remaining_stages_and_actionable_next_step(client):
+    ready = create_ready(client, target="https://task-center.test")
+    run = client.post(f"/api/v1/engagements/{ready['id']}/start", json={"execution_mode": "demo"})
+    assert run.status_code == 202
+    center = client.get("/api/v1/task-center?mode=traditional")
+    assert center.status_code == 200
+    item = next(value for value in center.json()["items"] if value["id"] == run.json()["id"])
+    assert item["status"] in {"queued", "running", "completed"}
+    assert isinstance(item["remaining_stages"], list)
+    assert item["next_action"]
+    assert center.json()["stall_timeout_seconds"] == 180
 
 
 def test_scope_required_and_run_checkpoints(client):

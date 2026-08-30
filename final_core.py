@@ -379,6 +379,83 @@ class StartAnalysisInput(BaseModel):
     include_native_agent: bool = True
 
 
+def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) -> list[str]:
+    repository = engagement.get("target_type") == "repository"
+    if engagement["mode"] == "web3":
+        planned = ["forge", "slither", "aderyn", "echidna", "medusa", "halmos", "gitleaks", "trivy"]
+        if not repository:
+            planned.extend(["anvil", "cast"])
+        return planned
+    planned = [] if repository or not body.include_recon else ["subfinder", "httpx", "katana", "nuclei"]
+    if repository or body.include_code or body.source_path:
+        planned.extend(["semgrep", "gitleaks", "trivy"])
+    if body.include_native_agent:
+        planned.append("native-agent")
+    if body.include_strix:
+        planned.append("strix")
+    if body.include_shannon:
+        planned.append("shannon")
+    return list(dict.fromkeys(planned))
+
+
+def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -> dict[str, Any]:
+    blockers: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    source = Path(body.source_path).expanduser() if body.source_path else None
+    repository = engagement.get("target_type") == "repository"
+    if engagement["status"] != "ready" or not engagement.get("confirmed_at"):
+        blockers.append({"id": "scope", "message": "ScopeSnapshot 尚未人工确认"})
+    if repository and engagement["mode"] == "traditional" and body.execution_mode == "real":
+        local_source = source or Path(engagement["normalized_target"]).expanduser()
+        if not local_source.is_dir():
+            blockers.append({"id": "source", "message": "远程仓库需先检出到本地源码目录"})
+    if engagement["mode"] == "web3" and not repository and body.execution_mode == "real":
+        if source is None or not source.is_dir():
+            blockers.append({"id": "web3_source", "message": "链上目标需要可编译的本地 Solidity source"})
+        parsed_rpc = urlparse(body.fork_rpc_url or "")
+        if parsed_rpc.scheme != "https" or not parsed_rpc.netloc:
+            blockers.append({"id": "fork_rpc", "message": "链上目标需要 HTTPS RPC 创建本地 Fork"})
+    if body.include_shannon and (engagement["mode"] != "traditional" or repository or not body.source_path):
+        blockers.append({"id": "shannon", "message": "Shannon 需要 Traditional 运行 URL 和本地源码"})
+
+    inventory = {item["id"]: item for item in capabilities()}
+    from native_agent import readiness as native_agent_readiness
+    native = native_agent_readiness()
+    tools = []
+    for capability in _planned_capabilities(engagement, body):
+        item = native if capability == "native-agent" else inventory.get(capability, {})
+        ready = bool(item.get("ready", item.get("available") and item.get("configured", True)))
+        reason = "已就绪" if ready else ("需要模型 API 或系统 Chrome" if capability == "native-agent" else "未安装、未配置或运行时不可用")
+        tools.append({"id": capability, "ready": ready, "version": item.get("version") or item.get("browser") or "未探测", "reason": reason, "optional": capability in {"native-agent", "strix", "shannon", "aderyn", "echidna", "medusa", "halmos"}})
+        if not ready:
+            warnings.append({"id": capability, "message": f"{capability} 会记录为 NOT TESTED：{reason}"})
+
+    identities = list_identities(engagement["id"]) if engagement["mode"] == "traditional" else []
+    ready_identities = [item for item in identities if item["session_status"] == "ready"]
+    if identities and len(ready_identities) < len(identities):
+        warnings.append({"id": "identity_session", "message": f"{len(identities)-len(ready_identities)} 个测试身份会话未就绪"})
+    if len(ready_identities) < 2 and engagement["mode"] == "traditional":
+        warnings.append({"id": "role_coverage", "message": "少于 2 个就绪身份，本次不能证明跨角色/跨租户隔离"})
+    policy = engagement["policy"]
+    return {
+        "engagement_id": engagement["id"], "name": engagement["name"], "mode": engagement["mode"],
+        "target": engagement["normalized_target"], "target_type": engagement["target_type"],
+        "ready": not blockers, "blockers": blockers, "warnings": warnings, "tools": tools,
+        "identities": {"total": len(identities), "ready": len(ready_identities)},
+        "budget": {
+            "requests": int(policy.get("max_requests", 100)),
+            "requests_per_second": float(policy.get("max_requests_per_second", 1)),
+            "runtime_minutes": int(policy.get("max_runtime_minutes", 30)),
+            "tool_calls": int(policy.get("max_tool_calls", 200)),
+            "model_usd": float(policy.get("max_model_budget_usd", 10)),
+        },
+        "actions": ["read", "analyze", "local_fork_write"] if engagement["mode"] == "web3" else ["read", "analyze", "scoped_http"],
+        "denied_actions": ["destructive", "credential_attack", "fund_transfer", "production_write", "transaction_broadcast"],
+        "remaining_stages": ["target", "scope", "surface", "analysis", "processing", "verification", "impact", "report"],
+        "disclaimer": "这是有界执行计划，不预测结束时间；未覆盖项将进入 Coverage Ledger。",
+    }
+
+
 class MaintenanceConfirmInput(BaseModel):
     confirmation: str
 
@@ -626,6 +703,11 @@ async def safe_demo_pipeline(run_id: str) -> None:
     add_event(run_id, "report", "run.completed", "安全演示完成；不代表真实扫描或漏洞验证", {"synthetic": True})
 
 
+@router.post("/engagements/{engagement_id}/execution-plan")
+def execution_plan(engagement_id: str, body: StartAnalysisInput | None = None):
+    return build_execution_plan(get_engagement(engagement_id), body or StartAnalysisInput())
+
+
 @router.post("/engagements/{engagement_id}/start", status_code=202)
 async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = None):
     test_demo_enabled = os.getenv("SRC_ENABLE_SYNTHETIC_DEMO") == "1"
@@ -716,6 +798,48 @@ def list_runs(mode: Literal["traditional", "web3"] | None = None):
     with connect() as db:
         rows = db.execute(sql, params).fetchall()
         return [hydrate_run(row, db.execute("SELECT * FROM run_events_v2 WHERE run_id=? ORDER BY id", (row["id"],)).fetchall()) for row in rows]
+
+
+@router.get("/task-center")
+def task_center(mode: Literal["traditional", "web3"] | None = None):
+    runs = list_runs(mode)
+    ordered_queued = [run["id"] for run in reversed(runs) if run["status"] == "queued"]
+    result = []
+    for run in runs:
+        completed = {event["stage"] for event in run["events"] if event["kind"] == "stage.completed"}
+        all_stages = ("target", "scope", "surface", "analysis", "processing", "verification", "impact", "report")
+        if run["status"] == "completed":
+            completed = set(all_stages)
+        remaining = [stage for stage in all_stages if stage not in completed]
+        last = run["events"][-1] if run["events"] else None
+        last_at = last["created_at"] if last else run["created_at"]
+        try:
+            quiet_seconds = max(0, int((datetime.now(timezone.utc) - datetime.fromisoformat(last_at)).total_seconds()))
+        except (TypeError, ValueError):
+            quiet_seconds = 0
+        stalled = run["status"] == "running" and quiet_seconds >= 180
+        if stalled:
+            next_action = "运行已超过 3 分钟无新事件，请检查工具详情，必要时停止后重跑"
+        elif run["status"] == "paused":
+            next_action = "恢复后从首个缺失 checkpoint 继续"
+        elif run["status"] == "queued":
+            next_action = "等待执行槽位"
+        elif run["status"] in {"failed", "timeout", "budget_exhausted"}:
+            next_action = "查看最后事件，修复阻塞项后重新运行"
+        elif run["status"] == "completed":
+            next_action = "查看覆盖报告和漏洞结果"
+        else:
+            next_action = "继续监看实时证据"
+        result.append({
+            "id": run["id"], "engagement_id": run["engagement_id"], "mode": run["mode"],
+            "status": run["status"], "current_stage": run["current_stage"],
+            "remaining_stages": remaining, "completed_stages": len(completed),
+            "queue_position": ordered_queued.index(run["id"]) + 1 if run["id"] in ordered_queued else None,
+            "last_event_at": last_at, "last_event": last["message"] if last else "尚无执行事件",
+            "quiet_seconds": quiet_seconds, "stalled": stalled, "next_action": next_action,
+        })
+    counts = {status: sum(item["status"] == status for item in result) for status in ("queued", "running", "paused", "completed", "failed")}
+    return {"counts": counts, "stall_timeout_seconds": 180, "items": result}
 
 
 @router.get("/runs/{run_id}")

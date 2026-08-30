@@ -55,6 +55,17 @@ def test_target_resolution_and_immutable_scope(client):
     assert scope[0] == 1 and scope[1]
 
 
+def test_bulk_archive_recent_projects_preserves_records(client):
+    first = create_ready(client, target="https://one.example.test")
+    second = create_ready(client, target="https://two.example.test")
+    response = client.post("/api/v1/engagements/bulk-archive?mode=traditional")
+    assert response.status_code == 200
+    assert response.json() == {"mode": "traditional", "archived": 2, "evidence_preserved": True}
+    assert client.get("/api/v1/engagements?mode=traditional").json() == []
+    assert client.get(f"/api/v1/engagements/{first['id']}").status_code == 200
+    assert client.get(f"/api/v1/engagements/{second['id']}").status_code == 200
+
+
 def test_traditional_local_and_git_repository_targets_keep_repository_identity(client, tmp_path):
     local = client.post("/api/v1/targets/resolve", json={"target": str(tmp_path), "mode": "traditional"})
     assert local.status_code == 200 and local.json()["target_type"] == "repository"

@@ -2,3 +2,24 @@
 .workspace[data-workspace="settings"] .tool-card{border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
 
 .web3-launch-config{border:1px solid var(--ink);padding:20px;display:grid;grid-template-columns:1.5fr 1fr 1fr;gap:16px;background:rgba(213,255,86,.08)}.web3-launch-config>div:first-child{grid-column:1/-1}.web3-launch-config h3{margin:5px 0 6px;font-size:20px}.web3-launch-config p{margin:0;color:var(--muted);font-size:13px}.web3-tool-line{grid-column:1/-1;display:flex!important;flex-wrap:wrap;gap:7px!important}.web3-tool-line span{border:1px solid var(--line);background:var(--panel);padding:6px 9px;font:10px monospace;text-transform:uppercase}.web3-launch-config[hidden]{display:none!important}@media(max-width:900px){.web3-launch-config{grid-template-columns:1fr}.web3-launch-config>div:first-child,.web3-tool-line{grid-column:auto}}
+
+/* Intake workspace: clearer hierarchy without changing the execution contract. */
+.advanced-panel{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:18px;background:#dfded4;border:1px solid var(--line);border-top:0}
+.advanced-intro{display:flex;align-items:end;justify-content:space-between;gap:36px;padding:8px 4px 16px;border-bottom:1px solid #b7b6aa}
+.advanced-intro h2{margin:5px 0 0;font-size:24px;letter-spacing:-.03em}.advanced-intro>p{max-width:48ch;margin:0;color:var(--muted);font-size:12px}
+.advanced-group{background:var(--paper);border:1px solid #c3c2b7;padding:20px;display:flex;flex-direction:column;gap:16px;min-width:0}
+.advanced-group>header{display:flex;gap:12px;align-items:flex-start;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.advanced-group>header>span{display:grid;place-items:center;width:28px;height:28px;flex:0 0 28px;border-radius:50%;background:var(--ink);color:var(--accent);font:600 10px ui-monospace,monospace}
+.advanced-group h3{margin:0;font-size:15px}.advanced-group header p{margin:2px 0 0;color:var(--muted);font-size:11px}
+.advanced-group label{display:block;color:var(--ink);font-size:11px;font-weight:650}.advanced-group input:not([type=checkbox]),.advanced-group select,.advanced-group textarea{width:100%;min-height:44px;margin-top:7px;padding:10px 12px;border:1px solid var(--line);background:var(--white);outline:none}
+.advanced-group input:focus,.advanced-group select:focus,.advanced-group textarea:focus{border-color:var(--ink);box-shadow:0 0 0 3px rgba(201,242,75,.35)}
+.advanced-group label>small{display:block;margin-top:7px;color:var(--muted);font-weight:400;line-height:1.45}.advanced-group textarea{min-height:96px;resize:vertical}
+.field-pair,.source-options,.scope-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.source-options{grid-template-columns:1.4fr 1fr;align-items:stretch}
+.option-card{display:flex!important;align-items:flex-start;gap:12px;min-height:72px;padding:13px;border:1px solid var(--line);background:#e9e8df;cursor:pointer;transition:border-color .18s,background .18s,transform .18s}
+.option-card:hover{border-color:var(--ink);background:var(--white);transform:translateY(-1px)}.option-card input{width:17px;height:17px;flex:0 0 auto;margin:2px 0 0;accent-color:var(--ink)}
+.option-card span,.option-card b,.option-card small{display:block}.option-card b{font-size:12px}.option-card small{margin-top:4px;color:var(--muted);font-weight:400;line-height:1.4}
+.recent-heading-actions{display:flex;align-items:center;gap:12px}.recent-heading-actions>span{font:600 .72rem ui-monospace,monospace;color:var(--muted)}
+.recent-heading-actions .quiet-button{padding:.55rem .75rem}.recent-heading-actions .quiet-button:disabled{opacity:.38;cursor:not-allowed;background:transparent;color:var(--muted)}
+.compact-dialog form{padding:26px}.compact-dialog h2{margin:4px 0 0;font-size:28px;letter-spacing:-.04em}.clear-projects-copy{margin:20px 0;padding:18px;background:var(--surface);font-size:13px}.clear-projects-copy p{font-weight:650}.clear-projects-copy ul{margin:0;padding-left:18px;color:var(--muted);line-height:1.8}
+@media(max-width:900px){.advanced-panel{grid-template-columns:1fr}.advanced-intro{align-items:flex-start;flex-direction:column;gap:8px}.field-pair,.source-options,.scope-options{grid-template-columns:1fr}.section-heading{align-items:flex-start}.recent-heading-actions{align-items:flex-end;flex-direction:column}.advanced-group.wide,.advanced-intro.wide{grid-column:auto}}
+@media(max-width:560px){.advanced-panel{padding:10px;gap:10px}.advanced-group{padding:15px}.section-heading{gap:12px}.recent-heading-actions{width:100%;align-items:stretch}.recent-heading-actions .quiet-button{width:100%}}

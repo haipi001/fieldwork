@@ -672,6 +672,26 @@ def archive_engagement(engagement_id: str):
     return {"id": engagement_id, "status": "archived"}
 
 
+@router.post("/engagements/bulk-archive")
+def archive_recent_engagements(mode: Literal["traditional", "web3"]):
+    """Hide a work domain's recent projects without deleting its evidence chain."""
+    with connect() as db:
+        active = db.execute(
+            """SELECT COUNT(*) FROM analysis_runs r
+               JOIN engagements_v2 e ON e.id=r.engagement_id
+               WHERE e.mode=? AND e.status!='archived'
+               AND r.status IN ('queued','running','paused')""",
+            (mode,),
+        ).fetchone()[0]
+        if active:
+            raise HTTPException(409, f"当前工作域有 {active} 个活动任务，请先停止或等待任务结束")
+        changed = db.execute(
+            "UPDATE engagements_v2 SET status='archived',updated_at=? WHERE mode=? AND status!='archived'",
+            (utcnow(), mode),
+        )
+    return {"mode": mode, "archived": changed.rowcount, "evidence_preserved": True}
+
+
 def add_event(run_id: str, stage: str, kind: str, message: str, payload: dict[str, Any] | None = None) -> None:
     with connect() as db:
         db.execute("INSERT INTO run_events_v2(run_id,stage,kind,message,payload,created_at) VALUES(?,?,?,?,?,?)", (

@@ -226,6 +226,37 @@ def init_final_db() -> None:
               parent_exchange_id TEXT, created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS http_exchanges_run_created_idx ON http_exchanges(run_id,created_at);
+            CREATE TABLE IF NOT EXISTS research_campaigns (
+              id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, name TEXT NOT NULL,
+              objective TEXT NOT NULL, status TEXT NOT NULL, strategy TEXT NOT NULL,
+              max_iterations INTEGER NOT NULL, iterations_completed INTEGER NOT NULL DEFAULT 0,
+              horizon_days INTEGER NOT NULL, coverage_target REAL NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS business_workflows (
+              id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, engagement_id TEXT NOT NULL,
+              name TEXT NOT NULL, objective TEXT NOT NULL, preconditions TEXT NOT NULL,
+              steps TEXT NOT NULL, invariants TEXT NOT NULL, risk_class TEXT NOT NULL,
+              status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS research_hypotheses (
+              id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, workflow_id TEXT,
+              fingerprint TEXT NOT NULL, category TEXT NOT NULL, statement TEXT NOT NULL,
+              status TEXT NOT NULL, priority INTEGER NOT NULL, evidence_ids TEXT NOT NULL,
+              counterevidence_ids TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+              last_tested_at TEXT, next_action TEXT NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(campaign_id,fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS campaign_iterations (
+              id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, run_id TEXT,
+              sequence INTEGER NOT NULL, status TEXT NOT NULL, plan TEXT NOT NULL,
+              results TEXT NOT NULL, started_at TEXT, completed_at TEXT,
+              created_at TEXT NOT NULL, UNIQUE(campaign_id,sequence)
+            );
+            CREATE INDEX IF NOT EXISTS campaign_engagement_idx ON research_campaigns(engagement_id,updated_at);
+            CREATE INDEX IF NOT EXISTS workflow_campaign_idx ON business_workflows(campaign_id,updated_at);
+            CREATE INDEX IF NOT EXISTS hypothesis_campaign_idx ON research_hypotheses(campaign_id,priority,updated_at);
             """
         )
         migrate_legacy_findings(db)
@@ -387,6 +418,42 @@ class StartAnalysisInput(BaseModel):
     include_strix: bool = False
     include_shannon: bool = False
     include_native_agent: bool = True
+
+
+class ResearchCampaignInput(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    objective: str = Field(min_length=8, max_length=4000)
+    strategy: Literal["breadth_first", "depth_first", "risk_weighted", "business_logic"] = "business_logic"
+    max_iterations: int = Field(default=20, ge=1, le=500)
+    horizon_days: int = Field(default=30, ge=1, le=3650)
+    coverage_target: float = Field(default=.85, ge=.1, le=1)
+
+
+class WorkflowStepInput(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    method: Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+    url: str = Field(min_length=4, max_length=2048)
+    actor_role: str | None = Field(default=None, max_length=80)
+    state_before: str = Field(default="", max_length=1000)
+    expected_transition: str = Field(default="", max_length=2000)
+    replay_safe: bool = True
+
+
+class BusinessWorkflowInput(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    objective: str = Field(min_length=8, max_length=2000)
+    preconditions: list[str] = Field(default_factory=list, max_length=50)
+    steps: list[WorkflowStepInput] = Field(min_length=1, max_length=100)
+    invariants: list[str] = Field(min_length=1, max_length=100)
+    risk_class: Literal["read_only", "reversible", "state_changing"] = "read_only"
+
+
+class ResearchHypothesisInput(BaseModel):
+    workflow_id: str | None = None
+    category: str = Field(min_length=2, max_length=120)
+    statement: str = Field(min_length=8, max_length=4000)
+    priority: int = Field(default=50, ge=1, le=100)
+    next_action: str = Field(default="等待测试计划", max_length=2000)
 
 
 def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) -> list[str]:
@@ -1666,6 +1733,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         source.close()
     backup_path.chmod(0o600)
     tables = (
+        "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
         "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
         "graveyard", "coverage_v2", "identity_profiles", "identities", "program_snapshots", "submission_packages_v2",
         "report_previews", "canonical_findings", "verification_attempts", "candidate_findings",
@@ -1795,6 +1863,165 @@ def role_matrix(engagement_id: str):
                 "ready": left["session_status"] == right["session_status"] == "ready",
             })
     return {"engagement_id": engagement_id, "identities": identities, "pairs": pairs, "ready_pairs": sum(1 for pair in pairs if pair["ready"])}
+
+
+def hydrate_campaign(row: sqlite3.Row) -> dict[str, Any]:
+    value = dict(row)
+    with connect() as db:
+        value["workflow_count"] = db.execute("SELECT COUNT(*) FROM business_workflows WHERE campaign_id=? AND status='active'", (value["id"],)).fetchone()[0]
+        value["hypothesis_count"] = db.execute("SELECT COUNT(*) FROM research_hypotheses WHERE campaign_id=? AND status!='archived'", (value["id"],)).fetchone()[0]
+        value["open_hypotheses"] = db.execute("SELECT COUNT(*) FROM research_hypotheses WHERE campaign_id=? AND status IN ('new','planned','testing','open_proof_gap')", (value["id"],)).fetchone()[0]
+    return value
+
+
+@router.post("/engagements/{engagement_id}/campaigns", status_code=201)
+def create_research_campaign(engagement_id: str, body: ResearchCampaignInput):
+    engagement = get_engagement(engagement_id)
+    if engagement["status"] == "archived":
+        raise HTTPException(409, "归档项目不能创建长期研究 Campaign")
+    campaign_id, timestamp = uid("campaign"), utcnow()
+    with connect() as db:
+        db.execute("INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            campaign_id, engagement_id, body.name.strip(), body.objective.strip(), "active",
+            body.strategy, body.max_iterations, 0, body.horizon_days, body.coverage_target,
+            timestamp, timestamp,
+        ))
+    with connect() as db:
+        row = db.execute("SELECT * FROM research_campaigns WHERE id=?", (campaign_id,)).fetchone()
+    return hydrate_campaign(row)
+
+
+@router.get("/engagements/{engagement_id}/campaigns")
+def list_research_campaigns(engagement_id: str):
+    get_engagement(engagement_id)
+    with connect() as db:
+        rows = db.execute("SELECT * FROM research_campaigns WHERE engagement_id=? ORDER BY updated_at DESC", (engagement_id,)).fetchall()
+    return [hydrate_campaign(row) for row in rows]
+
+
+@router.get("/campaigns/{campaign_id}")
+def get_research_campaign(campaign_id: str):
+    with connect() as db:
+        row = db.execute("SELECT * FROM research_campaigns WHERE id=?", (campaign_id,)).fetchone()
+        workflows = [dict(item) for item in db.execute("SELECT * FROM business_workflows WHERE campaign_id=? AND status='active' ORDER BY updated_at DESC", (campaign_id,))]
+        hypotheses = [dict(item) for item in db.execute("SELECT * FROM research_hypotheses WHERE campaign_id=? AND status!='archived' ORDER BY priority DESC,updated_at DESC", (campaign_id,))]
+        iterations = [dict(item) for item in db.execute("SELECT * FROM campaign_iterations WHERE campaign_id=? ORDER BY sequence DESC", (campaign_id,))]
+    if not row:
+        raise HTTPException(404, "Research Campaign 不存在")
+    for workflow in workflows:
+        for key in ("preconditions", "steps", "invariants"):
+            workflow[key] = load(workflow[key], [])
+    for hypothesis in hypotheses:
+        hypothesis["evidence_ids"] = load(hypothesis["evidence_ids"], [])
+        hypothesis["counterevidence_ids"] = load(hypothesis["counterevidence_ids"], [])
+    for iteration in iterations:
+        iteration["plan"] = load(iteration["plan"], {})
+        iteration["results"] = load(iteration["results"], {})
+    return {**hydrate_campaign(row), "workflows": workflows, "hypotheses": hypotheses, "iterations": iterations}
+
+
+@router.post("/campaigns/{campaign_id}/workflows", status_code=201)
+def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
+    campaign = get_research_campaign(campaign_id)
+    engagement = get_engagement(campaign["engagement_id"])
+    blocked = []
+    for index, step in enumerate(body.steps):
+        policy = execution_policy_check(PolicyCheckInput(engagement_id=engagement["id"], target=step.url, action="read"))
+        if not policy["allowed"]:
+            blocked.append({"step": index + 1, "reason": policy["reason"]})
+        if step.method not in {"GET", "HEAD", "OPTIONS"} and body.risk_class == "read_only":
+            blocked.append({"step": index + 1, "reason": "non_read_method_requires_reversible_or_state_changing_risk_class"})
+    if blocked:
+        raise HTTPException(409, {"message": "业务流程包含未授权或风险声明不一致的步骤", "blocked_steps": blocked})
+    workflow_id, timestamp = uid("workflow"), utcnow()
+    with connect() as db:
+        db.execute("INSERT INTO business_workflows VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            workflow_id, campaign_id, engagement["id"], body.name.strip(), body.objective.strip(),
+            dump(body.preconditions), dump([step.model_dump() for step in body.steps]), dump(body.invariants),
+            body.risk_class, "active", timestamp, timestamp,
+        ))
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
+    return {"id": workflow_id, "campaign_id": campaign_id, **body.model_dump(), "status": "active"}
+
+
+@router.post("/campaigns/{campaign_id}/hypotheses", status_code=201)
+def create_research_hypothesis(campaign_id: str, body: ResearchHypothesisInput):
+    campaign = get_research_campaign(campaign_id)
+    if body.workflow_id and not any(item["id"] == body.workflow_id for item in campaign["workflows"]):
+        raise HTTPException(422, "workflow_id 不属于当前 Campaign")
+    fingerprint = hashlib.sha256(f"{body.category.strip().lower()}:{' '.join(body.statement.lower().split())}".encode()).hexdigest()
+    hypothesis_id, timestamp = uid("hypothesis"), utcnow()
+    with connect() as db:
+        existing = db.execute("SELECT id FROM research_hypotheses WHERE campaign_id=? AND fingerprint=?", (campaign_id, fingerprint)).fetchone()
+        if existing:
+            raise HTTPException(409, "相同研究假设已存在，将继续累积原记录")
+        db.execute("INSERT INTO research_hypotheses VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            hypothesis_id, campaign_id, body.workflow_id, fingerprint, body.category.strip(), body.statement.strip(),
+            "new", body.priority, dump([]), dump([]), 0, None, body.next_action.strip(), timestamp, timestamp,
+        ))
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
+    return {"id": hypothesis_id, "campaign_id": campaign_id, "fingerprint": fingerprint, "status": "new", **body.model_dump()}
+
+
+@router.post("/campaigns/{campaign_id}/sync-memory")
+def sync_campaign_memory(campaign_id: str):
+    campaign = get_research_campaign(campaign_id)
+    created = linked = 0
+    with connect() as db:
+        candidates = db.execute("SELECT * FROM candidate_findings WHERE engagement_id=? AND status!='archived' ORDER BY updated_at", (campaign["engagement_id"],)).fetchall()
+        for candidate in candidates:
+            fingerprint = hashlib.sha256(f"{candidate['category'].lower()}:{candidate['target'].lower()}:{' '.join(candidate['hypothesis'].lower().split())}".encode()).hexdigest()
+            existing = db.execute("SELECT id,evidence_ids FROM research_hypotheses WHERE campaign_id=? AND fingerprint=?", (campaign_id, fingerprint)).fetchone()
+            evidence_ids = load(candidate["evidence_ids"], [])
+            if existing:
+                merged = list(dict.fromkeys(load(existing["evidence_ids"], []) + evidence_ids))
+                db.execute("UPDATE research_hypotheses SET evidence_ids=?,updated_at=? WHERE id=?", (dump(merged), utcnow(), existing["id"]))
+                linked += 1
+                continue
+            db.execute("INSERT INTO research_hypotheses VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                uid("hypothesis"), campaign_id, None, fingerprint, candidate["category"], candidate["hypothesis"],
+                "verified" if candidate["status"] == "verified" else "open_proof_gap", 60,
+                dump(evidence_ids), dump([]), 0, None, "基于历史 Candidate 规划独立重放与负对照", utcnow(), utcnow(),
+            ))
+            created += 1
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (utcnow(), campaign_id))
+    return {"campaign_id": campaign_id, "candidates_seen": len(candidates), "hypotheses_created": created, "hypotheses_linked": linked}
+
+
+@router.post("/campaigns/{campaign_id}/iterations/plan", status_code=201)
+def plan_campaign_iteration(campaign_id: str):
+    campaign = get_research_campaign(campaign_id)
+    if campaign["iterations_completed"] >= campaign["max_iterations"]:
+        raise HTTPException(409, "Campaign 已达到最大研究轮次")
+    engagement = get_engagement(campaign["engagement_id"])
+    identities = list_identities(engagement["id"])
+    ready = [item for item in identities if item["session_status"] == "ready"]
+    matrix, blocked = [], []
+    for workflow in campaign["workflows"]:
+        for step_index, step in enumerate(workflow["steps"]):
+            eligible = [item for item in ready if not step.get("actor_role") or item["role"] == step["actor_role"]]
+            if not eligible:
+                blocked.append({"workflow_id": workflow["id"], "step": step_index + 1, "reason": "required_identity_not_ready"})
+                continue
+            for identity in eligible:
+                matrix.append({"kind": "baseline", "workflow_id": workflow["id"], "step": step_index + 1, "identity_id": identity["id"], "method": step["method"], "url": step["url"], "expected": step["expected_transition"]})
+            for left in eligible:
+                for right in ready:
+                    if left["id"] == right["id"]:
+                        continue
+                    if left["role"] != right["role"] or left.get("tenant") != right.get("tenant"):
+                        matrix.append({"kind": "cross_identity_replay", "workflow_id": workflow["id"], "step": step_index + 1, "source_identity_id": left["id"], "replay_identity_id": right["id"], "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
+            if step.get("replay_safe"):
+                matrix.append({"kind": "duplicate_replay", "workflow_id": workflow["id"], "step": step_index + 1, "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
+        if len(workflow["steps"]) > 1:
+            matrix.append({"kind": "sequence_violation", "workflow_id": workflow["id"], "sequence": list(reversed(range(1, len(workflow["steps"]) + 1))), "assertions": workflow["invariants"]})
+    sequence = len(campaign["iterations"]) + 1
+    plan = {"strategy": campaign["strategy"], "tests": matrix, "blocked": blocked, "identity_count": len(ready), "workflow_count": len(campaign["workflows"])}
+    iteration_id, timestamp = uid("iteration"), utcnow()
+    with connect() as db:
+        db.execute("INSERT INTO campaign_iterations VALUES(?,?,?,?,?,?,?,?,?,?)", (iteration_id, campaign_id, None, sequence, "planned", dump(plan), dump({}), None, None, timestamp))
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
+    return {"id": iteration_id, "campaign_id": campaign_id, "sequence": sequence, "status": "planned", **plan}
 
 
 @router.post("/program-snapshots", status_code=201)

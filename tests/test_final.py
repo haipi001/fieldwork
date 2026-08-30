@@ -111,6 +111,67 @@ def test_identity_workspace_crud_and_role_matrix_never_echoes_credentials(client
     assert secret.status_code == 422
 
 
+def test_long_running_business_logic_campaign_builds_memory_and_test_matrix(client):
+    engagement = create_ready(client, target="https://logic.test")
+    for label, role, tenant in (("Tenant A user", "user", "tenant-a"), ("Tenant B admin", "admin", "tenant-b")):
+        created = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": label, "role": role, "tenant": tenant, "auth_type": "keychain_reference",
+            "credential_ref": f"keychain://fieldwork/{tenant}-{role}", "session_status": "ready",
+        })
+        assert created.status_code == 201
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Order authorization deep research",
+        "objective": "Continuously test order ownership, transitions and replay resistance",
+        "strategy": "business_logic", "max_iterations": 30, "horizon_days": 90, "coverage_target": .9,
+    })
+    assert campaign.status_code == 201
+    campaign_id = campaign.json()["id"]
+    workflow = client.post(f"/api/v1/campaigns/{campaign_id}/workflows", json={
+        "name": "Read order detail", "objective": "Compare object ownership decisions across tenants",
+        "preconditions": ["Two ready identities from different tenants"],
+        "steps": [{"name": "Open order", "method": "GET", "url": "https://logic.test/api/orders/42", "actor_role": "user", "state_before": "authenticated", "expected_transition": "No state change", "replay_safe": True}],
+        "invariants": ["A user must never read an order owned by another tenant"], "risk_class": "read_only",
+    })
+    assert workflow.status_code == 201
+    plan = client.post(f"/api/v1/campaigns/{campaign_id}/iterations/plan")
+    assert plan.status_code == 201
+    kinds = {item["kind"] for item in plan.json()["tests"]}
+    assert {"baseline", "cross_identity_replay", "duplicate_replay"} <= kinds
+    assert plan.json()["identity_count"] == 2 and plan.json()["blocked"] == []
+
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+    observation = client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type": "http.authorization", "subject": "GET /api/orders/42",
+        "summary": "Cross-tenant replay returned a distinct object", "source_capability": "http-state-replay", "confidence": .8,
+    }).json()
+    candidate = client.post(f"/api/v1/runs/{run_id}/candidates", json={
+        "title": "Order ownership hypothesis", "category": "CWE-639", "target": "https://logic.test/api/orders/42",
+        "hypothesis": "Order ownership may not be enforced across tenants", "observation_ids": [observation["id"]],
+    })
+    assert candidate.status_code == 201
+    synced = client.post(f"/api/v1/campaigns/{campaign_id}/sync-memory")
+    assert synced.status_code == 200 and synced.json()["hypotheses_created"] == 1
+    synced_again = client.post(f"/api/v1/campaigns/{campaign_id}/sync-memory")
+    assert synced_again.json()["hypotheses_created"] == 0 and synced_again.json()["hypotheses_linked"] == 1
+    detail = client.get(f"/api/v1/campaigns/{campaign_id}").json()
+    assert detail["workflow_count"] == 1 and detail["hypothesis_count"] == 1
+    assert detail["hypotheses"][0]["status"] == "open_proof_gap"
+
+
+def test_business_workflow_rejects_out_of_scope_and_read_only_post(client):
+    engagement = create_ready(client, target="https://workflow-scope.test")
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Scope-safe logic research", "objective": "Test workflows without leaving the frozen scope",
+    }).json()
+    rejected = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+        "name": "Unsafe checkout", "objective": "Must be rejected before becoming a test plan",
+        "steps": [{"name": "Submit", "method": "POST", "url": "https://outside.test/checkout"}],
+        "invariants": ["No out-of-scope request"], "risk_class": "read_only",
+    })
+    assert rejected.status_code == 409
+    blockers = rejected.json()["detail"]["blocked_steps"]
+    assert {item["reason"] for item in blockers} == {"out_of_scope", "non_read_method_requires_reversible_or_state_changing_risk_class"}
+
 def test_execution_plan_exposes_real_tools_budgets_degradation_and_scope_blockers(client, monkeypatch):
     monkeypatch.setattr(final_core, "capability_inventory", lambda: [
         {"id": "subfinder", "available": True, "configured": True, "ready": True, "version": "v1"},

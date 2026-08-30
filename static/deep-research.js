@@ -1,0 +1,45 @@
+(() => {
+  const dialog = document.createElement('dialog');
+  dialog.id = 'deepResearchDialog';
+  dialog.className = 'deep-research-dialog';
+  dialog.innerHTML = `<div class="deep-research-shell">
+    <header><div><p class="eyebrow">LONG-RUNNING RESEARCH</p><h2>长期深挖 Campaign</h2><p>跨多次运行保存业务流程、安全不变量、研究假设、失败反证和下一步测试。</p></div><button class="close-button" aria-label="关闭">×</button></header>
+    <div class="deep-research-layout"><aside><div class="deep-aside-heading"><b>研究 Campaign</b><button id="newCampaign" class="text-action">新建 +</button></div><div id="campaignList"></div></aside>
+    <main><section id="campaignEmpty" class="deep-empty"><h3>建立长期研究，而不是一次性扫描</h3><p>先创建 Campaign，再描述真实业务流程和必须始终成立的安全不变量。</p></section><section id="campaignWorkspace" hidden><div id="campaignOverview"></div><div class="deep-toolbar"><button id="syncCampaignMemory" class="quiet-button">同步历史假设</button><button id="planCampaignIteration" class="primary-action compact"><span>生成下一轮矩阵</span><b>→</b></button></div><div id="iterationPlan"></div><section class="workflow-section"><div class="section-heading"><div><h3>业务流程与不变量</h3><p>当前版本先支持受 Scope 保护的只读流程；状态变更执行将在隔离环境和显式授权后开放。</p></div></div><div id="workflowList"></div><button id="showWorkflowForm" class="quiet-button">添加业务流程</button></section></section></main></div>
+    <form id="campaignForm" class="deep-form" hidden><div class="dialog-top"><h3>新建长期 Campaign</h3><button type="button" data-close-form class="close-button">×</button></div><label>名称<input id="campaignName" required placeholder="例如：订单与退款权限深挖"></label><label>长期目标<textarea id="campaignObjective" required rows="3" placeholder="说明需要持续证明的业务风险、角色和状态边界"></textarea></label><div class="deep-form-grid"><label>策略<select id="campaignStrategy"><option value="business_logic">复杂业务逻辑优先</option><option value="risk_weighted">风险加权</option><option value="depth_first">单路径深入</option><option value="breadth_first">覆盖面优先</option></select></label><label>最大轮次<input id="campaignIterations" type="number" min="1" max="500" value="30"></label><label>研究周期（天）<input id="campaignHorizon" type="number" min="1" max="3650" value="90"></label><label>目标覆盖率<input id="campaignCoverage" type="number" min="0.1" max="1" step="0.05" value="0.9"></label></div><button class="primary-action compact" type="submit">创建 Campaign</button></form>
+    <form id="workflowForm" class="deep-form" hidden><div class="dialog-top"><h3>定义业务流程</h3><button type="button" data-close-workflow class="close-button">×</button></div><label>流程名称<input id="workflowName" required placeholder="例如：查看订单详情"></label><label>测试目标<input id="workflowObjective" required placeholder="比较不同租户对同一业务对象的访问决策"></label><label>只读步骤 URL（每行一个）<textarea id="workflowUrls" required rows="4" placeholder="https://authorized.example/api/orders/42"></textarea></label><label>安全不变量（每行一个）<textarea id="workflowInvariants" required rows="4" placeholder="普通用户不得读取其他租户的订单"></textarea></label><label>执行角色（可选）<input id="workflowRole" placeholder="user"></label><button class="primary-action compact" type="submit">保存流程并校验 Scope</button></form>
+  </div>`;
+  document.body.append(dialog);
+  let engagementId = null, campaigns = [], current = null;
+  const byId = id => document.getElementById(id);
+  const lines = value => [...new Set(value.split(/\r?\n/).map(item => item.trim()).filter(Boolean))];
+
+  async function loadCampaigns(selectId = null) {
+    campaigns = await api(`/api/v1/engagements/${engagementId}/campaigns`);
+    byId('campaignList').innerHTML = campaigns.length ? campaigns.map(item => `<button class="campaign-list-row ${item.id===(selectId||current?.id)?'active':''}" data-campaign="${esc(item.id)}"><b>${esc(item.name)}</b><small>${item.workflow_count} 流程 · ${item.open_hypotheses} 待证明</small><span>${esc(item.strategy)}</span></button>`).join('') : '<div class="empty-state">还没有长期 Campaign。</div>';
+    document.querySelectorAll('[data-campaign]').forEach(button => button.onclick = () => selectCampaign(button.dataset.campaign));
+    if (selectId || (!current && campaigns.length)) await selectCampaign(selectId || campaigns[0].id);
+  }
+  async function selectCampaign(id) {
+    current = await api(`/api/v1/campaigns/${id}`);
+    byId('campaignEmpty').hidden = true; byId('campaignWorkspace').hidden = false;
+    document.querySelectorAll('[data-campaign]').forEach(button => button.classList.toggle('active', button.dataset.campaign===id));
+    byId('campaignOverview').innerHTML = `<div class="campaign-title"><div><small>${esc(current.strategy)}</small><h3>${esc(current.name)}</h3><p>${esc(current.objective)}</p></div><span class="state-badge ready">${esc(current.status)}</span></div><div class="campaign-metrics"><div><small>业务流程</small><b>${current.workflow_count}</b></div><div><small>长期假设</small><b>${current.hypothesis_count}</b></div><div><small>待证明</small><b>${current.open_hypotheses}</b></div><div><small>研究轮次</small><b>${current.iterations_completed}/${current.max_iterations}</b></div><div><small>目标覆盖</small><b>${Math.round(current.coverage_target*100)}%</b></div></div>`;
+    byId('workflowList').innerHTML = current.workflows.length ? current.workflows.map(item => `<article class="workflow-row"><div><b>${esc(item.name)}</b><p>${esc(item.objective)}</p><small>${item.steps.length} 步 · ${item.invariants.length} 个不变量 · ${esc(item.risk_class)}</small></div><ol>${item.invariants.map(value=>`<li>${esc(value)}</li>`).join('')}</ol></article>`).join('') : '<div class="empty-state">尚未定义业务流程。没有流程和不变量，系统只能做通用扫描。</div>';
+    const latest = current.iterations[0]; if (latest) renderPlan(latest.plan, latest.sequence);
+  }
+  function renderPlan(plan, sequence) {
+    const counts = plan.tests.reduce((all,item)=>(all[item.kind]=(all[item.kind]||0)+1,all),{});
+    byId('iterationPlan').innerHTML = `<section class="iteration-plan"><header><div><small>ITERATION ${sequence}</small><h3>下一轮业务逻辑测试矩阵</h3></div><strong>${plan.tests.length} TESTS · ${plan.blocked.length} BLOCKED</strong></header><div class="matrix-kinds">${Object.entries(counts).map(([kind,count])=>`<article><b>${count}</b><span>${esc(kind)}</span></article>`).join('')}</div>${plan.blocked.length?`<div class="matrix-blocked"><b>需要先处理</b>${plan.blocked.map(item=>`<p>流程 ${esc(item.workflow_id)} · 步骤 ${item.step}：${esc(item.reason)}</p>`).join('')}</div>`:''}</section>`;
+  }
+  window.openDeepResearch = async id => { engagementId=id; current=null; dialog.showModal(); try { await loadCampaigns(); } catch (error) { toast(error.message); } };
+  dialog.querySelector('header .close-button').onclick = () => dialog.close();
+  byId('newCampaign').onclick = () => byId('campaignForm').hidden=false;
+  dialog.querySelector('[data-close-form]').onclick = () => byId('campaignForm').hidden=true;
+  byId('showWorkflowForm').onclick = () => byId('workflowForm').hidden=false;
+  dialog.querySelector('[data-close-workflow]').onclick = () => byId('workflowForm').hidden=true;
+  byId('campaignForm').onsubmit = async event => { event.preventDefault(); try { const created=await api(`/api/v1/engagements/${engagementId}/campaigns`,{method:'POST',body:JSON.stringify({name:byId('campaignName').value.trim(),objective:byId('campaignObjective').value.trim(),strategy:byId('campaignStrategy').value,max_iterations:Number(byId('campaignIterations').value),horizon_days:Number(byId('campaignHorizon').value),coverage_target:Number(byId('campaignCoverage').value)})}); event.target.reset(); byId('campaignForm').hidden=true; await loadCampaigns(created.id); toast('长期 Research Campaign 已创建'); } catch(error){toast(error.message)} };
+  byId('workflowForm').onsubmit = async event => { event.preventDefault(); if(!current)return; const urls=lines(byId('workflowUrls').value),role=byId('workflowRole').value.trim()||null; try { await api(`/api/v1/campaigns/${current.id}/workflows`,{method:'POST',body:JSON.stringify({name:byId('workflowName').value.trim(),objective:byId('workflowObjective').value.trim(),preconditions:role?[`需要可用角色：${role}`]:[],steps:urls.map((url,index)=>({name:`步骤 ${index+1}`,method:'GET',url,actor_role:role,state_before:'authenticated',expected_transition:'no state change',replay_safe:true})),invariants:lines(byId('workflowInvariants').value),risk_class:'read_only'})}); event.target.reset(); byId('workflowForm').hidden=true; await selectCampaign(current.id); await loadCampaigns(current.id); toast('业务流程已保存并通过 Scope 校验'); } catch(error){toast(error.message)} };
+  byId('syncCampaignMemory').onclick = async () => { if(!current)return; try { const result=await api(`/api/v1/campaigns/${current.id}/sync-memory`,{method:'POST'}); await selectCampaign(current.id); await loadCampaigns(current.id); toast(`已同步历史：新增 ${result.hypotheses_created}，关联 ${result.hypotheses_linked}`); } catch(error){toast(error.message)} };
+  byId('planCampaignIteration').onclick = async () => { if(!current)return; try { const result=await api(`/api/v1/campaigns/${current.id}/iterations/plan`,{method:'POST'}); renderPlan(result,result.sequence); await selectCampaign(current.id); toast(`第 ${result.sequence} 轮已生成 ${result.tests.length} 个测试项`); } catch(error){toast(error.message)} };
+})();

@@ -39,6 +39,7 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - 报告编译器只读取 CanonicalFinding；缺字段输出 `MISSING_REQUIRED_FIELD`，不会编造内容。
 - 导出只生成本地 Submission Package，不自动登录或提交任何漏洞平台。
 - 生产网与公共测试网 Web3 写入失败关闭；写入只允许真实 Anvil local fork / local devnet，不需要真实私钥。
+- Web3 链上合约启动前必须生成部署对齐 ProgramSnapshot：本地源码编译、编译器/优化参数、固定区块、Chain ID、EIP-1967 Proxy Implementation 与 Runtime Bytecode SHA-256 均必须一致。不对齐时阻断真实任务；RPC URL 和原始 bytecode 不持久化。
 - Heavy tools 是可选能力；缺失时 Settings 显示 `MISSING/degraded`，不伪造可用状态。
 
 ## 数据与恢复

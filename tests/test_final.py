@@ -418,6 +418,94 @@ def test_web3_chain_real_run_requires_source_and_https_fork(client):
     assert insecure.status_code == 422 and "HTTPS" in insecure.json()["detail"]
 
 
+def test_web3_deployment_alignment_binds_bytecode_block_chain_and_program_snapshot(client, monkeypatch):
+    address = "0x3333333333333333333333333333333333333333"
+    engagement = create_ready(client, "web3", address)
+    fixture = app.ROOT / "fixtures" / "web3-vault"
+    artifact = json.loads((fixture / "out" / "Vault.sol" / "Vault.json").read_text())
+    runtime = artifact["deployedBytecode"]["object"]
+
+    class RpcHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            results = {
+                "eth_chainId": "0x7a69",
+                "eth_blockNumber": "0x2a",
+                "eth_getCode": runtime,
+                "eth_getStorageAt": "0x" + "00" * 32,
+            }
+            payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": results[body["method"]]}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RpcHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    monkeypatch.setattr(web3_analysis, "run_forge_build", lambda _root: {"status": "compiled"})
+    rpc_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        response = client.post("/api/v1/web3/deployment-alignments", json={
+            "engagement_id": engagement["id"], "source_path": str(fixture), "rpc_url": rpc_url,
+            "contract_address": address, "artifact_contract": "Vault", "expected_chain_id": 31337,
+        })
+    finally:
+        server.shutdown(); server.server_close()
+    assert response.status_code == 201, response.text
+    value = response.json()
+    assert value["status"] == "aligned" and value["runtime_bytecode_match"] is True
+    assert value["chain_id"] == 31337 and value["block_number"] == 42
+    assert value["artifact_contract"] == "Vault" and value["compiler_version"].startswith("0.8.24")
+    assert "rpc" not in json.dumps(value).lower()
+    snapshots = client.get(f"/api/v1/web3/engagements/{engagement['id']}/deployment-alignments").json()
+    assert snapshots[0]["id"] == value["program_snapshot_id"]
+    persisted = json.dumps(snapshots)
+    assert rpc_url not in persisted and runtime not in persisted
+    plan = client.post(f"/api/v1/engagements/{engagement['id']}/execution-plan", json={
+        "execution_mode": "real", "source_path": str(fixture), "fork_rpc_url": "https://rpc.example.test",
+        "fork_block_number": 42, "chain_id": 31337,
+    })
+    assert plan.status_code == 200
+    assert "deployment_alignment" not in {item["id"] for item in plan.json()["blockers"]}
+
+
+def test_web3_deployment_alignment_blocks_bytecode_or_chain_mismatch(client, monkeypatch):
+    address = "0x4444444444444444444444444444444444444444"
+    engagement = create_ready(client, "web3", address)
+    fixture = app.ROOT / "fixtures" / "web3-vault"
+
+    class RpcHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            results = {"eth_chainId": "0x1", "eth_blockNumber": "0x64", "eth_getCode": "0x6001600055", "eth_getStorageAt": "0x" + "00" * 32}
+            payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": results[body["method"]]}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RpcHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    monkeypatch.setattr(web3_analysis, "run_forge_build", lambda _root: {"status": "compiled"})
+    try:
+        response = client.post("/api/v1/web3/deployment-alignments", json={
+            "engagement_id": engagement["id"], "source_path": str(fixture),
+            "rpc_url": f"http://127.0.0.1:{server.server_port}", "contract_address": address,
+            "artifact_contract": "Vault", "expected_chain_id": 31337,
+        })
+    finally:
+        server.shutdown(); server.server_close()
+    assert response.status_code == 201
+    value = response.json()
+    assert value["status"] == "blocked" and value["runtime_bytecode_match"] is False
+    assert {item.split(":")[0] for item in value["blockers"]} == {"chain_id_mismatch", "runtime_bytecode_mismatch"}
+    plan = client.post(f"/api/v1/engagements/{engagement['id']}/execution-plan", json={
+        "execution_mode": "real", "source_path": str(fixture), "fork_rpc_url": "https://rpc.example.test",
+    }).json()
+    assert "deployment_alignment" in {item["id"] for item in plan["blockers"]}
+
+
 @pytest.mark.skipif(not web3_lab.binary("forge"), reason="Forge optional capability not installed")
 def test_foundry_compile_and_protocol_model(client):
     engagement = create_ready(client, "web3", "0x3333333333333333333333333333333333333333")

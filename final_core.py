@@ -408,6 +408,20 @@ def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) 
     return list(dict.fromkeys(planned))
 
 
+def latest_deployment_alignment(engagement_id: str) -> dict[str, Any] | None:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC", (engagement_id,),
+        ).fetchall()
+    for row in rows:
+        value = dict(row)
+        rules = load(value["rules"], {})
+        if rules.get("kind") == "deployment_alignment":
+            value["rules"] = rules
+            return value
+    return None
+
+
 def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -> dict[str, Any]:
     blockers: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
@@ -425,6 +439,19 @@ def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -
         parsed_rpc = urlparse(body.fork_rpc_url or "")
         if parsed_rpc.scheme != "https" or not parsed_rpc.netloc:
             blockers.append({"id": "fork_rpc", "message": "链上目标需要 HTTPS RPC 创建本地 Fork"})
+        alignment = latest_deployment_alignment(engagement["id"])
+        rules = alignment["rules"] if alignment else {}
+        if not alignment:
+            blockers.append({"id": "deployment_alignment", "message": "必须先证明本地源码与链上 Runtime Bytecode 一致"})
+        elif rules.get("status") != "aligned":
+            blockers.append({"id": "deployment_alignment", "message": "最新部署对齐未通过，不能把本地结果归因到链上合约"})
+        else:
+            if source and Path(alignment.get("source_uri") or "").resolve() != source.resolve():
+                blockers.append({"id": "deployment_alignment", "message": "当前源码目录与已对齐 ProgramSnapshot 不一致"})
+            if body.chain_id and rules.get("chain_id") != body.chain_id:
+                blockers.append({"id": "deployment_alignment", "message": "当前 Chain ID 与已对齐 ProgramSnapshot 不一致"})
+            if body.fork_block_number is not None and rules.get("block_number") != body.fork_block_number:
+                blockers.append({"id": "deployment_alignment", "message": "当前 Fork 区块与已对齐 ProgramSnapshot 不一致"})
     if body.include_shannon and (engagement["mode"] != "traditional" or repository or not body.source_path):
         blockers.append({"id": "shannon", "message": "Shannon 需要 Traditional 运行 URL 和本地源码"})
 
@@ -749,6 +776,16 @@ async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = N
             parsed_rpc = urlparse(body.fork_rpc_url)
             if parsed_rpc.scheme != "https" or not parsed_rpc.netloc:
                 raise HTTPException(422, "RPC Fork 地址必须使用 HTTPS")
+            alignment = latest_deployment_alignment(engagement_id)
+            rules = alignment["rules"] if alignment else {}
+            if not alignment or rules.get("status") != "aligned":
+                raise HTTPException(409, "必须先完成 source/compiler/runtime bytecode 部署对齐")
+            if Path(alignment.get("source_uri") or "").resolve() != source.resolve():
+                raise HTTPException(409, "当前 source 与已对齐 ProgramSnapshot 不一致")
+            if body.chain_id and rules.get("chain_id") != body.chain_id:
+                raise HTTPException(409, "当前 Chain ID 与已对齐 ProgramSnapshot 不一致")
+            if body.fork_block_number is not None and rules.get("block_number") != body.fork_block_number:
+                raise HTTPException(409, "当前 Fork 区块与已对齐 ProgramSnapshot 不一致")
             body = body.model_copy(update={"source_path": str(source.resolve()), "include_code": True, "include_recon": False, "include_native_agent": False})
         db.execute("INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             run_id, engagement_id, engagement["mode"], engagement["current_scope_snapshot_id"],
@@ -1365,9 +1402,12 @@ def download_package(package_id: str):
 
 
 @router.get("/capabilities")
-def capabilities():
+def capabilities(refresh: bool = False):
     from traditional_tools import shannon_configured, shannon_ready, strix_configured, strix_sandbox_ready
-    items = capability_inventory()
+    try:
+        items = capability_inventory(refresh=refresh)
+    except TypeError:  # test or extension adapters may expose the legacy no-argument contract
+        items = capability_inventory()
     for item in items:
         item["requires_docker"] = item["id"] in {"strix", "shannon"}
         item["execution_backend"] = "docker_optional" if item["requires_docker"] else "local_native"

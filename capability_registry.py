@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -54,6 +55,8 @@ SPECS = {
     "medusa": ("web3", "medusa", "AGPL-3.0", "Parallel Solidity fuzzer"),
     "halmos": ("web3", "halmos", "AGPL-3.0", "Symbolic testing"),
 }
+
+_INVENTORY_CACHE: tuple[float, list[dict]] | None = None
 
 
 def resolve_executable(name: str) -> str | None:
@@ -111,8 +114,15 @@ def detect(capability_id: str) -> Capability:
     return Capability(capability_id, domain, executable, bool(executable), version, license_name, detail)
 
 
-def inventory() -> list[dict]:
-    return [asdict(detect(name)) for name in SPECS]
+def inventory(refresh: bool = False) -> list[dict]:
+    """Return a short-lived version probe snapshot so plan dialogs stay responsive."""
+    global _INVENTORY_CACHE
+    now = time.monotonic()
+    if not refresh and _INVENTORY_CACHE and now - _INVENTORY_CACHE[0] < 60:
+        return [dict(item) for item in _INVENTORY_CACHE[1]]
+    values = [asdict(detect(name)) for name in SPECS]
+    _INVENTORY_CACHE = (now, values)
+    return [dict(item) for item in values]
 
 
 def execute(capability_id: str, args: list[str], cwd: Path, timeout: int = 120) -> ToolResultEnvelope:

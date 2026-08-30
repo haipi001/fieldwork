@@ -4,8 +4,11 @@ import hashlib
 import json
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -33,6 +36,93 @@ class Web3ToolInput(BaseModel):
     run_id: str
     source_path: str
     args: list[str] = Field(default_factory=list)
+
+
+class DeploymentAlignmentInput(BaseModel):
+    engagement_id: str
+    source_path: str
+    rpc_url: str
+    contract_address: str
+    artifact_contract: str | None = None
+    block_number: int | None = Field(default=None, ge=0)
+    expected_chain_id: int | None = Field(default=None, ge=1)
+
+
+EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+
+def _evm_address(value: str) -> str:
+    address = value.strip().lower()
+    if not re.fullmatch(r"0x[0-9a-f]{40}", address):
+        raise HTTPException(422, "无效 EVM 合约地址")
+    return address
+
+
+def _rpc_endpoint(value: str) -> str:
+    parsed = urlparse(value.strip())
+    if parsed.username or parsed.password:
+        raise HTTPException(422, "RPC URL 不能包含内嵌凭据")
+    local = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    if parsed.scheme != "https" and not (local and parsed.scheme == "http"):
+        raise HTTPException(422, "远程 RPC 必须使用 HTTPS；本机 RPC 可使用 localhost")
+    if not parsed.hostname:
+        raise HTTPException(422, "无效 RPC URL")
+    return value.strip()
+
+
+def _rpc_call(endpoint: str, method: str, params: list[Any]) -> Any:
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read(2_000_000))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        raise HTTPException(409, f"RPC 只读检查失败：{type(error).__name__}") from error
+    if payload.get("error"):
+        message = str(payload["error"].get("message", "RPC error"))[:300]
+        raise HTTPException(409, f"RPC 只读检查失败：{message}")
+    return payload.get("result")
+
+
+def _hex_bytes(value: str | None) -> bytes:
+    raw = (value or "").removeprefix("0x")
+    if not raw:
+        return b""
+    try:
+        return bytes.fromhex(raw)
+    except ValueError as error:
+        raise HTTPException(409, "RPC 或编译产物返回了无效 bytecode") from error
+
+
+def deployment_artifacts(root: Path) -> list[dict[str, Any]]:
+    values = []
+    for path in sorted((root / "out").rglob("*.json")) if (root / "out").is_dir() else []:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        deployed = data.get("deployedBytecode", {}).get("object", "")
+        code = _hex_bytes(deployed)
+        if not code:
+            continue
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        compiler = metadata.get("compiler") if isinstance(metadata.get("compiler"), dict) else {}
+        settings = metadata.get("settings") if isinstance(metadata.get("settings"), dict) else {}
+        optimizer = settings.get("optimizer") if isinstance(settings.get("optimizer"), dict) else {}
+        values.append({
+            "contract": path.stem,
+            "artifact": str(path.relative_to(root)),
+            "runtime_bytecode_sha256": hashlib.sha256(code).hexdigest(),
+            "runtime_bytecode_bytes": len(code),
+            "compiler_version": compiler.get("version"),
+            "optimizer_enabled": optimizer.get("enabled"),
+            "optimizer_runs": optimizer.get("runs"),
+            "evm_version": settings.get("evmVersion"),
+        })
+    return values
 
 
 def detect_framework(root: Path) -> str:
@@ -111,6 +201,113 @@ def compiler_model(root: Path) -> list[dict[str, Any]]:
             "ast": {"nodeType": ast.get("nodeType"), "src": ast.get("src"), "nodes": len(ast.get("nodes", []))},
         })
     return normalized
+
+
+@router.post("/deployment-alignments", status_code=201)
+def align_deployment(body: DeploymentAlignmentInput):
+    """Bind a local build artifact to read-only chain state without persisting the RPC URL."""
+    import final_core
+
+    engagement = final_core.get_engagement(body.engagement_id)
+    if engagement["mode"] != "web3" or engagement.get("target_type") != "contract":
+        raise HTTPException(409, "部署对齐必须绑定 Web3 合约地址项目")
+    address = _evm_address(body.contract_address)
+    if address != engagement["normalized_target"].lower():
+        raise HTTPException(409, "合约地址不属于当前冻结 Scope")
+    root = Path(body.source_path).expanduser().resolve()
+    if not root.is_dir() or not solidity_sources(root):
+        raise HTTPException(422, "source_path 必须包含 Solidity 源码")
+    endpoint = _rpc_endpoint(body.rpc_url)
+    compile_result = run_forge_build(root) if detect_framework(root) == "foundry" else {"status": "not_run"}
+    if compile_result.get("status") != "compiled":
+        raise HTTPException(409, "本地源码未成功编译，不能执行部署字节码对齐")
+    artifacts = deployment_artifacts(root)
+    if body.artifact_contract:
+        artifacts = [item for item in artifacts if item["contract"] == body.artifact_contract]
+        if not artifacts:
+            raise HTTPException(409, "未找到指定合约的 deployedBytecode 编译产物")
+    if not artifacts:
+        raise HTTPException(409, "编译完成但未找到 deployedBytecode 产物")
+
+    chain_id = int(_rpc_call(endpoint, "eth_chainId", []), 16)
+    block = body.block_number if body.block_number is not None else int(_rpc_call(endpoint, "eth_blockNumber", []), 16)
+    block_tag = hex(block)
+    target_code = _hex_bytes(_rpc_call(endpoint, "eth_getCode", [address, block_tag]))
+    if not target_code:
+        raise HTTPException(409, "固定区块上未发现目标合约 Runtime Bytecode")
+    slot = _rpc_call(endpoint, "eth_getStorageAt", [address, EIP1967_IMPLEMENTATION_SLOT, block_tag]) or "0x"
+    implementation = None
+    slot_bytes = _hex_bytes(slot)
+    if len(slot_bytes) >= 20 and any(slot_bytes[-20:]):
+        implementation = "0x" + slot_bytes[-20:].hex()
+    comparison_address = implementation or address
+    chain_code = _hex_bytes(_rpc_call(endpoint, "eth_getCode", [comparison_address, block_tag])) if implementation else target_code
+    chain_hash = hashlib.sha256(chain_code).hexdigest()
+    matches = [item for item in artifacts if item["runtime_bytecode_sha256"] == chain_hash]
+    selected = matches[0] if matches else (artifacts[0] if len(artifacts) == 1 else None)
+    chain_ok = body.expected_chain_id is None or body.expected_chain_id == chain_id
+    bytecode_ok = bool(matches)
+    status = "aligned" if chain_ok and bytecode_ok else "blocked"
+    blockers = []
+    if not chain_ok:
+        blockers.append(f"chain_id_mismatch: expected {body.expected_chain_id}, received {chain_id}")
+    if not bytecode_ok:
+        blockers.append("runtime_bytecode_mismatch")
+    try:
+        source_commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        source_commit = None
+    alignment = {
+        "kind": "deployment_alignment",
+        "status": status,
+        "chain_id": chain_id,
+        "block_number": block,
+        "contract_address": address,
+        "proxy_detected": bool(implementation),
+        "implementation_address": implementation,
+        "comparison_address": comparison_address,
+        "source_commit": source_commit,
+        "artifact_contract": selected["contract"] if selected else body.artifact_contract,
+        "artifact_path": selected["artifact"] if selected else None,
+        "compiler_version": selected["compiler_version"] if selected else None,
+        "optimizer_enabled": selected["optimizer_enabled"] if selected else None,
+        "optimizer_runs": selected["optimizer_runs"] if selected else None,
+        "evm_version": selected["evm_version"] if selected else None,
+        "local_runtime_sha256": selected["runtime_bytecode_sha256"] if selected else None,
+        "chain_runtime_sha256": chain_hash,
+        "runtime_bytecode_match": bytecode_ok,
+        "blockers": blockers,
+    }
+    snapshot = final_core.create_program_snapshot(final_core.ProgramSnapshotInput(
+        engagement_id=body.engagement_id,
+        platform="immunefi",
+        rules=alignment,
+        source_uri=str(root),
+    ))
+    # The RPC URL and raw bytecode are intentionally absent from ProgramSnapshot and API output.
+    return {"program_snapshot_id": snapshot["id"], "program_snapshot_version": snapshot["version"], **alignment}
+
+
+@router.get("/engagements/{engagement_id}/deployment-alignments")
+def list_deployment_alignments(engagement_id: str):
+    import final_core
+
+    engagement = final_core.get_engagement(engagement_id)
+    if engagement["mode"] != "web3":
+        raise HTTPException(409, "部署对齐仅用于 Web3 Engagement")
+    with final_core.connect() as db:
+        rows = db.execute(
+            "SELECT * FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC", (engagement_id,),
+        ).fetchall()
+    values = []
+    for row in rows:
+        value = dict(row)
+        value["rules"] = final_core.load(value["rules"], {})
+        if value["rules"].get("kind") == "deployment_alignment":
+            values.append(value)
+    return values
 
 
 @router.post("/source/inspect")

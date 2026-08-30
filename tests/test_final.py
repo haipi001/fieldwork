@@ -175,11 +175,40 @@ def test_multiple_runs_can_execute_concurrently_and_have_zero_finding_report(cli
     report = client.get(f"/api/v1/runs/{run_one.json()['id']}/summary-report")
     assert report.status_code == 200
     assert report.json()["counts"]["verified"] == 0
+    assert report.json()["counts"]["tests"] == 5
+    assert len(report.json()["tests"]) == 5
+    assert "实际测试与反馈" in report.json()["content"]
     assert "未形成已验证漏洞" in report.json()["content"]
     details = client.get(f"/api/v1/runs/{run_one.json()['id']}/details")
     assert details.status_code == 200
     assert [item["id"] for item in details.json()["test_items"]] == ["subfinder", "httpx", "katana", "nuclei", "native-agent"]
     assert len(details.json()["stages"]) == 8
+
+
+def test_bulk_archive_run_candidates_preserves_evidence_and_report(client):
+    engagement = create_ready(client, target="https://candidate-cleanup.test")
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+    observation = client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type": "http.route", "subject": "GET /admin", "summary": "Route observed",
+        "source_capability": "katana", "confidence": .6,
+    }).json()
+    candidate = client.post(f"/api/v1/runs/{run_id}/candidates", json={
+        "title": "Admin route hypothesis", "category": "exposure",
+        "target": "https://candidate-cleanup.test/admin", "hypothesis": "Needs authorization replay",
+        "observation_ids": [observation["id"]],
+    })
+    assert candidate.status_code == 201
+    assert client.post(f"/api/v1/runs/{run_id}/findings/archive-candidates").status_code == 409
+    with sqlite3.connect(final_core.DB) as db:
+        db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+    cleared = client.post(f"/api/v1/runs/{run_id}/findings/archive-candidates")
+    assert cleared.status_code == 200
+    assert cleared.json()["archived"] == 1 and cleared.json()["evidence_preserved"] is True
+    assert client.get(f"/api/v1/findings?run_id={run_id}").json()["candidates"] == []
+    details = client.get(f"/api/v1/runs/{run_id}/details").json()
+    assert any(item["id"] == observation["id"] for item in details["observations"])
+    report = client.get(f"/api/v1/runs/{run_id}/summary-report")
+    assert report.status_code == 200 and "实际测试与反馈" in report.json()["content"]
 
 
 def test_production_mode_rejects_public_demo_execution(client, monkeypatch):

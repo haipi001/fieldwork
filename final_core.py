@@ -1323,25 +1323,76 @@ def archive_finding(finding_id: str):
     raise HTTPException(404, "Finding 不存在")
 
 
+@router.post("/runs/{run_id}/findings/archive-candidates")
+def archive_run_candidates(run_id: str):
+    """Clear non-verified candidate output for one terminal run, preserving evidence."""
+    run = get_run(run_id)
+    if run["status"] in {"queued", "running", "paused"}:
+        raise HTTPException(409, "运行中的任务仍可能产生候选，请先停止或等待任务结束")
+    with connect() as db:
+        changed = db.execute(
+            """UPDATE candidate_findings SET status='archived',updated_at=?
+               WHERE run_id=? AND status NOT IN ('archived','verified')""",
+            (utcnow(), run_id),
+        )
+        verified = db.execute(
+            "SELECT COUNT(*) FROM candidate_findings WHERE run_id=? AND status='verified'",
+            (run_id,),
+        ).fetchone()[0]
+    return {
+        "run_id": run_id,
+        "archived": changed.rowcount,
+        "verified_preserved": verified,
+        "evidence_preserved": True,
+    }
+
+
 @router.get("/runs/{run_id}/summary-report")
 def run_summary_report(run_id: str):
     run = get_run(run_id)
     engagement = get_engagement(run["engagement_id"])
     findings = list_findings(mode=run["mode"], run_id=run_id)
-    with connect() as db:
-        coverage = [dict(row) for row in db.execute("SELECT * FROM coverage_v2 WHERE run_id=? ORDER BY surface_key", (run_id,))]
+    details = get_run_details(run_id)
+    coverage = details["coverage"]
+    tests = details["test_items"]
     tested = sum(1 for item in coverage if item["state"] == "tested")
+    completed_tests = sum(1 for item in tests if item["status"] == "completed")
+    failed_tests = sum(1 for item in tests if item["status"] == "failed")
+    not_tested = sum(1 for item in tests if item["status"] == "not_tested")
     verdict = "发现已验证漏洞" if findings["verified"] else "本次分析未形成已验证漏洞"
-    content = "\n".join([
+    content_lines = [
         f"# {engagement['name']} 分析总结", "", f"- 目标：{engagement['normalized_target']}",
         f"- 运行：{run_id}", "- 执行模式：真实扫描",
         f"- 状态：{run['status']}", f"- 开始时间：{run['started_at'] or run['created_at']}",
         f"- 完成时间：{run['completed_at'] or run['stopped_at'] or '未结束'}", f"- 结论：{verdict}", "",
         "## 结果统计", "", f"- 候选：{len(findings['candidates'])}", f"- 已验证漏洞：{len(findings['verified'])}",
-        f"- 覆盖项：{len(coverage)}", f"- 已测试覆盖项：{tested}", "",
-        "## 说明", "", "未形成已验证漏洞不等于目标绝对安全。本报告只陈述本次授权范围、工具能力和覆盖账本内的事实。",
-    ])
-    return {"run_id": run_id, "engagement_id": run["engagement_id"], "name": engagement["name"], "verdict": verdict, "counts": {"candidates": len(findings["candidates"]), "verified": len(findings["verified"]), "coverage": len(coverage), "tested": tested}, "content": content}
+        f"- 测试项：{len(tests)}（完成 {completed_tests} / 失败 {failed_tests} / 未测试 {not_tested}）",
+        f"- 覆盖项：{len(coverage)}", f"- 已测试覆盖项：{tested}", "", "## 实际测试与反馈", "",
+    ]
+    if tests:
+        for item in tests:
+            content_lines.extend([
+                f"### {item['label']}", "", f"- 工具/能力：{item['id']}", f"- 状态：{item['status']}",
+                f"- 测试目的：{item['description']}", f"- 执行反馈：{item['result']}",
+                f"- Observation：{item['observation_count']}", "",
+            ])
+    else:
+        content_lines.extend(["本次运行没有形成可核验的测试项记录。", ""])
+    content_lines.extend(["## Coverage Ledger", ""])
+    if coverage:
+        for item in coverage:
+            content_lines.append(f"- [{item['state']}] {item['surface_key']}：{item['reason']}")
+    else:
+        content_lines.append("- 没有覆盖账本记录；不能据此推断目标安全。")
+    content_lines.extend(["", "## 说明", "", "未形成已验证漏洞不等于目标绝对安全。本报告只陈述本次授权范围、实际测试反馈和覆盖账本内的事实。"])
+    return {
+        "run_id": run_id, "engagement_id": run["engagement_id"], "name": engagement["name"],
+        "target": engagement["normalized_target"], "status": run["status"], "verdict": verdict,
+        "counts": {"candidates": len(findings["candidates"]), "verified": len(findings["verified"]),
+                   "coverage": len(coverage), "tested": tested, "tests": len(tests),
+                   "completed_tests": completed_tests, "failed_tests": failed_tests, "not_tested": not_tested},
+        "tests": tests, "coverage": coverage, "content": "\n".join(content_lines),
+    }
 
 
 @router.get("/findings/{finding_id}")

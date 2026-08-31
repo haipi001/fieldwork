@@ -1579,9 +1579,16 @@ def capabilities(refresh: bool = False):
 
 
 @router.get("/runtime/readiness")
-def runtime_readiness():
+def runtime_readiness(lightweight: bool = False):
     """Summarize the default Docker-free production runtime."""
-    items = capabilities()
+    if lightweight:
+        # First-run diagnostics must never wait for every third-party CLI to
+        # answer a version command. The detailed Tool Health refresh still
+        # performs those probes; startup only needs executable presence.
+        from capability_registry import SPECS, resolve_executable
+        items = [{"id": name, "available": bool(resolve_executable(spec[1]))} for name, spec in SPECS.items()]
+    else:
+        items = capabilities()
     by_id = {item["id"]: item for item in items}
     traditional_core = ["httpx", "katana", "nuclei", "semgrep", "gitleaks", "trivy"]
     web3_core = ["forge", "anvil", "cast", "slither", "aderyn", "echidna", "medusa", "halmos"]
@@ -1654,7 +1661,10 @@ def runtime_status():
 
 
 def onboarding_checks(run_fixture_tests: bool = False) -> dict[str, Any]:
-    readiness = runtime_readiness()
+    try:
+        readiness = runtime_readiness(lightweight=True)
+    except TypeError:  # test adapters may expose the legacy no-argument contract
+        readiness = runtime_readiness()
     status = runtime_status()
     version = system_version()
     chrome = status["native_agent"].get("available", False)

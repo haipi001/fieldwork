@@ -173,6 +173,89 @@ def test_business_workflow_rejects_out_of_scope_and_read_only_post(client):
     assert {item["reason"] for item in blockers} == {"out_of_scope", "non_read_method_requires_reversible_or_state_changing_risk_class"}
 
 
+def test_oast_probe_is_scope_gated_correlated_and_redacted(client):
+    denied_engagement = create_ready(client, target="https://oast-denied.test")
+    denied_campaign = client.post(f"/api/v1/engagements/{denied_engagement['id']}/campaigns", json={
+        "name": "Denied OAST", "objective": "Prove OAST remains opt-in for every frozen scope",
+    }).json()
+    denied_run = client.post(f"/api/v1/engagements/{denied_engagement['id']}/start", json={"execution_mode": "demo"}).json()
+    denied = client.post(f"/api/v1/campaigns/{denied_campaign['id']}/oast-probes", json={"run_id": denied_run["id"]})
+    assert denied.status_code == 409 and "未显式允许" in denied.json()["detail"]
+
+    created = client.post("/api/v1/engagements", json={
+        "name": "OAST fixture", "target": "https://oast.test", "mode": "traditional",
+        "scope": {"allow_oast": True, "oast_allowed_hosts": ["callbacks.example.test"]},
+        "policy": {},
+    }).json()
+    engagement = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Async callback campaign", "objective": "Correlate delayed callbacks without treating silence as safety",
+    }).json()
+    hypothesis = client.post(f"/api/v1/campaigns/{campaign['id']}/hypotheses", json={
+        "category": "blind_ssrf", "statement": "An asynchronous worker may fetch an attacker-controlled callback URL",
+        "priority": 90,
+    }).json()
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start", json={"execution_mode": "demo"}).json()["id"]
+    remote_denied = client.post(f"/api/v1/campaigns/{campaign['id']}/oast-probes", json={
+        "run_id": run_id, "callback_base": "https://unapproved.example.test/callback",
+    })
+    assert remote_denied.status_code == 409 and "oast_allowed_hosts" in remote_denied.json()["detail"]
+    probe = client.post(f"/api/v1/campaigns/{campaign['id']}/oast-probes", json={
+        "run_id": run_id, "hypothesis_id": hypothesis["id"],
+        "callback_base": "http://127.0.0.1:8000/api/v1/oast/callback", "expires_minutes": 30,
+    })
+    assert probe.status_code == 201
+    probe_data = probe.json()
+    assert probe_data["status"] == "pending" and probe_data["local_only"] is True
+    token = probe_data["callback_url"].rsplit("/", 1)[1]
+    with sqlite3.connect(final_core.DB) as db:
+        stored = db.execute("SELECT token_sha256 FROM oast_probes WHERE id=?", (probe_data["id"],)).fetchone()[0]
+        assert token not in stored and len(stored) == 64
+    callback = client.post(
+        f"/api/v1/oast/callback/{token}?trace=controlled",
+        headers={"Authorization": "Bearer should-never-persist", "Cookie": "session=should-never-persist"},
+        content="worker reached controlled callback",
+    )
+    assert callback.status_code == 200 and callback.json()["received"] is True
+    probes = client.get(f"/api/v1/campaigns/{campaign['id']}/oast-probes").json()
+    saved = next(item for item in probes if item["id"] == probe_data["id"])
+    assert saved["status"] == "observed" and saved["event_count"] == 1
+    assert saved["callback_url"] is None
+    assert saved["events"][0]["headers"]["authorization"] == "[REDACTED]"
+    assert saved["events"][0]["headers"]["cookie"] == "[REDACTED]"
+    assert "should-never-persist" not in json.dumps(saved)
+    details = client.get(f"/api/v1/runs/{run_id}/details").json()
+    observation = next(item for item in details["observations"] if item["source_capability"] == "oast-callback")
+    assert observation["observation_type"] == "oast_callback"
+    coverage = client.get(f"/api/v1/runs/{run_id}/coverage").json()["coverage"]
+    assert next(item for item in coverage if item["surface_key"] == f"oast:{probe_data['id']}")["state"] == "tested"
+    refreshed = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
+    linked = next(item for item in refreshed["hypotheses"] if item["id"] == hypothesis["id"])
+    assert linked["status"] == "open_proof_gap" and linked["evidence_ids"]
+
+
+def test_expired_oast_probe_keeps_coverage_not_tested(client):
+    created = client.post("/api/v1/engagements", json={
+        "name": "Expired OAST", "target": "https://expired-oast.test", "mode": "traditional",
+        "scope": {"allow_oast": True}, "policy": {},
+    }).json()
+    engagement = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Expiry campaign", "objective": "Keep absent callbacks explicitly untested after expiry",
+    }).json()
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start", json={"execution_mode": "demo"}).json()["id"]
+    probe = client.post(f"/api/v1/campaigns/{campaign['id']}/oast-probes", json={"run_id": run_id}).json()
+    token = probe["callback_url"].rsplit("/", 1)[1]
+    with sqlite3.connect(final_core.DB) as db:
+        db.execute("UPDATE oast_probes SET expires_at=? WHERE id=?", ("2000-01-01T00:00:00+00:00", probe["id"]))
+    expired = client.get(f"/api/v1/campaigns/{campaign['id']}/oast-probes").json()[0]
+    assert expired["status"] == "expired"
+    callback = client.get(f"/api/v1/oast/callback/{token}")
+    assert callback.status_code == 410
+    coverage = client.get(f"/api/v1/runs/{run_id}/coverage").json()["coverage"]
+    assert next(item for item in coverage if item["surface_key"] == f"oast:{probe['id']}")["state"] == "not_tested"
+
+
 def test_campaign_iteration_executes_guarded_cross_identity_and_duplicate_replay(client, monkeypatch):
     class LogicHandler(BaseHTTPRequestHandler):
         def do_GET(self):

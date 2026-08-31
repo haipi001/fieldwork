@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, StreamingResponse
 from reporting import export_bundle, redact, render, universal_model
@@ -254,9 +255,25 @@ def init_final_db() -> None:
               results TEXT NOT NULL, started_at TEXT, completed_at TEXT,
               created_at TEXT NOT NULL, UNIQUE(campaign_id,sequence)
             );
+            CREATE TABLE IF NOT EXISTS oast_probes (
+              id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, run_id TEXT NOT NULL,
+              campaign_id TEXT NOT NULL, hypothesis_id TEXT,
+              token_sha256 TEXT NOT NULL UNIQUE, callback_base TEXT NOT NULL,
+              status TEXT NOT NULL, expires_at TEXT NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS oast_events (
+              id TEXT PRIMARY KEY, probe_id TEXT NOT NULL, transport TEXT NOT NULL,
+              method TEXT NOT NULL, path TEXT NOT NULL, query_preview TEXT NOT NULL,
+              headers TEXT NOT NULL, body_preview TEXT NOT NULL,
+              body_sha256 TEXT NOT NULL, source_address_sha256 TEXT,
+              event_sha256 TEXT NOT NULL, received_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS campaign_engagement_idx ON research_campaigns(engagement_id,updated_at);
             CREATE INDEX IF NOT EXISTS workflow_campaign_idx ON business_workflows(campaign_id,updated_at);
             CREATE INDEX IF NOT EXISTS hypothesis_campaign_idx ON research_hypotheses(campaign_id,priority,updated_at);
+            CREATE INDEX IF NOT EXISTS oast_campaign_idx ON oast_probes(campaign_id,created_at);
+            CREATE INDEX IF NOT EXISTS oast_probe_event_idx ON oast_events(probe_id,received_at);
             """
         )
         migrate_legacy_findings(db)
@@ -468,6 +485,13 @@ class CampaignExecuteInput(BaseModel):
     max_tests: int = Field(default=10, ge=1, le=50)
 
 
+class OastProbeInput(BaseModel):
+    run_id: str
+    hypothesis_id: str | None = None
+    callback_base: str = "http://127.0.0.1:8000/api/v1/oast/callback"
+    expires_minutes: int = Field(default=30, ge=5, le=1440)
+
+
 def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) -> list[str]:
     repository = engagement.get("target_type") == "repository"
     if engagement["mode"] == "web3":
@@ -643,6 +667,8 @@ def create_engagement(body: EngagementInput):
         "denied_targets": [],
         "allowed_actions": ["read", "analyze"],
         "denied_actions": ["destructive", "fund_transfer", "credential_attack"],
+        "allow_oast": False,
+        "oast_allowed_hosts": [],
         "requires_confirmation": True,
         **body.scope,
     }
@@ -1755,7 +1781,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         source.close()
     backup_path.chmod(0o600)
     tables = (
-        "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
+        "oast_events", "oast_probes", "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
         "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
         "graveyard", "coverage_v2", "identity_profiles", "identities", "program_snapshots", "submission_packages_v2",
         "report_previews", "canonical_findings", "verification_attempts", "candidate_findings",
@@ -1939,7 +1965,15 @@ def get_research_campaign(campaign_id: str):
     for iteration in iterations:
         iteration["plan"] = load(iteration["plan"], {})
         iteration["results"] = load(iteration["results"], {})
-    return {**hydrate_campaign(row), "workflows": workflows, "hypotheses": hypotheses, "iterations": iterations}
+    campaign = hydrate_campaign(row)
+    engagement = get_engagement(campaign["engagement_id"])
+    return {
+        **campaign, "workflows": workflows, "hypotheses": hypotheses, "iterations": iterations,
+        "oast_policy": {
+            "allowed": bool(engagement.get("confirmed_at") and engagement["scope"].get("allow_oast", False)),
+            "allowed_hosts": engagement["scope"].get("oast_allowed_hosts", []),
+        },
+    }
 
 
 @router.post("/campaigns/{campaign_id}/workflows", status_code=201)
@@ -2044,6 +2078,184 @@ def update_research_hypothesis(campaign_id: str, hypothesis_id: str, body: Resea
         db.execute("UPDATE research_hypotheses SET " + ",".join(f"{key}=?" for key in values) + " WHERE id=?", (*values.values(), hypothesis_id))
         db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (utcnow(), campaign_id))
     return next(item for item in get_research_campaign(campaign_id)["hypotheses"] if item["id"] == hypothesis_id)
+
+
+def _expire_oast_probes(db: sqlite3.Connection) -> None:
+    timestamp = utcnow()
+    expired = db.execute(
+        "SELECT id,run_id,status FROM oast_probes WHERE status IN ('pending','observed') AND expires_at<=?", (timestamp,),
+    ).fetchall()
+    for row in expired:
+        db.execute("UPDATE oast_probes SET status='expired',updated_at=? WHERE id=?", (timestamp, row["id"]))
+        if row["status"] == "pending":
+            db.execute("""UPDATE coverage_v2 SET state='not_tested',reason=?,updated_at=?
+              WHERE run_id=? AND surface_key=?""", (
+                "探针已过期且未观测到回调；结果保持 NOT TESTED，不能作为安全反证",
+                timestamp, row["run_id"], f"oast:{row['id']}",
+            ))
+
+
+def _hydrate_oast_probe(row: sqlite3.Row, include_events: bool = True) -> dict[str, Any]:
+    value = dict(row)
+    value.pop("token_sha256", None)
+    with connect() as db:
+        events = [dict(item) for item in db.execute(
+            "SELECT * FROM oast_events WHERE probe_id=? ORDER BY received_at DESC", (value["id"],),
+        )] if include_events else []
+    for event in events:
+        event["headers"] = load(event["headers"], {})
+    value["events"] = events
+    value["event_count"] = len(events)
+    value["callback_url"] = None
+    return value
+
+
+def _validate_oast_callback_base(engagement: dict[str, Any], callback_base: str) -> tuple[str, bool]:
+    parsed = urlparse(callback_base.strip().rstrip("/"))
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HTTPException(422, "OAST callback_base 必须是无凭据、无查询参数的 HTTP(S) URL")
+    host = parsed.hostname.lower()
+    local = host in {"localhost", "127.0.0.1", "::1"}
+    allowed_hosts = {str(item).lower().rstrip(".") for item in engagement["scope"].get("oast_allowed_hosts", [])}
+    if not local and parsed.scheme != "https":
+        raise HTTPException(409, "远程 OAST 回调必须使用 HTTPS")
+    if not local and host.rstrip(".") not in allowed_hosts:
+        raise HTTPException(409, "OAST 回调域名未列入冻结 Scope 的 oast_allowed_hosts")
+    return callback_base.strip().rstrip("/"), local
+
+
+@router.post("/campaigns/{campaign_id}/oast-probes", status_code=201)
+def create_oast_probe(campaign_id: str, body: OastProbeInput):
+    campaign = get_research_campaign(campaign_id)
+    engagement = get_engagement(campaign["engagement_id"])
+    if not engagement.get("confirmed_at") or not engagement["scope"].get("allow_oast", False):
+        raise HTTPException(409, "冻结 Scope 未显式允许 OAST")
+    run = get_run(body.run_id)
+    if run["engagement_id"] != engagement["id"] or run["mode"] != "traditional":
+        raise HTTPException(409, "OAST 探针必须绑定当前项目的 Traditional Run")
+    if run["status"] not in {"running", "paused", "completed"}:
+        raise HTTPException(409, "当前 Run 状态不允许创建 OAST 探针")
+    if body.hypothesis_id and not any(item["id"] == body.hypothesis_id for item in campaign["hypotheses"]):
+        raise HTTPException(422, "hypothesis_id 不属于当前 Campaign")
+    callback_base, local_only = _validate_oast_callback_base(engagement, body.callback_base)
+    token = secrets.token_urlsafe(24)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    timestamp = utcnow()
+    expires_at = datetime.fromtimestamp(time.time() + body.expires_minutes * 60, timezone.utc).isoformat()
+    probe_id = uid("oast")
+    with connect() as db:
+        db.execute("INSERT INTO oast_probes VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+            probe_id, engagement["id"], body.run_id, campaign_id, body.hypothesis_id,
+            token_hash, callback_base, "pending", expires_at, timestamp, timestamp,
+        ))
+        db.execute("""INSERT INTO coverage_v2 VALUES(?,?,?,?,?,?,?)
+          ON CONFLICT(run_id,surface_key) DO UPDATE SET state=excluded.state,reason=excluded.reason,updated_at=excluded.updated_at""", (
+            uid("coverage"), body.run_id, f"oast:{probe_id}", "not_tested",
+            "等待短期异步回调；过期无回调仍保持 NOT TESTED", dump([]), timestamp,
+        ))
+    add_event(body.run_id, "verification", "oast.probe_created", "已创建短期 OAST 关联探针，等待异步回调", {
+        "probe_id": probe_id, "expires_at": expires_at, "local_only": local_only,
+    })
+    return {
+        "id": probe_id, "campaign_id": campaign_id, "run_id": body.run_id,
+        "hypothesis_id": body.hypothesis_id, "status": "pending", "expires_at": expires_at,
+        "callback_url": f"{callback_base}/{token}", "local_only": local_only,
+        "warning": "回调 URL 仅本次返回；请注入授权测试输入。无回调不代表无漏洞。",
+    }
+
+
+@router.get("/campaigns/{campaign_id}/oast-probes")
+def list_oast_probes(campaign_id: str):
+    get_research_campaign(campaign_id)
+    with connect() as db:
+        _expire_oast_probes(db)
+        rows = db.execute("SELECT * FROM oast_probes WHERE campaign_id=? ORDER BY created_at DESC", (campaign_id,)).fetchall()
+    return [_hydrate_oast_probe(row) for row in rows]
+
+
+@router.post("/oast-probes/{probe_id}/revoke")
+def revoke_oast_probe(probe_id: str):
+    with connect() as db:
+        row = db.execute("SELECT * FROM oast_probes WHERE id=?", (probe_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "OAST 探针不存在")
+        if row["status"] in {"pending", "observed"}:
+            db.execute("UPDATE oast_probes SET status='revoked',updated_at=? WHERE id=?", (utcnow(), probe_id))
+            if row["status"] == "pending":
+                db.execute("UPDATE coverage_v2 SET reason=?,updated_at=? WHERE run_id=? AND surface_key=?", (
+                    "探针已人工撤销且未观测到回调；结果保持 NOT TESTED", utcnow(), row["run_id"], f"oast:{probe_id}",
+                ))
+    return {"id": probe_id, "status": "revoked" if row["status"] in {"pending", "observed"} else row["status"]}
+
+
+def _safe_oast_headers(headers: Any) -> dict[str, str]:
+    sensitive = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key"}
+    return {
+        str(key): "[REDACTED]" if str(key).lower() in sensitive else redact(str(value))
+        for key, value in headers.items()
+    }
+
+
+@router.api_route("/oast/callback/{token}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "OPTIONS"])
+async def receive_oast_callback(token: str, request: Request):
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with connect() as db:
+        _expire_oast_probes(db)
+        probe = db.execute("SELECT * FROM oast_probes WHERE token_sha256=?", (token_hash,)).fetchone()
+    if not probe:
+        raise HTTPException(404, "OAST 探针不存在")
+    if probe["status"] in {"expired", "revoked"}:
+        raise HTTPException(410, f"OAST 探针已{ '过期' if probe['status']=='expired' else '撤销' }")
+    body = await request.body()
+    if len(body) > 65536:
+        raise HTTPException(413, "OAST 回调体超过 64 KiB")
+    timestamp = utcnow()
+    body_hash = hashlib.sha256(body).hexdigest()
+    headers = _safe_oast_headers(request.headers)
+    query_preview = redact(request.url.query[:2000])
+    body_preview = redact(body.decode(errors="replace")[:4000])
+    source = request.client.host if request.client else ""
+    source_hash = hashlib.sha256(source.encode()).hexdigest() if source else None
+    canonical = dump({
+        "probe_id": probe["id"], "method": request.method, "path": request.url.path,
+        "query": query_preview, "headers": headers, "body_sha256": body_hash, "received_at": timestamp,
+    })
+    event_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    event_id, observation_id, evidence_id = uid("oast-event"), uid("obs"), uid("evidence")
+    summary = f"收到 {request.method} 异步 HTTP 回调；body_sha256={body_hash[:12]}"
+    with connect() as db:
+        db.execute("INSERT INTO oast_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            event_id, probe["id"], "http", request.method, request.url.path, query_preview,
+            dump(headers), body_preview, body_hash, source_hash, event_hash, timestamp,
+        ))
+        db.execute("UPDATE oast_probes SET status='observed',updated_at=? WHERE id=?", (timestamp, probe["id"]))
+        db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+            observation_id, probe["run_id"], probe["engagement_id"], "traditional", "oast_callback",
+            f"oast:{probe['id']}", summary, .98, "oast-callback", event_id, timestamp,
+        ))
+        db.execute("INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)", (
+            evidence_id, observation_id, probe["run_id"], "oast_http_callback", summary,
+            None, "supporting", timestamp,
+        ))
+        db.execute("""INSERT INTO coverage_v2 VALUES(?,?,?,?,?,?,?)
+          ON CONFLICT(run_id,surface_key) DO UPDATE SET state='tested',reason=excluded.reason,
+          observation_ids=excluded.observation_ids,updated_at=excluded.updated_at""", (
+            uid("coverage"), probe["run_id"], f"oast:{probe['id']}", "tested",
+            "已收到关联 HTTP 回调；仍需独立确认触发路径与影响", dump([observation_id]), timestamp,
+        ))
+        if probe["hypothesis_id"]:
+            hypothesis = db.execute("SELECT evidence_ids FROM research_hypotheses WHERE id=?", (probe["hypothesis_id"],)).fetchone()
+            if hypothesis:
+                merged = list(dict.fromkeys(load(hypothesis["evidence_ids"], []) + [evidence_id]))
+                db.execute("""UPDATE research_hypotheses SET status='open_proof_gap',evidence_ids=?,
+                  last_tested_at=?,next_action=?,updated_at=? WHERE id=?""", (
+                    dump(merged), timestamp, "独立重放触发路径，并使用负对照排除背景流量", timestamp, probe["hypothesis_id"],
+                ))
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, probe["campaign_id"]))
+    add_event(probe["run_id"], "verification", "oast.callback_observed", "收到与探针关联的异步 HTTP 回调", {
+        "probe_id": probe["id"], "event_id": event_id, "evidence_id": evidence_id,
+    })
+    return {"received": True, "event_id": event_id}
 
 
 def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | None = None) -> dict[str, Any]:

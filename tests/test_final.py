@@ -224,7 +224,36 @@ def test_campaign_iteration_executes_guarded_cross_identity_and_duplicate_replay
         assert any(item["surface_key"].startswith(f"campaign:{campaign['id']}") and item["state"] == "tested" for item in coverage)
         campaign_detail = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
         assert campaign_detail["iterations_completed"] == 1
-        assert any(item["category"] == "access_control_differential" for item in campaign_detail["hypotheses"])
+        hypothesis = next(item for item in campaign_detail["hypotheses"] if item["category"] == "access_control_differential")
+        updated = client.patch(f"/api/v1/campaigns/{campaign['id']}/hypotheses/{hypothesis['id']}", json={
+            "priority": 95, "next_action": "Repeat with an owner and a non-owner negative control",
+        })
+        assert updated.status_code == 200 and updated.json()["priority"] == 95
+        retest = client.post(f"/api/v1/campaigns/{campaign['id']}/hypotheses/{hypothesis['id']}/retest-plan")
+        assert retest.status_code == 201 and retest.json()["strategy"] == "directed_retest"
+        assert {item["workflow_id"] for item in retest.json()["tests"]} == {workflow.json()["id"]}
+        rerun = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{retest.json()['id']}/execute", json={"run_id": run_id, "max_tests": 10})
+        assert rerun.status_code == 200 and rerun.json()["tested"] == 3
+        after = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
+        hypothesis_after = next(item for item in after["hypotheses"] if item["id"] == hypothesis["id"])
+        assert hypothesis_after["status"] == "open_proof_gap" and hypothesis_after["attempts"] >= 2
+        rejected = client.patch(f"/api/v1/campaigns/{campaign['id']}/hypotheses/{hypothesis['id']}", json={"status": "rejected"})
+        assert rejected.status_code == 409 and "反证" in rejected.json()["detail"]
+        counterevidence_id = final_core.uid("evidence")
+        with sqlite3.connect(final_core.DB) as db:
+            observation_id = db.execute("SELECT id FROM observations WHERE run_id=? LIMIT 1", (run_id,)).fetchone()[0]
+            db.execute("INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)", (
+                counterevidence_id, observation_id, run_id, "negative_control",
+                "Owner and non-owner returned the same authorization decision under a controlled negative test",
+                None, "counter", final_core.utcnow(),
+            ))
+        rejected_with_proof = client.patch(f"/api/v1/campaigns/{campaign['id']}/hypotheses/{hypothesis['id']}", json={
+            "status": "rejected", "counterevidence_ids": [counterevidence_id],
+            "next_action": "Retain the negative control and reopen only when the workflow changes",
+        })
+        assert rejected_with_proof.status_code == 200
+        assert rejected_with_proof.json()["status"] == "rejected"
+        assert rejected_with_proof.json()["counterevidence_ids"] == [counterevidence_id]
     finally:
         server.shutdown(); server.server_close()
 

@@ -456,6 +456,13 @@ class ResearchHypothesisInput(BaseModel):
     next_action: str = Field(default="等待测试计划", max_length=2000)
 
 
+class ResearchHypothesisUpdateInput(BaseModel):
+    status: Literal["new", "planned", "testing", "open_proof_gap", "rejected", "archived"] | None = None
+    priority: int | None = Field(default=None, ge=1, le=100)
+    next_action: str | None = Field(default=None, min_length=2, max_length=2000)
+    counterevidence_ids: list[str] | None = Field(default=None, max_length=100)
+
+
 class CampaignExecuteInput(BaseModel):
     run_id: str
     max_tests: int = Field(default=10, ge=1, le=50)
@@ -1993,16 +2000,48 @@ def sync_campaign_memory(campaign_id: str):
     return {"campaign_id": campaign_id, "candidates_seen": len(candidates), "hypotheses_created": created, "hypotheses_linked": linked}
 
 
-@router.post("/campaigns/{campaign_id}/iterations/plan", status_code=201)
-def plan_campaign_iteration(campaign_id: str):
+@router.patch("/campaigns/{campaign_id}/hypotheses/{hypothesis_id}")
+def update_research_hypothesis(campaign_id: str, hypothesis_id: str, body: ResearchHypothesisUpdateInput):
     campaign = get_research_campaign(campaign_id)
-    if campaign["iterations_completed"] >= campaign["max_iterations"]:
-        raise HTTPException(409, "Campaign 已达到最大研究轮次")
+    values = body.model_dump(exclude_none=True)
+    if not values:
+        raise HTTPException(422, "至少提供一个研究假设更新字段")
+    with connect() as db:
+        row = db.execute("SELECT * FROM research_hypotheses WHERE id=? AND campaign_id=?", (hypothesis_id, campaign_id)).fetchone()
+        if not row:
+            raise HTTPException(404, "长期研究假设不存在")
+        transitions = {
+            "new": {"planned", "archived"}, "planned": {"new", "testing", "archived"},
+            "testing": {"planned", "open_proof_gap", "rejected"},
+            "open_proof_gap": {"planned", "testing", "rejected", "archived"},
+            "rejected": {"planned", "archived"}, "verified": {"planned", "archived"},
+        }
+        target_status = values.get("status")
+        if target_status and target_status != row["status"] and target_status not in transitions.get(row["status"], set()):
+            raise HTTPException(409, f"不允许从 {row['status']} 直接变为 {target_status}")
+        if target_status == "rejected" and not values.get("counterevidence_ids") and not load(row["counterevidence_ids"], []):
+            raise HTTPException(409, "拒绝研究假设前必须关联反证 Evidence")
+        if "counterevidence_ids" in values:
+            ids = list(dict.fromkeys(values["counterevidence_ids"]))
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                valid = db.execute(f"""SELECT COUNT(*) FROM evidence_v2 e JOIN analysis_runs r ON r.id=e.run_id
+                  WHERE e.id IN ({marks}) AND r.engagement_id=? AND e.polarity='counter'""", (*ids, campaign["engagement_id"])).fetchone()[0]
+                if valid != len(ids):
+                    raise HTTPException(422, "反证必须属于当前项目且 polarity=counter")
+            values["counterevidence_ids"] = dump(ids)
+        values["updated_at"] = utcnow()
+        db.execute("UPDATE research_hypotheses SET " + ",".join(f"{key}=?" for key in values) + " WHERE id=?", (*values.values(), hypothesis_id))
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (utcnow(), campaign_id))
+    return next(item for item in get_research_campaign(campaign_id)["hypotheses"] if item["id"] == hypothesis_id)
+
+
+def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | None = None) -> dict[str, Any]:
     engagement = get_engagement(campaign["engagement_id"])
-    identities = list_identities(engagement["id"])
-    ready = [item for item in identities if item["session_status"] == "ready"]
+    ready = [item for item in list_identities(engagement["id"]) if item["session_status"] == "ready"]
     matrix, blocked = [], []
-    for workflow in campaign["workflows"]:
+    workflows = [item for item in campaign["workflows"] if not workflow_ids or item["id"] in workflow_ids]
+    for workflow in workflows:
         for step_index, step in enumerate(workflow["steps"]):
             eligible = [item for item in ready if not step.get("actor_role") or item["role"] == step["actor_role"]]
             if not eligible:
@@ -2012,19 +2051,47 @@ def plan_campaign_iteration(campaign_id: str):
                 matrix.append({"kind": "baseline", "workflow_id": workflow["id"], "step": step_index + 1, "identity_id": identity["id"], "method": step["method"], "url": step["url"], "expected": step["expected_transition"]})
             for left in eligible:
                 for right in ready:
-                    if left["id"] == right["id"]:
-                        continue
-                    if left["role"] != right["role"] or left.get("tenant") != right.get("tenant"):
+                    if left["id"] != right["id"] and (left["role"] != right["role"] or left.get("tenant") != right.get("tenant")):
                         matrix.append({"kind": "cross_identity_replay", "workflow_id": workflow["id"], "step": step_index + 1, "source_identity_id": left["id"], "replay_identity_id": right["id"], "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
             if step.get("replay_safe"):
                 matrix.append({"kind": "duplicate_replay", "workflow_id": workflow["id"], "step": step_index + 1, "identity_id": eligible[0]["id"], "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
         if len(workflow["steps"]) > 1:
             matrix.append({"kind": "sequence_violation", "workflow_id": workflow["id"], "sequence": list(reversed(range(1, len(workflow["steps"]) + 1))), "assertions": workflow["invariants"]})
+    return {"tests": matrix, "blocked": blocked, "identity_count": len(ready), "workflow_count": len(workflows)}
+
+
+@router.post("/campaigns/{campaign_id}/iterations/plan", status_code=201)
+def plan_campaign_iteration(campaign_id: str):
+    campaign = get_research_campaign(campaign_id)
+    if campaign["iterations_completed"] >= campaign["max_iterations"]:
+        raise HTTPException(409, "Campaign 已达到最大研究轮次")
+    matrix = _build_campaign_matrix(campaign)
     sequence = len(campaign["iterations"]) + 1
-    plan = {"strategy": campaign["strategy"], "tests": matrix, "blocked": blocked, "identity_count": len(ready), "workflow_count": len(campaign["workflows"])}
+    plan = {"strategy": campaign["strategy"], **matrix}
     iteration_id, timestamp = uid("iteration"), utcnow()
     with connect() as db:
         db.execute("INSERT INTO campaign_iterations VALUES(?,?,?,?,?,?,?,?,?,?)", (iteration_id, campaign_id, None, sequence, "planned", dump(plan), dump({}), None, None, timestamp))
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
+    return {"id": iteration_id, "campaign_id": campaign_id, "sequence": sequence, "status": "planned", **plan}
+
+
+@router.post("/campaigns/{campaign_id}/hypotheses/{hypothesis_id}/retest-plan", status_code=201)
+def plan_hypothesis_retest(campaign_id: str, hypothesis_id: str):
+    campaign = get_research_campaign(campaign_id)
+    hypothesis = next((item for item in campaign["hypotheses"] if item["id"] == hypothesis_id), None)
+    if not hypothesis:
+        raise HTTPException(404, "长期研究假设不存在")
+    if not hypothesis.get("workflow_id"):
+        raise HTTPException(409, "该历史假设尚未绑定业务流程，请先关联流程后再定向复测")
+    if hypothesis["status"] in {"archived", "verified"}:
+        raise HTTPException(409, "当前假设状态不能直接定向复测")
+    matrix = _build_campaign_matrix(campaign, {hypothesis["workflow_id"]})
+    sequence = len(campaign["iterations"]) + 1
+    plan = {"strategy": "directed_retest", "hypothesis_id": hypothesis_id, **matrix}
+    iteration_id, timestamp = uid("iteration"), utcnow()
+    with connect() as db:
+        db.execute("INSERT INTO campaign_iterations VALUES(?,?,?,?,?,?,?,?,?,?)", (iteration_id, campaign_id, None, sequence, "planned", dump(plan), dump({}), None, None, timestamp))
+        db.execute("UPDATE research_hypotheses SET status='planned',next_action=?,updated_at=? WHERE id=?", (f"执行第 {sequence} 轮定向复测", timestamp, hypothesis_id))
         db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
     return {"id": iteration_id, "campaign_id": campaign_id, "sequence": sequence, "status": "planned", **plan}
 
@@ -2067,6 +2134,8 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
     timestamp = utcnow()
     with connect() as db:
         db.execute("UPDATE campaign_iterations SET status='executing',run_id=?,started_at=? WHERE id=?", (body.run_id, timestamp, iteration_id))
+        if plan.get("hypothesis_id"):
+            db.execute("UPDATE research_hypotheses SET status='testing',updated_at=? WHERE id=? AND campaign_id=?", (timestamp, plan["hypothesis_id"], campaign_id))
     results, observation_ids = [], []
     engagement = get_engagement(campaign["engagement_id"])
     delay = 1 / max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
@@ -2136,6 +2205,13 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
         ))
         db.execute("UPDATE campaign_iterations SET status='completed',results=?,completed_at=? WHERE id=?", (dump({"tests": results, "tested": tested, "blocked": blocked}), utcnow(), iteration_id))
         db.execute("UPDATE research_campaigns SET iterations_completed=iterations_completed+1,updated_at=? WHERE id=?", (utcnow(), campaign_id))
+        if plan.get("hypothesis_id"):
+            db.execute("""UPDATE research_hypotheses SET status=?,attempts=attempts+1,last_tested_at=?,
+              next_action=?,updated_at=? WHERE id=? AND campaign_id=?""", (
+                "open_proof_gap" if tested else "planned", utcnow(),
+                "审阅本轮差异并执行独立负对照" if tested else "补齐阻塞条件后重新执行",
+                utcnow(), plan["hypothesis_id"], campaign_id,
+            ))
     add_event(body.run_id, "verification", "campaign.iteration_completed", f"长期研究第 {iteration['sequence']} 轮完成：{tested} 已执行，{blocked} 阻塞", {"campaign_id": campaign_id, "iteration_id": iteration_id})
     return {"campaign_id": campaign_id, "iteration_id": iteration_id, "run_id": body.run_id, "status": "completed", "tested": tested, "blocked": blocked, "results": results, "observation_ids": observation_ids}
 

@@ -17,6 +17,7 @@ import capability_registry
 import traditional_tools
 import traditional_runtime
 import native_agent
+import session_capture
 
 
 @pytest.fixture()
@@ -109,6 +110,64 @@ def test_identity_workspace_crud_and_role_matrix_never_echoes_credentials(client
         "label": "Unsafe", "role": "admin", "credential_ref": "password=plain-text",
     })
     assert secret.status_code == 422
+
+
+def test_visible_session_capture_is_scope_gated_and_keychain_only(client, monkeypatch):
+    denied = create_ready(client, target="https://login-denied.test")
+    denied_identity = client.post(f"/api/v1/engagements/{denied['id']}/identities", json={
+        "label": "Denied user", "role": "user", "auth_type": "none", "session_status": "needs_login",
+    }).json()
+    blocked = client.post(f"/api/v1/identities/{denied_identity['id']}/session-captures", json={
+        "login_url": "https://login-denied.test/login",
+    })
+    assert blocked.status_code == 409 and "未显式允许" in blocked.json()["detail"]
+
+    created = client.post("/api/v1/engagements", json={
+        "name": "Login capture fixture", "target": "https://app.login.test", "mode": "traditional",
+        "scope": {"allow_authentication": True, "auth_allowed_hosts": ["sso.login.test"]}, "policy": {},
+    }).json()
+    engagement = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
+    identity = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+        "label": "Tenant A", "role": "user", "tenant": "a", "auth_type": "none", "session_status": "needs_login",
+    }).json()
+    outside = client.post(f"/api/v1/identities/{identity['id']}/session-captures", json={
+        "login_url": "https://outside-login.test/login",
+    })
+    assert outside.status_code == 409 and "auth_allowed_hosts" in outside.json()["detail"]
+
+    started_args = {}
+    monkeypatch.setattr(session_capture, "start", lambda identity_id, login_url, allowed_hosts, max_requests: (
+        started_args.update({"identity_id": identity_id, "login_url": login_url, "allowed_hosts": allowed_hosts, "max_requests": max_requests})
+        or {"id": "capture-test", "identity_id": identity_id, "status": "browser_open", "login_url": login_url}
+    ))
+    monkeypatch.setattr(session_capture, "status", lambda capture_id: {
+        "id": capture_id, "identity_id": identity["id"], "status": "browser_open",
+    })
+    monkeypatch.setattr(session_capture, "complete", lambda capture_id: {
+        "headers": {"Cookie": "session=secret-cookie-value"}, "cookie_count": 1, "domain_count": 1,
+        "requests_seen": 8, "requests_blocked": 2,
+    })
+    stored = {}
+    monkeypatch.setattr(session_capture, "store_keychain", lambda identity_id, headers: (
+        stored.update({"identity_id": identity_id, "headers": headers}) or f"keychain://fieldwork-session/{identity_id}"
+    ))
+    started = client.post(f"/api/v1/identities/{identity['id']}/session-captures", json={
+        "login_url": "https://sso.login.test/start", "max_requests": 250,
+    })
+    assert started.status_code == 201 and started.json()["status"] == "browser_open"
+    assert started_args["allowed_hosts"] == ["app.login.test", "sso.login.test"]
+    completed = client.post("/api/v1/session-captures/capture-test/complete")
+    assert completed.status_code == 200 and completed.json()["credential_configured"] is True
+    assert completed.json()["requests_blocked"] == 2
+    assert "secret-cookie-value" not in completed.text
+    assert stored["headers"]["Cookie"] == "session=secret-cookie-value"
+    refreshed = client.get(f"/api/v1/engagements/{engagement['id']}/identities").json()[0]
+    assert refreshed["session_status"] == "ready" and refreshed["auth_type"] == "keychain_reference"
+    assert refreshed["credential_configured"] is True and "credential_ref" not in refreshed
+    with sqlite3.connect(final_core.DB) as db:
+        row = db.execute("SELECT credential_ref FROM identities WHERE id=?", (identity["id"],)).fetchone()
+    assert row[0] == f"keychain://fieldwork-session/{identity['id']}"
+    assert "secret-cookie-value" not in row[0]
 
 
 def test_long_running_business_logic_campaign_builds_memory_and_test_matrix(client):

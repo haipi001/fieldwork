@@ -492,6 +492,11 @@ class OastProbeInput(BaseModel):
     expires_minutes: int = Field(default=30, ge=5, le=1440)
 
 
+class SessionCaptureInput(BaseModel):
+    login_url: str = Field(min_length=8, max_length=2048)
+    max_requests: int = Field(default=300, ge=20, le=1000)
+
+
 def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) -> list[str]:
     repository = engagement.get("target_type") == "repository"
     if engagement["mode"] == "web3":
@@ -669,6 +674,8 @@ def create_engagement(body: EngagementInput):
         "denied_actions": ["destructive", "fund_transfer", "credential_attack"],
         "allow_oast": False,
         "oast_allowed_hosts": [],
+        "allow_authentication": False,
+        "auth_allowed_hosts": [],
         "requires_confirmation": True,
         **body.scope,
     }
@@ -1767,8 +1774,18 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         raise HTTPException(422, "确认文本不匹配")
     with connect() as db:
         active = db.execute("SELECT COUNT(*) FROM analysis_runs WHERE status IN ('queued','running','paused')").fetchone()[0]
+        owned_keychain_ids = [row[0] for row in db.execute(
+            "SELECT id FROM identities WHERE credential_ref='keychain://fieldwork-session/' || id"
+        )]
     if active:
         raise HTTPException(409, "存在运行中或暂停的任务，请先停止后再清空记录")
+    if owned_keychain_ids:
+        import session_capture
+        for identity_id in owned_keychain_ids:
+            try:
+                session_capture.delete_keychain(identity_id)
+            except RuntimeError as error:
+                raise HTTPException(409, f"无法清理测试会话钥匙串：{error}") from error
     backup_root = LOCAL_DATA_ROOT / "backups"
     backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     backup_path = backup_root / f"before-clear-{datetime.now().strftime('%Y%m%d-%H%M%S')}.sqlite3"
@@ -1891,9 +1908,98 @@ def update_identity(identity_id: str, body: IdentityUpdateInput):
 def delete_identity(identity_id: str):
     get_identity(identity_id)
     with connect() as db:
+        row = db.execute("SELECT credential_ref FROM identities WHERE id=?", (identity_id,)).fetchone()
+        owned_keychain = bool(row and row[0] == f"keychain://fieldwork-session/{identity_id}")
+    if owned_keychain:
+        import session_capture
+        try:
+            session_capture.delete_keychain(identity_id)
+        except RuntimeError as error:
+            raise HTTPException(409, f"无法清理测试会话钥匙串：{error}") from error
+    with connect() as db:
         db.execute("DELETE FROM identity_profiles WHERE identity_id=?", (identity_id,))
         db.execute("DELETE FROM identities WHERE id=?", (identity_id,))
     return {"id": identity_id, "status": "deleted"}
+
+
+def _session_capture_scope(identity_id: str, login_url: str) -> tuple[dict[str, Any], list[str]]:
+    identity = get_identity(identity_id)
+    engagement = get_engagement(identity["engagement_id"])
+    if engagement["mode"] != "traditional" or engagement.get("target_type") == "repository":
+        raise HTTPException(409, "可见登录态采集仅支持 Traditional Web/API 项目")
+    if not engagement.get("confirmed_at") or not engagement["scope"].get("allow_authentication", False):
+        raise HTTPException(409, "冻结 Scope 未显式允许登录态采集")
+    parsed = urlparse(login_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise HTTPException(422, "login_url 必须是无凭据的 HTTP(S) URL")
+    host = parsed.hostname.lower().rstrip(".")
+    target_host = (urlparse(engagement["normalized_target"]).hostname or "").lower().rstrip(".")
+    allowed = {target_host, *{
+        str(item).lower().rstrip(".") for item in engagement["scope"].get("auth_allowed_hosts", [])
+    }}
+    local = host in {"localhost", "127.0.0.1", "::1"}
+    if host not in allowed:
+        raise HTTPException(409, "登录域名未列入冻结 Scope 的目标或 auth_allowed_hosts")
+    if parsed.scheme != "https" and not local:
+        raise HTTPException(409, "远程登录页必须使用 HTTPS")
+    return identity, sorted(item for item in allowed if item)
+
+
+@router.post("/identities/{identity_id}/session-captures", status_code=201)
+def start_identity_session_capture(identity_id: str, body: SessionCaptureInput):
+    identity, allowed_hosts = _session_capture_scope(identity_id, body.login_url)
+    import session_capture
+    try:
+        result = session_capture.start(identity_id, body.login_url, allowed_hosts, body.max_requests)
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+    return {
+        **result, "allowed_hosts": allowed_hosts, "max_requests": body.max_requests,
+        "instructions": "在独立 Chrome 中完成授权测试账号登录，然后回到 Fieldwork 点击完成采集。",
+        "privacy": "不会读取日常 Chrome 配置；Cookie 仅经内存管道写入 macOS Keychain。",
+        "identity": {"id": identity["id"], "label": identity["label"], "role": identity["role"]},
+    }
+
+
+@router.get("/session-captures/{capture_id}")
+def identity_session_capture_status(capture_id: str):
+    import session_capture
+    try:
+        return session_capture.status(capture_id)
+    except KeyError as error:
+        raise HTTPException(404, "登录态采集不存在或服务已重启") from error
+
+
+@router.post("/session-captures/{capture_id}/complete")
+def complete_identity_session_capture(capture_id: str):
+    import session_capture
+    try:
+        capture = session_capture.status(capture_id)
+        result = session_capture.complete(capture_id)
+        credential_ref = session_capture.store_keychain(capture["identity_id"], result["headers"])
+    except KeyError as error:
+        raise HTTPException(404, "登录态采集不存在或服务已重启") from error
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+    timestamp = utcnow()
+    with connect() as db:
+        db.execute("UPDATE identities SET credential_ref=? WHERE id=?", (credential_ref, capture["identity_id"]))
+        db.execute("""UPDATE identity_profiles SET auth_type='keychain_reference',session_status='ready',
+          last_validated_at=?,updated_at=? WHERE identity_id=?""", (timestamp, timestamp, capture["identity_id"]))
+    return {
+        "id": capture_id, "identity_id": capture["identity_id"], "status": "stored",
+        "cookie_count": result["cookie_count"], "domain_count": result["domain_count"],
+        "requests_seen": result["requests_seen"], "requests_blocked": result["requests_blocked"],
+        "credential_configured": True, "secret_persisted_outside_keychain": False,
+    }
+
+
+@router.delete("/session-captures/{capture_id}")
+def cancel_identity_session_capture(capture_id: str):
+    import session_capture
+    if not session_capture.cancel(capture_id):
+        raise HTTPException(404, "登录态采集不存在或服务已重启")
+    return {"id": capture_id, "status": "cancelled"}
 
 
 @router.get("/engagements/{engagement_id}/role-matrix")

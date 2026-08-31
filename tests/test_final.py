@@ -232,6 +232,87 @@ def test_business_workflow_rejects_out_of_scope_and_read_only_post(client):
     assert {item["reason"] for item in blockers} == {"out_of_scope", "non_read_method_requires_reversible_or_state_changing_risk_class"}
 
 
+def test_reversible_business_transition_requires_isolation_confirmation_and_proves_rollback(client):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    state = {"exists": False}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, value: bytes):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(value)
+
+        def do_GET(self):
+            self._reply(b'{"exists":true}' if state["exists"] else b'{"exists":false}')
+
+        def do_POST(self):
+            state["exists"] = True
+            self._reply(b'{"created":true}')
+
+        def do_DELETE(self):
+            state["exists"] = False
+            self._reply(b'{"deleted":true}')
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        created = client.post("/api/v1/engagements", json={
+            "name": "Reversible fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True, "allow_reversible_state_change": True, "environment_class": "local_fixture"},
+            "policy": {"allow_state_change": True, "max_requests_per_second": 100, "max_requests": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
+        identity = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Fixture operator", "role": "operator", "auth_type": "none", "session_status": "ready",
+        }).json()
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Lifecycle campaign", "objective": "Prove create and cancel preserve the initial business state",
+        }).json()
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Create then cancel", "objective": "Exercise a reversible local business transition",
+            "steps": [{
+                "name": "Create object", "method": "POST", "url": f"{target}/objects", "actor_role": "operator",
+                "body": "{}", "snapshot_url": f"{target}/objects/current", "expected_transition": "absent -> present",
+                "compensation_method": "DELETE", "compensation_url": f"{target}/objects/current", "replay_safe": False,
+            }],
+            "invariants": ["The fixture must return to its initial state after every test"], "risk_class": "reversible",
+        })
+        assert workflow.status_code == 201
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        transition = next(item for item in iteration["tests"] if item["kind"] == "reversible_transition")
+        assert transition["snapshot_url"].endswith("/objects/current")
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        executed = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={
+            "run_id": run_id, "max_tests": 5, "confirm_reversible_state_change": True,
+        })
+        assert executed.status_code == 200
+        result = next(item for item in executed.json()["results"] if item["kind"] == "reversible_transition")
+        assert result["status"] == "observed" and result["rollback_proven"] is True
+        assert len(result["exchange_ids"]) == 5 and state["exists"] is False
+        journals = client.get(f"/api/v1/campaigns/{campaign['id']}/state-change-journals").json()
+        assert journals[0]["id"] == result["journal_id"] and journals[0]["state"] == "restored"
+        # Simulate an app interruption after a mutation was attempted. The
+        # persisted journal must support compensation-only recovery.
+        state["exists"] = True
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE state_change_journal SET state='mutation_attempted' WHERE id=?", (result["journal_id"],))
+        unconfirmed = client.post(f"/api/v1/state-change-journals/{result['journal_id']}/recover", json={})
+        assert unconfirmed.status_code == 409
+        recovered = client.post(f"/api/v1/state-change-journals/{result['journal_id']}/recover", json={"confirm_compensation": True})
+        assert recovered.status_code == 200 and recovered.json()["rollback_proven"] is True
+        assert recovered.json()["state"] == "restored" and state["exists"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
 def test_oast_probe_is_scope_gated_correlated_and_redacted(client):
     denied_engagement = create_ready(client, target="https://oast-denied.test")
     denied_campaign = client.post(f"/api/v1/engagements/{denied_engagement['id']}/campaigns", json={

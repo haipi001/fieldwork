@@ -255,6 +255,14 @@ def init_final_db() -> None:
               results TEXT NOT NULL, started_at TEXT, completed_at TEXT,
               created_at TEXT NOT NULL, UNIQUE(campaign_id,sequence)
             );
+            CREATE TABLE IF NOT EXISTS state_change_journal (
+              id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+              iteration_id TEXT NOT NULL, run_id TEXT NOT NULL, workflow_id TEXT NOT NULL,
+              step_number INTEGER NOT NULL, identity_id TEXT NOT NULL, state TEXT NOT NULL,
+              snapshot_exchange_id TEXT, mutation_exchange_id TEXT, after_exchange_id TEXT,
+              compensation_exchange_id TEXT, rollback_exchange_id TEXT, error TEXT,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS oast_probes (
               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, run_id TEXT NOT NULL,
               campaign_id TEXT NOT NULL, hypothesis_id TEXT,
@@ -274,6 +282,7 @@ def init_final_db() -> None:
             CREATE INDEX IF NOT EXISTS hypothesis_campaign_idx ON research_hypotheses(campaign_id,priority,updated_at);
             CREATE INDEX IF NOT EXISTS oast_campaign_idx ON oast_probes(campaign_id,created_at);
             CREATE INDEX IF NOT EXISTS oast_probe_event_idx ON oast_events(probe_id,received_at);
+            CREATE INDEX IF NOT EXISTS state_change_engagement_idx ON state_change_journal(engagement_id,state,updated_at);
             """
         )
         migrate_legacy_findings(db)
@@ -454,6 +463,11 @@ class WorkflowStepInput(BaseModel):
     state_before: str = Field(default="", max_length=1000)
     expected_transition: str = Field(default="", max_length=2000)
     replay_safe: bool = True
+    body: str | None = Field(default=None, max_length=65536)
+    snapshot_url: str | None = Field(default=None, max_length=2048)
+    compensation_method: Literal["POST", "PUT", "PATCH", "DELETE"] | None = None
+    compensation_url: str | None = Field(default=None, max_length=2048)
+    compensation_body: str | None = Field(default=None, max_length=65536)
 
 
 class BusinessWorkflowInput(BaseModel):
@@ -483,6 +497,11 @@ class ResearchHypothesisUpdateInput(BaseModel):
 class CampaignExecuteInput(BaseModel):
     run_id: str
     max_tests: int = Field(default=10, ge=1, le=50)
+    confirm_reversible_state_change: bool = False
+
+
+class StateChangeRecoveryInput(BaseModel):
+    confirm_compensation: bool = False
 
 
 class OastProbeInput(BaseModel):
@@ -676,6 +695,8 @@ def create_engagement(body: EngagementInput):
         "oast_allowed_hosts": [],
         "allow_authentication": False,
         "auth_allowed_hosts": [],
+        "allow_reversible_state_change": False,
+        "environment_class": "production",
         "requires_confirmation": True,
         **body.scope,
     }
@@ -1798,7 +1819,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         source.close()
     backup_path.chmod(0o600)
     tables = (
-        "oast_events", "oast_probes", "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
+        "oast_events", "oast_probes", "state_change_journal", "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
         "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
         "graveyard", "coverage_v2", "identity_profiles", "identities", "program_snapshots", "submission_packages_v2",
         "report_previews", "canonical_findings", "verification_attempts", "candidate_findings",
@@ -2093,6 +2114,14 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
             blocked.append({"step": index + 1, "reason": policy["reason"]})
         if step.method not in {"GET", "HEAD", "OPTIONS"} and body.risk_class == "read_only":
             blocked.append({"step": index + 1, "reason": "non_read_method_requires_reversible_or_state_changing_risk_class"})
+        if step.method not in {"GET", "HEAD", "OPTIONS"} and body.risk_class == "reversible":
+            if not all((step.snapshot_url, step.compensation_method, step.compensation_url)):
+                blocked.append({"step": index + 1, "reason": "reversible_step_requires_snapshot_and_compensation"})
+            for proof_url in (step.snapshot_url, step.compensation_url):
+                if proof_url:
+                    proof_policy = execution_policy_check(PolicyCheckInput(engagement_id=engagement["id"], target=proof_url, action="read"))
+                    if not proof_policy["allowed"]:
+                        blocked.append({"step": index + 1, "reason": f"compensation_or_snapshot_{proof_policy['reason']}"})
     if blocked:
         raise HTTPException(409, {"message": "业务流程包含未授权或风险声明不一致的步骤", "blocked_steps": blocked})
     workflow_id, timestamp = uid("workflow"), utcnow()
@@ -2375,6 +2404,20 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
             if not eligible:
                 blocked.append({"workflow_id": workflow["id"], "step": step_index + 1, "reason": "required_identity_not_ready"})
                 continue
+            mutating = step.get("method") not in {"GET", "HEAD", "OPTIONS"}
+            if mutating:
+                if workflow["risk_class"] != "reversible":
+                    blocked.append({"workflow_id": workflow["id"], "step": step_index + 1, "reason": "unbounded_state_change_is_never_executable"})
+                elif not engagement["scope"].get("allow_reversible_state_change") or not engagement["policy"].get("allow_state_change"):
+                    blocked.append({"workflow_id": workflow["id"], "step": step_index + 1, "reason": "reversible_state_change_not_in_frozen_scope"})
+                elif engagement["scope"].get("environment_class") not in {"local_fixture", "ephemeral_test", "staging_clone"}:
+                    blocked.append({"workflow_id": workflow["id"], "step": step_index + 1, "reason": "state_change_requires_isolated_environment"})
+                else:
+                    matrix.append({
+                        "kind": "reversible_transition", "workflow_id": workflow["id"], "step": step_index + 1,
+                        "identity_id": eligible[0]["id"], **step, "assertions": workflow["invariants"],
+                    })
+                continue
             for identity in eligible:
                 matrix.append({"kind": "baseline", "workflow_id": workflow["id"], "step": step_index + 1, "identity_id": identity["id"], "method": step["method"], "url": step["url"], "expected": step["expected_transition"]})
             for left in eligible:
@@ -2443,7 +2486,7 @@ def _campaign_hypothesis(campaign_id: str, workflow_id: str, category: str, stat
 
 @router.post("/campaigns/{campaign_id}/iterations/{iteration_id}/execute")
 def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: CampaignExecuteInput):
-    """Execute bounded read-only logic probes through the existing guarded HTTP runtime."""
+    """Execute bounded probes; mutations require isolated scope and proven compensation."""
     import traditional_runtime
     campaign = get_research_campaign(campaign_id)
     with connect() as db:
@@ -2467,10 +2510,13 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
     results, observation_ids = [], []
     engagement = get_engagement(campaign["engagement_id"])
     delay = 1 / max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
+    with connect() as db:
+        unresolved_state_change = db.execute("""SELECT id,state FROM state_change_journal
+          WHERE engagement_id=? AND state NOT IN ('restored','cancelled') ORDER BY created_at LIMIT 1""", (engagement["id"],)).fetchone()
 
     def request(test: dict, identity_key: str = "identity_id") -> dict:
         return traditional_runtime._execute_exchange(body.run_id, traditional_runtime.ExchangeRequestInput(
-            url=test["url"], method=test.get("method", "GET"), headers={}, body=None,
+            url=test["url"], method=test.get("method", "GET"), headers={}, body=test.get("body"),
             identity_id=test.get(identity_key),
         ), f"campaign:{campaign_id}:{test['kind']}")
 
@@ -2479,11 +2525,84 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
         if kind == "sequence_violation":
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "sequence_execution_requires_explicit_reversible_state_authorization"})
             continue
-        if test.get("method") not in {"GET", "HEAD", "OPTIONS"}:
+        if kind == "reversible_transition" and not body.confirm_reversible_state_change:
+            results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "reversible_state_change_requires_per_execution_confirmation"})
+            continue
+        if kind == "reversible_transition" and unresolved_state_change:
+            results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": f"pending_state_recovery:{unresolved_state_change['id']}:{unresolved_state_change['state']}"})
+            continue
+        if test.get("method") not in {"GET", "HEAD", "OPTIONS"} and kind != "reversible_transition":
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "state_change_not_enabled_for_campaign_executor"})
             continue
         try:
-            if kind == "cross_identity_replay":
+            if kind == "reversible_transition":
+                snapshot = {"kind": kind, "url": test["snapshot_url"], "method": "GET", "identity_id": test["identity_id"]}
+                before = request(snapshot)
+                journal_id, journal_time = uid("state-change"), utcnow()
+                with connect() as db:
+                    db.execute("INSERT INTO state_change_journal VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                        journal_id, engagement["id"], campaign_id, iteration_id, body.run_id, workflow_id,
+                        int(test["step"]), test["identity_id"], "snapshot_captured", before["id"], None, None,
+                        None, None, None, journal_time, journal_time,
+                    ))
+                exchanges, primary_error, compensation_error = [before], None, None
+                try:
+                    with connect() as db:
+                        db.execute("UPDATE state_change_journal SET state='mutation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
+                    mutation = request(test)
+                    exchanges.append(mutation)
+                    with connect() as db:
+                        db.execute("UPDATE state_change_journal SET mutation_exchange_id=?,updated_at=? WHERE id=?", (mutation["id"], utcnow(), journal_id))
+                    after = request(snapshot)
+                    exchanges.append(after)
+                    with connect() as db:
+                        db.execute("UPDATE state_change_journal SET after_exchange_id=?,updated_at=? WHERE id=?", (after["id"], utcnow(), journal_id))
+                except HTTPException as error:
+                    # A timeout can happen after the server committed the change,
+                    # therefore compensation remains mandatory once attempted.
+                    primary_error = str(error.detail)
+                finally:
+                    try:
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET state='compensation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
+                        compensation = request({
+                            **test, "url": test["compensation_url"], "method": test["compensation_method"],
+                            "body": test.get("compensation_body"),
+                        })
+                        exchanges.append(compensation)
+                        restored_exchange = request(snapshot)
+                        exchanges.append(restored_exchange)
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET compensation_exchange_id=?,rollback_exchange_id=?,updated_at=? WHERE id=?", (compensation["id"], restored_exchange["id"], utcnow(), journal_id))
+                    except HTTPException as error:
+                        compensation_error = str(error.detail)
+                restored = exchanges[-1] if len(exchanges) >= 3 and not compensation_error else None
+                rollback_proven = bool(restored and before["response_status"] == restored["response_status"] and before["response_sha256"] == restored["response_sha256"])
+                with connect() as db:
+                    db.execute("UPDATE state_change_journal SET state=?,error=?,updated_at=? WHERE id=?", (
+                        "restored" if rollback_proven else "rollback_failed", primary_error or compensation_error, utcnow(), journal_id,
+                    ))
+                summary = f"可逆状态测试已执行；补偿后状态{'恢复' if rollback_proven else '未恢复'}"
+                if primary_error:
+                    summary += f"；主动作异常：{primary_error}"
+                if compensation_error:
+                    summary += f"；补偿异常：{compensation_error}"
+                observation = record_observation(body.run_id, ObservationInput(
+                    observation_type="business_logic.reversible_transition", subject=f"{test['method']} {test['url']}",
+                    summary=summary, source_capability="campaign-logic-runner", confidence=.9 if rollback_proven else .98,
+                    raw_ref=":".join(item["id"] for item in exchanges),
+                ))
+                observation_ids.append(observation["id"])
+                result_status = "rollback_failed" if not rollback_proven else ("degraded" if primary_error else "observed")
+                result = {"kind": kind, "workflow_id": workflow_id, "status": result_status, "rollback_proven": rollback_proven,
+                          "exchange_ids": [item["id"] for item in exchanges], "observation_id": observation["id"],
+                          "primary_error": primary_error, "compensation_error": compensation_error, "journal_id": journal_id}
+                if not rollback_proven:
+                    result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "rollback_integrity", "补偿动作未能恢复前置状态，隔离环境需要人工清理并审阅业务副作用", [observation["id"]], "停止状态变更测试并人工恢复隔离环境")
+                results.append(result)
+                if not rollback_proven:
+                    break
+            elif kind == "cross_identity_replay":
                 left = request({**test, "identity_id": test["source_identity_id"]})
                 time.sleep(min(delay, 2))
                 right = request({**test, "identity_id": test["replay_identity_id"]})
@@ -2542,6 +2661,72 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             ))
     add_event(body.run_id, "verification", "campaign.iteration_completed", f"长期研究第 {iteration['sequence']} 轮完成：{tested} 已执行，{blocked} 阻塞", {"campaign_id": campaign_id, "iteration_id": iteration_id})
     return {"campaign_id": campaign_id, "iteration_id": iteration_id, "run_id": body.run_id, "status": "completed", "tested": tested, "blocked": blocked, "results": results, "observation_ids": observation_ids}
+
+
+@router.get("/campaigns/{campaign_id}/state-change-journals")
+def list_state_change_journals(campaign_id: str):
+    get_research_campaign(campaign_id)
+    with connect() as db:
+        return [dict(row) for row in db.execute(
+            "SELECT * FROM state_change_journal WHERE campaign_id=? ORDER BY created_at DESC", (campaign_id,),
+        )]
+
+
+@router.post("/state-change-journals/{journal_id}/recover")
+def recover_state_change(journal_id: str, body: StateChangeRecoveryInput):
+    """Run only the declared compensation and prove the baseline was restored."""
+    import traditional_runtime
+    with connect() as db:
+        journal = db.execute("SELECT * FROM state_change_journal WHERE id=?", (journal_id,)).fetchone()
+        if not journal:
+            raise HTTPException(404, "状态变更日志不存在")
+        iteration = db.execute("SELECT plan FROM campaign_iterations WHERE id=?", (journal["iteration_id"],)).fetchone()
+    if journal["state"] in {"restored", "cancelled"}:
+        return {"id": journal_id, "state": journal["state"], "rollback_proven": journal["state"] == "restored"}
+    if not body.confirm_compensation:
+        raise HTTPException(409, "恢复操作必须显式确认补偿动作")
+    engagement = get_engagement(journal["engagement_id"])
+    if not engagement["scope"].get("allow_reversible_state_change") or not engagement["policy"].get("allow_state_change"):
+        raise HTTPException(409, "当前冻结 Scope 不允许可逆状态恢复")
+    if engagement["scope"].get("environment_class") not in {"local_fixture", "ephemeral_test", "staging_clone"}:
+        raise HTTPException(409, "状态恢复只允许隔离测试环境")
+    if journal["state"] == "snapshot_captured":
+        with connect() as db:
+            db.execute("UPDATE state_change_journal SET state='cancelled',updated_at=? WHERE id=?", (utcnow(), journal_id))
+        return {"id": journal_id, "state": "cancelled", "rollback_proven": True, "reason": "mutation_was_never_attempted"}
+    plan = load(iteration["plan"], {}) if iteration else {}
+    test = next((item for item in plan.get("tests", []) if item.get("kind") == "reversible_transition" and item.get("workflow_id") == journal["workflow_id"] and int(item.get("step", 0)) == journal["step_number"]), None)
+    if not test:
+        raise HTTPException(409, "无法从冻结研究计划恢复补偿定义")
+    baseline = traditional_runtime._get_exchange(journal["snapshot_exchange_id"])
+    try:
+        with connect() as db:
+            db.execute("UPDATE state_change_journal SET state='compensation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
+        compensation = traditional_runtime._execute_exchange(journal["run_id"], traditional_runtime.ExchangeRequestInput(
+            url=test["compensation_url"], method=test["compensation_method"], headers={},
+            body=test.get("compensation_body"), identity_id=journal["identity_id"],
+        ), f"campaign-recovery:{journal_id}")
+        restored = traditional_runtime._execute_exchange(journal["run_id"], traditional_runtime.ExchangeRequestInput(
+            url=test["snapshot_url"], method="GET", headers={}, body=None, identity_id=journal["identity_id"],
+        ), f"campaign-recovery:{journal_id}")
+    except HTTPException as error:
+        with connect() as db:
+            db.execute("UPDATE state_change_journal SET state='rollback_failed',error=?,updated_at=? WHERE id=?", (str(error.detail), utcnow(), journal_id))
+        raise HTTPException(409, f"补偿恢复失败：{error.detail}") from error
+    rollback_proven = baseline["response_status"] == restored["response_status"] and baseline["response_sha256"] == restored["response_sha256"]
+    state_value = "restored" if rollback_proven else "rollback_failed"
+    timestamp = utcnow()
+    with connect() as db:
+        db.execute("""UPDATE state_change_journal SET state=?,compensation_exchange_id=?,rollback_exchange_id=?,
+          error=?,updated_at=? WHERE id=?""", (state_value, compensation["id"], restored["id"], None if rollback_proven else "snapshot_mismatch", timestamp, journal_id))
+    observation = record_observation(journal["run_id"], ObservationInput(
+        observation_type="business_logic.state_recovery", subject=f"journal:{journal_id}",
+        summary=f"中断状态变更补偿已执行；基线{'已恢复' if rollback_proven else '仍不一致'}",
+        source_capability="campaign-recovery", confidence=.98,
+        raw_ref=f"{baseline['id']}:{compensation['id']}:{restored['id']}",
+    ))
+    add_event(journal["run_id"], "verification", "campaign.state_recovery", observation["summary"], {"journal_id": journal_id, "rollback_proven": rollback_proven})
+    return {"id": journal_id, "state": state_value, "rollback_proven": rollback_proven, "observation_id": observation["id"], "exchange_ids": [compensation["id"], restored["id"]]}
 
 
 @router.post("/program-snapshots", status_code=201)

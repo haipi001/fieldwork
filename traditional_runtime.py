@@ -120,8 +120,24 @@ def request_once(spec: ReplayRequest) -> dict:
     return {
         "status": status, "body_sha256": hashlib.sha256(body).hexdigest(), "body_bytes": len(body),
         "headers": {k: redact(v) for k, v in headers.items() if k.lower() in {"content-type", "location", "etag"}},
-        "body_preview": redact(body_text[:1000]),
+        "body_preview": _safe_body_preview(body_text), "_transient_body": body_text,
     }
+
+
+def _safe_body_preview(body_text: str) -> str:
+    sensitive = {"authorization", "cookie", "password", "passwd", "secret", "token", "access_token", "refresh_token", "api_key", "apikey", "private_key"}
+    try:
+        value = json.loads(body_text)
+    except json.JSONDecodeError:
+        return redact(body_text[:1000])
+
+    def clean(item):
+        if isinstance(item, dict):
+            return {key: "[REDACTED]" if str(key).lower() in sensitive or any(part in str(key).lower() for part in ("password", "secret", "token", "private_key")) else clean(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [clean(child) for child in item[:100]]
+        return item
+    return redact(json.dumps(clean(value), ensure_ascii=False, separators=(",", ":"))[:1000])
 
 
 def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -209,7 +225,7 @@ def _record_exchange(run: dict, spec: ReplayRequest, result: dict, identity_id: 
     return _get_exchange(exchange_id)
 
 
-def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, parent_exchange_id: str | None = None) -> dict:
+def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, parent_exchange_id: str | None = None, include_transient: bool = False) -> dict:
     import final_core
     method = body.method.upper()
     if method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
@@ -230,6 +246,8 @@ def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, pare
         raise HTTPException(409, reason)
     result = request_once(spec)
     exchange = _record_exchange(run, spec, result, body.identity_id, source, parent_exchange_id)
+    if include_transient:
+        exchange["_transient_body"] = result.get("_transient_body", "")
     final_core.add_event(run_id, "verification", "http.exchange_recorded", f"{method} {urlparse(body.url).path or '/'} → {result['status']}", {"exchange_id": exchange["id"], "source": source})
     return exchange
 

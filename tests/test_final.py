@@ -313,6 +313,89 @@ def test_reversible_business_transition_requires_isolation_confirmation_and_prov
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(client, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    secret = "fixture-secret-never-persist"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            tenant = self.headers.get("X-Test-Tenant", "tenant-a")
+            if self.path == "/session":
+                body = json.dumps({"order_id": "order-42" if tenant == "tenant-a" else "order-99", "secret_token": secret}).encode()
+            elif self.path == "/orders/order-42":
+                body = b'{"id":"order-42","owner":"tenant-a","visible":true}'
+            else:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Dynamic workflow fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True}, "policy": {"max_requests_per_second": 100, "max_requests": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        first_identity = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Tenant A", "role": "user", "tenant": "tenant-a", "auth_type": "none", "session_status": "ready",
+        }).json()
+        second_identity = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Tenant B", "role": "user", "tenant": "tenant-b", "auth_type": "none", "session_status": "ready",
+        }).json()
+        identity_headers = {first_identity["id"]: {"X-Test-Tenant": "tenant-a"}, second_identity["id"]: {"X-Test-Tenant": "tenant-b"}}
+        monkeypatch.setattr(traditional_runtime, "resolve_identity_headers", lambda identity_id: identity_headers[identity_id])
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Dynamic object campaign", "objective": "Carry runtime object identifiers across an authorized workflow",
+        }).json()
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Discover then fetch order", "objective": "Extract an object identifier and prove tenant ownership",
+            "steps": [
+                {"name": "Discover", "method": "GET", "url": f"{target}/session", "actor_role": "user", "extract": {"order_id": "/order_id", "ephemeral_secret": "/secret_token"}},
+                {"name": "Fetch", "method": "GET", "url": f"{target}/orders/{{{{order_id}}}}", "actor_role": "user"},
+            ],
+            "invariants": ["The fetched object must belong to the active tenant"],
+            "executable_invariants": [
+                {"name": "Both requests succeed", "kind": "status_in", "step": 2, "expected_statuses": [200]},
+                {"name": "Object id follows discovery", "kind": "json_equals", "step": 2, "pointer": "/id", "expected_template": "{{order_id}}"},
+                {"name": "Tenant owns object", "kind": "json_equals", "step": 2, "pointer": "/owner", "expected_template": "{{identity_tenant}}"},
+                {"name": "Responses are distinct", "kind": "body_differs_step", "step": 2, "other_step": 1},
+            ], "risk_class": "read_only",
+        })
+        assert workflow.status_code == 201
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        assert [item["kind"] for item in iteration["tests"]] == ["workflow_sequence", "cross_identity_sequence", "sequence_violation"]
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        executed = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={"run_id": run_id, "max_tests": 10})
+        assert executed.status_code == 200
+        sequence = next(item for item in executed.json()["results"] if item["kind"] == "workflow_sequence")
+        assert "invariants" in sequence, executed.json()
+        assert all(item["passed"] for item in sequence["invariants"])
+        assert sequence["extracted_variables"] == ["ephemeral_secret", "order_id"]
+        assert secret not in json.dumps(sequence)
+        cross = next(item for item in executed.json()["results"] if item["kind"] == "cross_identity_sequence")
+        assert cross["decision"] == "suspicious_success" and cross["hypothesis_id"]
+        assert cross["carried_variables"] == ["ephemeral_secret", "order_id"] and secret not in json.dumps(cross)
+        with sqlite3.connect(final_core.DB) as db:
+            previews = " ".join(row[0] for row in db.execute("SELECT response_body_preview FROM http_exchanges WHERE run_id=?", (run_id,)))
+            evidence = " ".join(row[0] for row in db.execute("SELECT summary FROM evidence_v2 WHERE run_id=?", (run_id,)))
+        assert secret not in previews and "[REDACTED]" in previews
+        assert secret not in evidence
+    finally:
+        server.shutdown()
+        server.server_close()
 def test_oast_probe_is_scope_gated_correlated_and_redacted(client):
     denied_engagement = create_ready(client, target="https://oast-denied.test")
     denied_campaign = client.post(f"/api/v1/engagements/{denied_engagement['id']}/campaigns", json={

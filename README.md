@@ -36,6 +36,7 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - 长期 Research Campaign 保存业务流程、安全不变量、跨身份/跨租户差异、重复重放、研究假设、失败反证和定向复测；单次无结果不会自动关闭长期风险。
 - 测试账号登录必须由冻结 Scope 显式开启。Fieldwork 使用非持久化、可见的独立 Chrome 采集授权测试账号会话，并对每个请求执行精确域名白名单与请求上限；不会读取日常 Chrome 配置。Cookie 仅经匿名内存管道写入 macOS Keychain，不进入 SQLite、日志、事件或报告；删除身份和清空记录时同步清理其专属钥匙串项。
 - 可逆业务状态测试只允许 `local_fixture / ephemeral_test / staging_clone`，且 Scope、Policy 和每次执行三重确认。每个动作强制执行“前置快照 → 状态动作 → 后置快照 → 补偿 → 回滚快照”，以响应哈希证明恢复；动作前写入持久化 Journal，进程中断后阻断后续变更，并提供补偿恢复入口。生产目标和无补偿的状态动作永远不执行。
+- 多步业务流程支持受限 JSON Pointer 提取和 `{{variable}}` 模板传递，可在后续 URL/Body 中使用前序对象 ID；不执行任意脚本。提取值只存在于本轮内存，证据仅保存变量名和 SHA-256。机器不变量支持状态码、JSON 存在/相等/不等和跨步骤响应哈希比较；跨身份序列会冻结源身份对象变量，用另一角色/租户重放并建立待复验假设，不能直接升级为漏洞。
 - OAST 必须由冻结 Scope 显式开启，并为远程自托管回调声明 `oast_allowed_hosts`。每个短期探针绑定 Campaign、真实 Run 和可选假设；token 只存 SHA-256，回调 Header 脱敏后进入 Observation/Evidence/Coverage。探针过期无回调保持 `NOT TESTED`，不能解释为安全。
 - “设置与工具”提供自定义 OpenAI-compatible API Base、模型 ID 和 API Key。本机 Key 只写入 `~/.strix/cli-config.json`（权限 `600`），不进入 SQLite、事件、报告或 API 响应。
 - Scanner / tool output 必须先成为 Observation，不能直接生成 Verified Finding。

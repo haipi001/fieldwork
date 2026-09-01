@@ -39,6 +39,7 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - 多步业务流程支持受限 JSON Pointer 提取和 `{{variable}}` 模板传递，可在后续 URL/Body 中使用前序对象 ID；不执行任意脚本。提取值只存在于本轮内存，证据仅保存变量名和 SHA-256。机器不变量支持状态码、JSON 存在/相等/不等和跨步骤响应哈希比较；跨身份序列会冻结源身份对象变量，用另一角色/租户重放并建立待复验假设，不能直接升级为漏洞。
 - 流程步骤可显式声明 `requires_steps`，系统用逆序扰动检查前置条件绕过。只读步骤还可声明 `concurrency_safe`，但只有冻结 Scope 显式允许、环境属于本地夹具/临时测试/脱敏克隆时才会执行 2–5 路有界并发。顺序或响应分歧只产生待复验 Hypothesis，不直接生成 Finding。
 - 任务中心和 Coverage Ledger 提供分区清理：只隐藏已结束任务或当前覆盖列表，活动任务、Observation、Evidence、Finding 和报告保留。
+- `benchmarks/logic-v1.json` 将复杂业务逻辑验收固定为版本化门禁：同时评分跨租户动态对象、声明前置步骤绕过、稳定并发负对照和 Finding 证据门禁。`python benchmarking.py captured-results.json` 可对导出的 Campaign `results` 重复评分。
 - OAST 必须由冻结 Scope 显式开启，并为远程自托管回调声明 `oast_allowed_hosts`。每个短期探针绑定 Campaign、真实 Run 和可选假设；token 只存 SHA-256，回调 Header 脱敏后进入 Observation/Evidence/Coverage。探针过期无回调保持 `NOT TESTED`，不能解释为安全。
 - “设置与工具”提供自定义 OpenAI-compatible API Base、模型 ID 和 API Key。本机 Key 只写入 `~/.strix/cli-config.json`（权限 `600`），不进入 SQLite、事件、报告或 API 响应。
 - Scanner / tool output 必须先成为 Observation，不能直接生成 Verified Finding。

@@ -14,6 +14,7 @@ import reporting
 import web3_lab
 import web3_analysis
 import capability_registry
+import benchmarking
 import traditional_tools
 import traditional_runtime
 import native_agent
@@ -255,6 +256,17 @@ def test_concurrency_probe_requires_explicit_isolated_scope(client):
     assert {item["reason"] for item in plan["blocked"]} == {"concurrency_test_requires_isolated_scope"}
 
 
+def test_logic_benchmark_fails_closed_on_missed_signal_or_proof_gate_bypass():
+    manifest = json.loads((app.ROOT / "benchmarks" / "logic-v1.json").read_text())
+    score = benchmarking.score_logic_benchmark(manifest, [
+        {"kind": "concurrent_step", "stable": True},
+    ], verified_findings=1)
+    assert score["passed"] is False
+    assert score["metrics"]["positive_recall"] == 0
+    assert score["metrics"]["negative_control_failure_rate"] == 0
+    assert score["proof_gate_passed"] is False
+
+
 def test_reversible_business_transition_requires_isolation_confirmation_and_proves_rollback(client):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
@@ -416,6 +428,13 @@ def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(c
         assert sequence_bypass["decision"] == "suspicious_success" and sequence_bypass["hypothesis_id"]
         concurrent = next(item for item in executed.json()["results"] if item["kind"] == "concurrent_step")
         assert concurrent["stable"] is True and concurrent["workers"] == 3
+        manifest = json.loads((app.ROOT / "benchmarks" / "logic-v1.json").read_text())
+        benchmark = benchmarking.score_logic_benchmark(manifest, executed.json()["results"], verified_findings=0)
+        assert benchmark["passed"] is True
+        assert benchmark["metrics"] == {
+            "positive_recall": 1.0, "negative_control_failure_rate": 0.0, "verified_findings": 0,
+        }
+        assert benchmark["proof_gate_passed"] is True
         with sqlite3.connect(final_core.DB) as db:
             previews = " ".join(row[0] for row in db.execute("SELECT response_body_preview FROM http_exchanges WHERE run_id=?", (run_id,)))
             evidence = " ".join(row[0] for row in db.execute("SELECT summary FROM evidence_v2 WHERE run_id=?", (run_id,)))

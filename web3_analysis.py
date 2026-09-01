@@ -20,6 +20,24 @@ from capability_registry import execute
 router = APIRouter(prefix="/api/v1/web3", tags=["Web3 analysis"])
 ARTIFACT_ROOT = Path(__file__).resolve().parent / "data" / "artifacts"
 CONTRACT_RE = re.compile(r"\b(?:abstract\s+)?contract\s+(\w+)(?:\s+is\s+([^\{]+))?")
+FUNCTION_RE = re.compile(
+    r"\bfunction\s+(\w+)\s*\(([^)]*)\)\s*([^\{;]*)(?:\{|;)", re.MULTILINE,
+)
+STATE_DECL_RE = re.compile(
+    r"(?:mapping\s*\([^;]+?\)|[A-Za-z_]\w*(?:\s*\[[^\]]*\])?)\s+"
+    r"(?:(?:public|private|internal|immutable|constant|transient)\s+)*([A-Za-z_]\w*)\s*(?:=[^;]*)?;$",
+    re.DOTALL,
+)
+RISK_PRIMITIVES = {
+    "delegatecall": ("critical", "Delegatecall target or calldata authority must be proven"),
+    "tx.origin": ("high", "tx.origin authorization is vulnerable to call-chain confusion"),
+    "selfdestruct": ("high", "Destructive lifecycle and forced Ether effects require review"),
+    ".call{": ("high", "Low-level value call requires reentrancy and return-value review"),
+    "assembly": ("medium", "Inline assembly bypasses Solidity safety assumptions"),
+    "unchecked": ("medium", "Unchecked arithmetic requires an explicit bound proof"),
+    "block.timestamp": ("medium", "Timestamp-dependent state transitions require manipulation bounds"),
+    "ecrecover": ("high", "Signature domain separation, nonce and malleability must be proven"),
+}
 
 
 class SourceInspectInput(BaseModel):
@@ -46,6 +64,12 @@ class DeploymentAlignmentInput(BaseModel):
     artifact_contract: str | None = None
     block_number: int | None = Field(default=None, ge=0)
     expected_chain_id: int | None = Field(default=None, ge=1)
+
+
+class PropertyReplayInput(BaseModel):
+    """A deliberately narrow contract: two local Forge replays, never verification promotion."""
+
+    rounds: int = Field(default=2, ge=2, le=2)
 
 
 EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
@@ -134,18 +158,171 @@ def detect_framework(root: Path) -> str:
 
 
 def solidity_sources(root: Path) -> list[Path]:
-    return sorted(p for p in root.rglob("*.sol") if not any(part in {"node_modules", "lib", "out", "cache"} for part in p.parts))
+    return sorted(
+        p for p in root.rglob("*.sol")
+        if not any(part in {"node_modules", "lib", "out", "cache", "test", "tests", "script", "scripts"} for part in p.relative_to(root).parts)
+    )
+
+
+def _brace_end(text: str, opening: int) -> int:
+    """Return the matching brace while ignoring braces inside strings and comments."""
+    depth, quote, escaped, line_comment, block_comment = 0, None, False, False, False
+    index = opening
+    while index < len(text):
+        char, nxt = text[index], text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and nxt == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == "/" and nxt == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and nxt == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return len(text) - 1
+
+
+def _top_level_statements(body: str) -> list[str]:
+    statements, current, depth = [], [], 0
+    for char in body:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(0, depth - 1)
+        if depth == 0:
+            current.append(char)
+            if char == ";":
+                statements.append("".join(current).strip())
+                current = []
+    return statements
+
+
+def _state_variables(contract_body: str) -> list[str]:
+    ignored = ("function ", "event ", "error ", "using ", "modifier ", "constructor", "struct ", "enum ")
+    values = []
+    for statement in _top_level_statements(contract_body):
+        clean = re.sub(r"//[^\n]*|/\*.*?\*/", " ", statement, flags=re.DOTALL).strip()
+        if not clean or clean.startswith(ignored):
+            continue
+        match = STATE_DECL_RE.search(clean)
+        if match:
+            values.append(match.group(1))
+    return list(dict.fromkeys(values))
+
+
+def _function_semantics(body: str, state_variables: list[str], known_functions: set[str]) -> dict[str, Any]:
+    semantic_body = re.sub(r"//[^\n]*|/\*.*?\*/", " ", body, flags=re.DOTALL)
+    reads, writes = [], []
+    for variable in state_variables:
+        if re.search(rf"\b{re.escape(variable)}\b", semantic_body):
+            reads.append(variable)
+        if re.search(rf"(?:\bdelete\s+{re.escape(variable)}\b|\b{re.escape(variable)}(?:\s*\[[^\]]+\])?\s*(?:[+\-*/%]?=|\+\+|--))", semantic_body):
+            writes.append(variable)
+    internal_calls = sorted({
+        name for name in known_functions
+        if re.search(rf"\b{re.escape(name)}\s*\(", semantic_body)
+    })
+    external_calls = []
+    for receiver, method in re.findall(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:\{|\()", semantic_body):
+        if receiver in {"msg", "tx", "block", "abi", "super", "this"}:
+            continue
+        external_calls.append(f"{receiver}.{method}")
+    external_calls.extend(
+        f"native.{method}" for method in re.findall(
+            r"\bpayable\s*\([^)]*\)\s*\.\s*(transfer|send|call)\b", semantic_body,
+        )
+    )
+    external_calls = sorted(set(external_calls))
+    low_level = sorted(set(re.findall(r"\.\s*(delegatecall|call|staticcall|send|transfer)\b", semantic_body)))
+    return {
+        "reads": reads, "writes": writes, "internal_calls": internal_calls,
+        "external_calls": external_calls, "low_level_calls": low_level,
+    }
 
 
 def source_model(root: Path) -> dict[str, Any]:
-    contracts, edges, invariants = [], [], []
+    contracts, edges, invariants, entrypoints, hypotheses, primitives = [], [], [], [], [], []
+    functions, state_inventory, call_edges, risk_paths = [], [], [], []
     for path in solidity_sources(root):
         text = path.read_text(errors="replace")
-        for match in CONTRACT_RE.finditer(text):
+        source_name = str(path.relative_to(root))
+        contract_matches = list(CONTRACT_RE.finditer(text))
+        for match in contract_matches:
             name = match.group(1)
             bases = [x.strip().split("(")[0] for x in (match.group(2) or "").split(",") if x.strip()]
-            contracts.append({"name": name, "source": str(path.relative_to(root)), "sha256": hashlib.sha256(text.encode()).hexdigest()})
+            contracts.append({"name": name, "source": source_name, "sha256": hashlib.sha256(text.encode()).hexdigest()})
             edges.extend({"source": name, "target": base, "type": "inherits"} for base in bases)
+            opening = text.find("{", match.end() - 1)
+            if opening < 0:
+                continue
+            closing = _brace_end(text, opening)
+            contract_body = text[opening + 1:closing]
+            variables = _state_variables(contract_body)
+            state_inventory.extend({"contract": name, "name": variable, "source": source_name} for variable in variables)
+            function_matches = list(FUNCTION_RE.finditer(contract_body))
+            known_functions = {function_match.group(1) for function_match in function_matches}
+            for function_match in function_matches:
+                function_name, parameters, suffix = function_match.groups()
+                visibility = next((item for item in ("external", "public", "internal", "private") if re.search(rf"\b{item}\b", suffix)), "internal")
+                mutability = next((item for item in ("pure", "view", "payable") if re.search(rf"\b{item}\b", suffix)), "nonpayable")
+                guards = [item for item in ("onlyOwner", "onlyRole", "nonReentrant", "whenNotPaused") if item.lower() in suffix.lower()]
+                body_opening = contract_body.find("{", function_match.end() - 1)
+                function_body = "" if body_opening < 0 else contract_body[body_opening + 1:_brace_end(contract_body, body_opening)]
+                semantics = _function_semantics(function_body, variables, known_functions - {function_name})
+                signature = f"{function_name}({','.join(re.sub(r'\s+(?:memory|calldata|storage)\b|\s+\w+$', '', value.strip()).strip() for value in parameters.split(',') if value.strip())})"
+                function_record = {
+                    "contract": name, "name": function_name, "signature": signature, "source": source_name,
+                    "visibility": visibility, "mutability": mutability, "guards": guards, **semantics,
+                }
+                functions.append(function_record)
+                call_edges.extend({"source": f"{name}.{function_name}", "target": f"{name}.{target}", "type": "internal_call"} for target in semantics["internal_calls"])
+                call_edges.extend({"source": f"{name}.{function_name}", "target": target, "type": "external_call"} for target in semantics["external_calls"])
+                if visibility in {"external", "public"}:
+                    state_changing = mutability not in {"view", "pure"}
+                    risk_score = min(100, len(semantics["writes"]) * 18 + len(semantics["external_calls"]) * 24 + len(semantics["low_level_calls"]) * 34 + (15 if state_changing and not guards else 0))
+                    entry = {**function_record, "state_changing": state_changing, "risk_score": risk_score}
+                    entrypoints.append(entry)
+                    if state_changing and semantics["writes"] and semantics["external_calls"]:
+                        risk_paths.append({
+                            "category": "state_external_interaction", "severity": "high" if not guards else "medium",
+                            "entrypoint": f"{name}.{signature}", "writes": semantics["writes"],
+                            "calls": semantics["external_calls"], "guards": guards, "source": source_name,
+                        })
+                        hypotheses.append({
+                            "category": "state_external_interaction", "severity": "high" if not guards else "medium",
+                            "source": source_name, "subject": f"{name}.{function_name}",
+                            "statement": "State mutation and external interaction share a reachable entrypoint; ordering and reentrancy safety require proof",
+                            "proof_required": "Trace checks-effects-interactions order, callback reachability, state delta and a non-reentrant negative control",
+                        })
         lower = text.lower()
         if "delegatecall" in lower or "upgrade" in lower:
             invariants.append({"category": "upgradeability", "statement": "Only authorized governance may change implementation"})
@@ -153,7 +330,34 @@ def source_model(root: Path) -> dict[str, Any]:
             invariants.append({"category": "accounting", "statement": "Asset/share accounting remains conserved across state transitions"})
         if any(term in lower for term in ("onlyowner", "accesscontrol", "hasrole")):
             invariants.append({"category": "authorization", "statement": "Privileged state transitions require the intended role"})
-    return {"contracts": contracts, "relationships": edges, "invariants": invariants}
+        for primitive, (severity, statement) in RISK_PRIMITIVES.items():
+            if primitive in lower:
+                occurrence = {"primitive": primitive, "severity": severity, "source": source_name, "count": lower.count(primitive)}
+                primitives.append(occurrence)
+                hypotheses.append({
+                    "category": "dangerous_primitive", "severity": severity, "source": source_name,
+                    "subject": primitive, "statement": statement, "proof_required": "Trace reachable callers, attacker-controlled inputs and a negative control",
+                })
+        if any(term in lower for term in ("price", "oracle", "latestanswer", "latestrounddata")):
+            hypotheses.append({
+                "category": "oracle_integrity", "severity": "high", "source": source_name,
+                "subject": "price/oracle dependency", "statement": "Price freshness, decimals and manipulation resistance require proof",
+                "proof_required": "Identify the price source, heartbeat, decimal normalization and fork-based manipulation bound",
+            })
+    unique_invariants = list({(item["category"], item["statement"]): item for item in invariants}.values())
+    unique_hypotheses = list({(item["category"], item["source"], item["subject"]): item for item in hypotheses}.values())
+    return {
+        "contracts": contracts, "relationships": edges, "invariants": unique_invariants,
+        "entrypoints": entrypoints, "functions": functions, "state_variables": state_inventory,
+        "call_graph": call_edges, "risk_paths": risk_paths,
+        "risk_primitives": primitives, "hypotheses": unique_hypotheses,
+        "summary": {
+            "contracts": len(contracts), "entrypoints": len(entrypoints),
+            "state_changing_entrypoints": sum(item["state_changing"] for item in entrypoints),
+            "state_variables": len(state_inventory), "call_edges": len(call_edges),
+            "risk_paths": len(risk_paths), "risk_primitives": len(primitives), "hypotheses": len(unique_hypotheses),
+        },
+    }
 
 
 def run_forge_build(root: Path) -> dict[str, Any]:
@@ -164,11 +368,39 @@ def run_forge_build(root: Path) -> dict[str, Any]:
     # broken Echidna harness must not hide whether the deployable contracts
     # themselves compile.
     result = subprocess.run(
-        [forge, "build", "--root", str(root), "--no-lint", "--skip", "test", "--skip", "script"],
-        capture_output=True, text=True, timeout=600,
+        [forge, "build", "--no-lint", "--skip", "test", "--skip", "script"],
+        cwd=root, capture_output=True, text=True, timeout=600,
     )
     output = (result.stdout + "\n" + result.stderr)[-12000:]
     return {"status": "compiled" if result.returncode == 0 else "failed", "exit_code": result.returncode, "output": output}
+
+
+def parse_forge_test_json(output: str) -> list[dict[str, Any]]:
+    """Normalize Forge JSON without persisting full traces or attacker-controlled logs."""
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        start = output.rfind("\n{")
+        try:
+            payload = json.loads(output[start + 1:] if start >= 0 else "{}")
+        except json.JSONDecodeError:
+            return []
+    tests = []
+    for suite, suite_result in payload.items() if isinstance(payload, dict) else []:
+        if not isinstance(suite_result, dict):
+            continue
+        for name, result in suite_result.get("test_results", {}).items():
+            kind = result.get("kind", {}) if isinstance(result, dict) else {}
+            fuzz = kind.get("Fuzz", {}) if isinstance(kind, dict) else {}
+            counterexample = result.get("counterexample") if isinstance(result, dict) else None
+            tests.append({
+                "suite": str(suite)[:300], "name": str(name)[:300],
+                "status": str(result.get("status", "Unknown")),
+                "reason": str(result.get("reason"))[:1000] if result.get("reason") else None,
+                "fuzz_runs": fuzz.get("runs"),
+                "counterexample": counterexample if isinstance(counterexample, (dict, list, str, int, float, bool, type(None))) else str(counterexample)[:2000],
+            })
+    return tests
 
 
 def run_forge_tests(root: Path) -> dict[str, Any]:
@@ -176,11 +408,41 @@ def run_forge_tests(root: Path) -> dict[str, Any]:
     if not forge:
         return {"status": "degraded", "reason": "forge_missing"}
     result = subprocess.run(
-        [forge, "test", "--root", str(root), "--fuzz-runs", "64", "--skip", "echidna"],
-        capture_output=True, text=True, timeout=600,
+        [forge, "test", "--fuzz-runs", "64", "--skip", "echidna", "--json"],
+        cwd=root, capture_output=True, text=True, timeout=600,
     )
     output = (result.stdout + "\n" + result.stderr)[-12000:]
-    return {"status": "passed" if result.returncode == 0 else "failed", "exit_code": result.returncode, "runs": 64, "output": output}
+    tests = parse_forge_test_json(result.stdout)
+    failed = [item for item in tests if item["status"].lower() not in {"success", "passed"}]
+    return {
+        "status": "passed" if result.returncode == 0 and not failed else "failed",
+        "exit_code": result.returncode, "runs": 64, "tests": tests,
+        "passed_tests": len(tests) - len(failed), "failed_tests": len(failed), "output": output,
+    }
+
+
+def run_forge_property_replay(root: Path, property_name: str, seed: int) -> dict[str, Any]:
+    """Replay one named property with an independent deterministic seed."""
+    forge = binary("forge")
+    if not forge:
+        return {"status": "degraded", "reason": "forge_missing", "tests": []}
+    base_name = property_name.split("(", 1)[0]
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", base_name):
+        raise HTTPException(422, "Property 名称不符合 Forge 测试函数格式")
+    result = subprocess.run(
+        [
+            forge, "test", "--match-test", f"^{base_name}", "--fuzz-runs", "64",
+            "--fuzz-seed", hex(seed), "--skip", "echidna", "--json",
+        ],
+        cwd=root, capture_output=True, text=True, timeout=600,
+    )
+    tests = [item for item in parse_forge_test_json(result.stdout) if item["name"].split("(", 1)[0] == base_name]
+    failed = [item for item in tests if item["status"].lower() not in {"success", "passed"}]
+    return {
+        "status": "failed" if failed else ("passed" if result.returncode == 0 and tests else "not_found"),
+        "exit_code": result.returncode, "seed": hex(seed), "runs": 64, "tests": tests,
+        "output_tail": (result.stdout + "\n" + result.stderr)[-4000:],
+    }
 
 
 def compiler_model(root: Path) -> list[dict[str, Any]]:
@@ -363,13 +625,203 @@ def inspect_source(body: SourceInspectInput):
                 final_core.uid("invariant"), body.engagement_id, invariant["category"], invariant["statement"],
                 "source-heuristic", "candidate", final_core.utcnow(),
             ))
+        hypothesis_observation_ids = []
+        for hypothesis in model["hypotheses"]:
+            hypothesis_observation_id = final_core.uid("obs")
+            hypothesis_observation_ids.append(hypothesis_observation_id)
+            db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                hypothesis_observation_id, body.run_id, body.engagement_id, "web3",
+                f"web3.hypothesis.{hypothesis['category']}", hypothesis["subject"],
+                f"{hypothesis['severity'].upper()} review · {hypothesis['statement']}",
+                .65, "web3-source-discovery", artifact_id, final_core.utcnow(),
+            ))
+        property_observation_ids = []
+        for property_test in fuzz_result.get("tests", []):
+            failed = property_test.get("status", "").lower() not in {"success", "passed"}
+            property_observation_id = final_core.uid("obs")
+            property_observation_ids.append(property_observation_id)
+            summary = (
+                f"PROPERTY FAILED · {property_test['name']} · {property_test.get('reason') or 'counterexample produced'}"
+                if failed else f"Property passed · {property_test['name']} · {property_test.get('fuzz_runs') or 0} fuzz runs"
+            )
+            db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                property_observation_id, body.run_id, body.engagement_id, "web3",
+                "web3.property.counterexample" if failed else "web3.property.passed",
+                property_test["suite"], summary[:1000], .95 if failed else .85,
+                "forge-test", artifact_id, final_core.utcnow(),
+            ))
+            if failed:
+                db.execute("INSERT INTO invariant_registry VALUES(?,?,?,?,?,?,?)", (
+                    final_core.uid("invariant"), body.engagement_id, "property_test",
+                    property_test["name"], "forge-counterexample", "violated", final_core.utcnow(),
+                ))
+                evidence_id = final_core.uid("evidence")
+                db.execute("INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)", (
+                    evidence_id, property_observation_id, body.run_id, "forge_counterexample",
+                    summary[:1000], artifact_id, "supporting", final_core.utcnow(),
+                ))
+                existing = db.execute(
+                    "SELECT id FROM candidate_findings WHERE run_id=? AND category='web3_property_violation' AND target=? AND status!='archived'",
+                    (body.run_id, property_test["name"]),
+                ).fetchone()
+                if not existing:
+                    candidate_id = final_core.uid("candidate")
+                    timestamp = final_core.utcnow()
+                    db.execute("INSERT INTO candidate_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+                        candidate_id, body.run_id, body.engagement_id, "web3",
+                        f"Property violation: {property_test['name']}", "web3_property_violation",
+                        property_test["name"],
+                        f"Forge produced a counterexample: {property_test.get('reason') or 'property failed'}. Independent fork replay and impact analysis are still required.",
+                        "candidate", final_core.dump([evidence_id]), timestamp, timestamp,
+                    ))
         observation_id = final_core.uid("obs")
         db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
             observation_id, body.run_id, body.engagement_id, "web3", "web3.compiler_result",
             str(root), f"{framework} compile={compile_result['status']} fuzz={fuzz_result['status']}",
             1.0 if compile_result["status"] == "compiled" else .2, "forge", artifact_id, final_core.utcnow(),
         ))
-    return {"artifact_id": artifact_id, "observation_id": observation_id, **artifact}
+    return {
+        "artifact_id": artifact_id, "observation_id": observation_id,
+        "hypothesis_observation_ids": hypothesis_observation_ids,
+        "property_observation_ids": property_observation_ids, **artifact,
+    }
+
+
+@router.post("/candidates/{candidate_id}/property-replay")
+def replay_property_candidate(candidate_id: str, body: PropertyReplayInput):
+    """Create replay evidence; formal verification gates remain in final_core.verify_candidate."""
+    import final_core
+
+    with final_core.connect() as db:
+        candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (candidate_id,)).fetchone()
+        if not candidate:
+            raise HTTPException(404, "Candidate 不存在")
+        if candidate["mode"] != "web3" or candidate["category"] != "web3_property_violation":
+            raise HTTPException(409, "定向属性复测仅用于 Web3 Property Candidate")
+        if candidate["status"] == "archived":
+            raise HTTPException(409, "已归档 Candidate 不能复测")
+        source_observation = db.execute(
+            """SELECT * FROM observations WHERE run_id=? AND observation_type='web3.compiler_result'
+               ORDER BY created_at DESC LIMIT 1""", (candidate["run_id"],),
+        ).fetchone()
+    if not source_observation:
+        raise HTTPException(409, "Candidate 缺少可追溯的本地源码根目录")
+    root = Path(source_observation["subject"]).expanduser().resolve()
+    if not root.is_dir() or detect_framework(root) != "foundry" or not solidity_sources(root):
+        raise HTTPException(409, "Candidate 的 Foundry 源码目录已不可用")
+
+    started_at = final_core.utcnow()
+    raw_rounds = [run_forge_property_replay(root, candidate["target"], seed) for seed in (0xF13D01, 0xF13D02)]
+    expected_base = candidate["target"].split("(", 1)[0]
+    normalized_rounds = []
+    for index, replay in enumerate(raw_rounds, start=1):
+        matched = next((item for item in replay.get("tests", []) if item["name"].split("(", 1)[0] == expected_base), None)
+        counterexample = matched.get("counterexample") if matched else None
+        digest = hashlib.sha256(json.dumps(counterexample, sort_keys=True, ensure_ascii=False).encode()).hexdigest() if counterexample is not None else None
+        normalized_rounds.append({
+            "round": index, "seed": replay.get("seed"), "status": replay.get("status"),
+            "property": matched.get("name") if matched else None,
+            "reason": matched.get("reason") if matched else replay.get("reason") or "property_not_found",
+            "fuzz_runs": matched.get("fuzz_runs") if matched else None,
+            "counterexample_sha256": digest,
+        })
+    failure_reasons = [item["reason"] for item in normalized_rounds]
+    stable = all(item["status"] == "failed" and item["property"] for item in normalized_rounds) and len(set(failure_reasons)) == 1
+    attempt_status = "reproduced" if stable else "unstable"
+
+    artifact_id = final_core.uid("artifact")
+    ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+    artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
+    artifact_payload = {
+        "kind": "web3.property_replay", "candidate_id": candidate_id,
+        "property": candidate["target"], "rounds": raw_rounds,
+        "stability": {"stable_failure": stable, "matched_failure_reason": failure_reasons[0] if stable else None},
+    }
+    artifact_path.write_text(final_core.redact(json.dumps(artifact_payload, ensure_ascii=False, indent=2)))
+    evidence_ids = final_core.load(candidate["evidence_ids"], [])
+    created_evidence_ids = []
+    with final_core.connect() as db:
+        db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
+            artifact_id, candidate["run_id"], "web3.property_replay", str(artifact_path),
+            hashlib.sha256(artifact_path.read_bytes()).hexdigest(), "application/json", 1, final_core.utcnow(),
+        ))
+        for item in normalized_rounds:
+            observation_id, evidence_id = final_core.uid("obs"), final_core.uid("evidence")
+            summary = (
+                f"PROPERTY REPLAY {item['round']}/2 · {item['status'].upper()} · "
+                f"{item['property'] or candidate['target']} · {item['reason']}"
+            )[:1000]
+            db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                observation_id, candidate["run_id"], candidate["engagement_id"], "web3",
+                "web3.property.replay", candidate["target"], summary,
+                .98 if item["status"] == "failed" else .7, "forge-property-replay", artifact_id, final_core.utcnow(),
+            ))
+            db.execute("INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)", (
+                evidence_id, observation_id, candidate["run_id"], "forge_property_replay",
+                summary, artifact_id, "supporting" if item["status"] == "failed" else "counter", final_core.utcnow(),
+            ))
+            created_evidence_ids.append(evidence_id)
+        evidence_ids.extend(created_evidence_ids)
+        attempt_id = final_core.uid("verify")
+        result = {
+            "stable_failure": stable, "property": candidate["target"], "rounds": normalized_rounds,
+            "boundary": "Replay stability does not prove impact, eligibility, or a verified finding.",
+        }
+        db.execute("INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)", (
+            attempt_id, candidate_id, "forge-property-replay", attempt_status, body.rounds,
+            final_core.dump(result), started_at, final_core.utcnow(),
+        ))
+        db.execute("UPDATE candidate_findings SET status=?,evidence_ids=?,updated_at=? WHERE id=?", (
+            attempt_status, final_core.dump(evidence_ids), final_core.utcnow(), candidate_id,
+        ))
+    final_core.add_event(
+        candidate["run_id"], "verification", "web3.property_replay_completed",
+        f"Web3 属性定向复测完成：{attempt_status}",
+        {"candidate_id": candidate_id, "attempt_id": attempt_id, "stable_failure": stable},
+    )
+    return {
+        "candidate_id": candidate_id, "verification_attempt_id": attempt_id,
+        "status": attempt_status, "stable_failure": stable, "rounds": normalized_rounds,
+        "evidence_ids": created_evidence_ids,
+        "next_gate": "需继续完成 ProgramSnapshot、影响证明、已知问题/历史审计与反证检查，才能进入 Verified Finding。",
+    }
+
+
+@router.get("/runs/{run_id}/discovery")
+def web3_run_discovery(run_id: str):
+    """Return the latest normalized Web3 attack-surface model for researcher review."""
+    import final_core
+
+    with final_core.connect() as db:
+        run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+        artifact = db.execute(
+            "SELECT * FROM artifacts WHERE run_id=? AND kind='web3.source_model' ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+    if not run or run["mode"] != "web3":
+        raise HTTPException(409, "Web3 discovery 仅用于 Web3 Run")
+    if not artifact:
+        return {"run_id": run_id, "ready": False, "reason": "source_model_not_generated"}
+    path = Path(artifact["uri"])
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(409, "Web3 source model artifact 不可读") from error
+    model = payload.get("model", {})
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    hypotheses = sorted(model.get("hypotheses", []), key=lambda item: severity_order.get(item.get("severity"), 9))
+    return {
+        "run_id": run_id, "ready": True, "artifact_id": artifact["id"],
+        "framework": payload.get("framework"), "compile": payload.get("compile", {}),
+        "fuzz": payload.get("fuzz", {}), "property_tests": payload.get("fuzz", {}).get("tests", []),
+        "summary": model.get("summary", {}),
+        "contracts": model.get("contracts", []), "entrypoints": model.get("entrypoints", []),
+        "state_variables": model.get("state_variables", []), "call_graph": model.get("call_graph", []),
+        "risk_paths": model.get("risk_paths", []),
+        "risk_primitives": model.get("risk_primitives", []), "hypotheses": hypotheses,
+        "invariants": model.get("invariants", []), "relationships": model.get("relationships", []),
+        "boundary": "Hypotheses require independent reproduction and do not constitute verified vulnerabilities.",
+    }
 
 
 @router.post("/tools/{capability_id}/run")

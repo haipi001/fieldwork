@@ -232,6 +232,29 @@ def test_business_workflow_rejects_out_of_scope_and_read_only_post(client):
     assert {item["reason"] for item in blockers} == {"out_of_scope", "non_read_method_requires_reversible_or_state_changing_risk_class"}
 
 
+def test_concurrency_probe_requires_explicit_isolated_scope(client):
+    engagement = create_ready(client, target="https://concurrency-scope.test")
+    client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+        "label": "Research user", "role": "user", "tenant": "tenant-a",
+        "auth_type": "none", "session_status": "ready",
+    })
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Concurrency guard", "objective": "Prove concurrency remains opt-in and isolated",
+    }).json()
+    workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+        "name": "Read sequence", "objective": "Test a declared dependency without state changes",
+        "steps": [
+            {"name": "Discover", "method": "GET", "url": "https://concurrency-scope.test/session", "actor_role": "user"},
+            {"name": "Read", "method": "GET", "url": "https://concurrency-scope.test/object", "actor_role": "user", "requires_steps": [1], "concurrency_safe": True},
+        ],
+        "invariants": ["Dependent reads require their declared prerequisite"], "risk_class": "read_only",
+    })
+    assert workflow.status_code == 201
+    plan = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+    assert "sequence_violation" in {item["kind"] for item in plan["tests"]}
+    assert {item["reason"] for item in plan["blocked"]} == {"concurrency_test_requires_isolated_scope"}
+
+
 def test_reversible_business_transition_requires_isolation_confirmation_and_proves_rollback(client):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
@@ -344,7 +367,8 @@ def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(c
     try:
         draft = client.post("/api/v1/engagements", json={
             "name": "Dynamic workflow fixture", "target": target, "mode": "traditional",
-            "scope": {"allow_private_ips": True}, "policy": {"max_requests_per_second": 100, "max_requests": 100},
+            "scope": {"allow_private_ips": True, "allow_concurrency_testing": True, "environment_class": "local_fixture"},
+            "policy": {"max_requests_per_second": 100, "max_requests": 100, "max_concurrency": 3},
         }).json()
         engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
         first_identity = client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
@@ -362,7 +386,7 @@ def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(c
             "name": "Discover then fetch order", "objective": "Extract an object identifier and prove tenant ownership",
             "steps": [
                 {"name": "Discover", "method": "GET", "url": f"{target}/session", "actor_role": "user", "extract": {"order_id": "/order_id", "ephemeral_secret": "/secret_token"}},
-                {"name": "Fetch", "method": "GET", "url": f"{target}/orders/{{{{order_id}}}}", "actor_role": "user"},
+                {"name": "Fetch", "method": "GET", "url": f"{target}/orders/{{{{order_id}}}}", "actor_role": "user", "requires_steps": [1], "concurrency_safe": True, "concurrency_replays": 3},
             ],
             "invariants": ["The fetched object must belong to the active tenant"],
             "executable_invariants": [
@@ -374,7 +398,7 @@ def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(c
         })
         assert workflow.status_code == 201
         iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
-        assert [item["kind"] for item in iteration["tests"]] == ["workflow_sequence", "cross_identity_sequence", "sequence_violation"]
+        assert [item["kind"] for item in iteration["tests"]] == ["workflow_sequence", "cross_identity_sequence", "sequence_violation", "concurrent_step"]
         run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
         with sqlite3.connect(final_core.DB) as db:
             db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
@@ -388,6 +412,10 @@ def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(c
         cross = next(item for item in executed.json()["results"] if item["kind"] == "cross_identity_sequence")
         assert cross["decision"] == "suspicious_success" and cross["hypothesis_id"]
         assert cross["carried_variables"] == ["ephemeral_secret", "order_id"] and secret not in json.dumps(cross)
+        sequence_bypass = next(item for item in executed.json()["results"] if item["kind"] == "sequence_violation")
+        assert sequence_bypass["decision"] == "suspicious_success" and sequence_bypass["hypothesis_id"]
+        concurrent = next(item for item in executed.json()["results"] if item["kind"] == "concurrent_step")
+        assert concurrent["stable"] is True and concurrent["workers"] == 3
         with sqlite3.connect(final_core.DB) as db:
             previews = " ".join(row[0] for row in db.execute("SELECT response_body_preview FROM http_exchanges WHERE run_id=?", (run_id,)))
             evidence = " ".join(row[0] for row in db.execute("SELECT summary FROM evidence_v2 WHERE run_id=?", (run_id,)))
@@ -602,6 +630,30 @@ def test_task_center_reports_remaining_stages_and_actionable_next_step(client):
     assert center.json()["stall_timeout_seconds"] == 180
 
 
+def test_task_and_coverage_clear_only_hide_ui_records(client):
+    ready = create_ready(client, target="https://display-cleanup.test")
+    run = client.post(f"/api/v1/engagements/{ready['id']}/start", json={"execution_mode": "demo"}).json()
+    assert client.post(f"/api/v1/runs/{run['id']}/stop").status_code == 200
+    timestamp = final_core.utcnow()
+    with sqlite3.connect(final_core.DB) as db:
+        db.execute("INSERT OR REPLACE INTO coverage_v2 VALUES(?,?,?,?,?,?,?)", (
+            "coverage-cleanup", run["id"], "business:authorization", "tested",
+            "authorized fixture response", "[]", timestamp,
+        ))
+    task_clear = client.request("DELETE", "/api/v1/task-center?mode=traditional", json={"confirmation": "CLEAR_TERMINAL_TASKS"})
+    assert task_clear.status_code == 200 and task_clear.json()["hidden"] >= 1
+    assert all(item["id"] != run["id"] for item in client.get("/api/v1/task-center?mode=traditional").json()["items"])
+    assert client.get(f"/api/v1/runs/{run['id']}").status_code == 200
+
+    before = client.get(f"/api/v1/runs/{run['id']}/coverage").json()["coverage"]
+    assert [item["id"] for item in before] == ["coverage-cleanup"]
+    coverage_clear = client.request("DELETE", f"/api/v1/runs/{run['id']}/coverage-display", json={"confirmation": "CLEAR_COVERAGE_DISPLAY"})
+    assert coverage_clear.status_code == 200 and coverage_clear.json()["report_preserved"] is True
+    assert client.get(f"/api/v1/runs/{run['id']}/coverage").json()["coverage"] == []
+    with sqlite3.connect(final_core.DB) as db:
+        assert db.execute("SELECT COUNT(*) FROM coverage_v2 WHERE id='coverage-cleanup'").fetchone()[0] == 1
+
+
 def test_scope_required_and_run_checkpoints(client):
     draft = client.post("/api/v1/engagements", json={"name": "Draft target", "target": "https://draft.test", "mode": "traditional"}).json()
     denied = client.post(f"/api/v1/engagements/{draft['id']}/start")
@@ -733,6 +785,140 @@ def test_web3_network_guard_and_program_versions(client):
     assert local["allowed"] is True and local["requires_real_private_key"] is False
     key = client.post("/api/v1/web3/execution/check", json={"engagement_id": engagement["id"], "network_class": "local_fork", "action": "sign", "uses_real_private_key": True}).json()
     assert key["allowed"] is False
+
+
+def test_web3_source_discovery_catalogs_entrypoints_and_review_hypotheses(client, tmp_path, monkeypatch):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "RiskyVault.sol").write_text("""
+pragma solidity ^0.8.24;
+contract RiskyVault {
+    uint256 public price;
+    function setPrice(uint256 next) external { price = next; }
+    function execute(address target, bytes calldata data) external payable {
+        target.delegatecall(data);
+    }
+    function quote() external view returns (uint256) { return block.timestamp * price; }
+}
+""")
+    model = web3_analysis.source_model(tmp_path)
+    assert model["summary"] == {
+        "contracts": 1, "entrypoints": 3, "state_changing_entrypoints": 2,
+        "state_variables": 1, "call_edges": 1, "risk_paths": 0,
+        "risk_primitives": 2, "hypotheses": 3,
+    }
+    assert {item["name"] for item in model["entrypoints"]} == {"setPrice", "execute", "quote"}
+    assert {item["subject"] for item in model["hypotheses"]} == {"delegatecall", "block.timestamp", "price/oracle dependency"}
+    assert model["state_variables"] == [{"contract": "RiskyVault", "name": "price", "source": "src/RiskyVault.sol"}]
+    assert next(item for item in model["entrypoints"] if item["name"] == "setPrice")["writes"] == ["price"]
+    assert next(item for item in model["entrypoints"] if item["name"] == "quote")["reads"] == ["price"]
+    assert model["call_graph"] == [{"source": "RiskyVault.execute", "target": "target.delegatecall", "type": "external_call"}]
+
+    engagement = create_ready(client, "web3", str(tmp_path))
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start", json={"execution_mode": "demo"}).json()["id"]
+    monkeypatch.setattr(web3_analysis, "run_forge_build", lambda _root: {"status": "not_run"})
+    inspected = client.post("/api/v1/web3/source/inspect", json={
+        "engagement_id": engagement["id"], "run_id": run_id, "source_path": str(tmp_path),
+    })
+    assert inspected.status_code == 200, inspected.text
+    assert len(inspected.json()["hypothesis_observation_ids"]) == 3
+    discovery = client.get(f"/api/v1/web3/runs/{run_id}/discovery")
+    assert discovery.status_code == 200
+    payload = discovery.json()
+    assert payload["ready"] is True and payload["summary"]["entrypoints"] == 3
+    assert payload["hypotheses"][0]["severity"] == "critical"
+    assert payload["state_variables"][0]["name"] == "price" and payload["call_graph"]
+
+
+def test_web3_semantic_model_prioritizes_state_and_external_interaction(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "Treasury.sol").write_text("""
+pragma solidity ^0.8.24;
+interface IERC20 { function transfer(address,uint256) external returns (bool); }
+contract Treasury {
+    mapping(address => uint256) public balances;
+    uint256 public totalAssets;
+    IERC20 public token;
+    function withdraw(uint256 amount) external {
+        balances[msg.sender] -= amount;
+        totalAssets -= amount;
+        token.transfer(msg.sender, amount);
+    }
+}
+""")
+    model = web3_analysis.source_model(tmp_path)
+    withdraw = next(item for item in model["entrypoints"] if item["name"] == "withdraw")
+    assert set(withdraw["writes"]) == {"balances", "totalAssets"}
+    assert withdraw["external_calls"] == ["token.transfer"]
+    assert withdraw["risk_score"] >= 70
+    assert model["risk_paths"] == [{
+        "category": "state_external_interaction", "severity": "high",
+        "entrypoint": "Treasury.withdraw(uint256)", "writes": ["balances", "totalAssets"],
+        "calls": ["token.transfer"], "guards": [], "source": "src/Treasury.sol",
+    }]
+    assert any(item["category"] == "state_external_interaction" for item in model["hypotheses"])
+
+
+@pytest.mark.skipif(not web3_lab.binary("forge"), reason="Forge optional capability not installed")
+def test_web3_buggy_fixture_produces_normalized_property_counterexample(client):
+    fixture = app.ROOT / "fixtures" / "web3-buggy-vault"
+    result = web3_analysis.run_forge_tests(fixture)
+    assert result["status"] == "failed" and result["failed_tests"] == 1
+    failed = result["tests"][0]
+    assert failed["name"] == "testFuzz_TotalAssetsReturnsToZero(uint96)"
+    assert failed["reason"] == "totalAssets drift after full withdrawal"
+    assert failed["counterexample"] and failed["counterexample"]["Single"]["args"]
+
+    engagement = create_ready(client, "web3", str(fixture))
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start", json={"execution_mode": "demo"}).json()["id"]
+    inspected = client.post("/api/v1/web3/source/inspect", json={
+        "engagement_id": engagement["id"], "run_id": run_id, "source_path": str(fixture),
+    })
+    assert inspected.status_code == 200, inspected.text
+    payload = inspected.json()
+    assert payload["fuzz"]["failed_tests"] == 1 and payload["property_observation_ids"]
+    with final_core.connect() as db:
+        observation = db.execute(
+            "SELECT * FROM observations WHERE id=?", (payload["property_observation_ids"][0],),
+        ).fetchone()
+        invariant = db.execute(
+            "SELECT * FROM invariant_registry WHERE engagement_id=? AND status='violated'", (engagement["id"],),
+        ).fetchone()
+        candidate = db.execute(
+            "SELECT * FROM candidate_findings WHERE run_id=? AND category='web3_property_violation'", (run_id,),
+        ).fetchone()
+    assert observation["observation_type"] == "web3.property.counterexample"
+    assert "totalAssets drift" in observation["summary"]
+    assert invariant["statement"] == failed["name"]
+    assert candidate["status"] == "candidate"
+    assert final_core.load(candidate["evidence_ids"], [])
+
+    replay = client.post(
+        f"/api/v1/web3/candidates/{candidate['id']}/property-replay", json={"rounds": 2},
+    )
+    assert replay.status_code == 200, replay.text
+    replay_payload = replay.json()
+    assert replay_payload["status"] == "reproduced"
+    assert replay_payload["stable_failure"] is True
+    assert len(replay_payload["rounds"]) == 2
+    assert {item["reason"] for item in replay_payload["rounds"]} == {"totalAssets drift after full withdrawal"}
+    assert all(item["counterexample_sha256"] for item in replay_payload["rounds"])
+    with final_core.connect() as db:
+        updated_candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (candidate["id"],)).fetchone()
+        attempt = db.execute(
+            "SELECT * FROM verification_attempts WHERE id=?", (replay_payload["verification_attempt_id"],),
+        ).fetchone()
+        replay_observations = db.execute(
+            "SELECT * FROM observations WHERE run_id=? AND observation_type='web3.property.replay'", (run_id,),
+        ).fetchall()
+        canonical = db.execute("SELECT * FROM canonical_findings WHERE candidate_id=?", (candidate["id"],)).fetchone()
+    assert updated_candidate["status"] == "reproduced"
+    assert len(final_core.load(updated_candidate["evidence_ids"], [])) == 3
+    assert attempt["status"] == "reproduced" and attempt["attempts"] == 2
+    assert final_core.load(attempt["result"], {})["stable_failure"] is True
+    assert len(replay_observations) == 2
+    assert canonical is None  # Replay stability never bypasses impact and counterevidence gates.
 
 
 def test_report_renderer_never_invents_missing_fields():

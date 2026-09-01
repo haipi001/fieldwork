@@ -5,8 +5,8 @@
   <key>CFBundleName</key><string>Fieldwork</string>
   <key>CFBundleDisplayName</key><string>Fieldwork</string>
   <key>CFBundleIdentifier</key><string>local.fieldwork.security-research</string>
-  <key>CFBundleVersion</key><string>12</string>
-  <key>CFBundleShortVersionString</key><string>0.17.0</string>
+  <key>CFBundleVersion</key><string>18</string>
+  <key>CFBundleShortVersionString</key><string>0.22.0</string>
   <key>CFBundleExecutable</key><string>Fieldwork</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>Fieldwork</string>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -474,6 +475,9 @@ class WorkflowStepInput(BaseModel):
     compensation_url: str | None = Field(default=None, max_length=2048)
     compensation_body: str | None = Field(default=None, max_length=65536)
     extract: dict[str, str] = Field(default_factory=dict, max_length=20)
+    requires_steps: list[int] = Field(default_factory=list, max_length=20)
+    concurrency_safe: bool = False
+    concurrency_replays: int = Field(default=2, ge=2, le=10)
 
 
 class ExecutableInvariantInput(BaseModel):
@@ -714,6 +718,7 @@ def create_engagement(body: EngagementInput):
         "allow_authentication": False,
         "auth_allowed_hosts": [],
         "allow_reversible_state_change": False,
+        "allow_concurrency_testing": False,
         "environment_class": "production",
         "requires_confirmation": True,
         **body.scope,
@@ -722,6 +727,7 @@ def create_engagement(body: EngagementInput):
         "max_requests": 100,
         "max_requests_per_second": 1,
         "max_runtime_minutes": 30,
+        "max_concurrency": 2,
         "max_tool_calls": 200,
         "max_model_budget_usd": 10,
         "network_mode": "read_only" if body.mode == "web3" else "scoped",
@@ -1021,6 +1027,10 @@ def list_runs(mode: Literal["traditional", "web3"] | None = None):
 @router.get("/task-center")
 def task_center(mode: Literal["traditional", "web3"] | None = None):
     runs = list_runs(mode)
+    with connect() as db:
+        hidden_row = db.execute("SELECT value FROM app_metadata WHERE key=?", (f"task_center_hidden:{mode or 'all'}",)).fetchone()
+    hidden = set(load(hidden_row["value"], []) if hidden_row else [])
+    runs = [run for run in runs if run["id"] not in hidden]
     ordered_queued = [run["id"] for run in reversed(runs) if run["status"] == "queued"]
     result = []
     for run in runs:
@@ -1058,6 +1068,21 @@ def task_center(mode: Literal["traditional", "web3"] | None = None):
         })
     counts = {status: sum(item["status"] == status for item in result) for status in ("queued", "running", "paused", "completed", "failed")}
     return {"counts": counts, "stall_timeout_seconds": 180, "items": result}
+
+
+@router.delete("/task-center")
+def clear_task_center(mode: Literal["traditional", "web3"], body: MaintenanceConfirmInput):
+    """Hide terminal task rows without deleting runs, evidence, findings, or reports."""
+    if body.confirmation != "CLEAR_TERMINAL_TASKS":
+        raise HTTPException(422, "任务记录清理确认值无效")
+    runs = list_runs(mode)
+    terminal = [run["id"] for run in runs if run["status"] not in {"queued", "running", "paused"}]
+    key, timestamp = f"task_center_hidden:{mode}", utcnow()
+    with connect() as db:
+        previous = db.execute("SELECT value FROM app_metadata WHERE key=?", (key,)).fetchone()
+        hidden = list(dict.fromkeys((load(previous["value"], []) if previous else []) + terminal))
+        db.execute("INSERT OR REPLACE INTO app_metadata VALUES(?,?,?)", (key, dump(hidden), timestamp))
+    return {"mode": mode, "hidden": len(terminal), "active_preserved": True, "evidence_preserved": True}
 
 
 @router.get("/runs/{run_id}")
@@ -2127,6 +2152,10 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
     engagement = get_engagement(campaign["engagement_id"])
     blocked, declared_variables = [], set()
     for index, step in enumerate(body.steps):
+        if any(required < 1 or required >= index + 1 for required in step.requires_steps):
+            blocked.append({"step": index + 1, "reason": "requires_steps_must_reference_earlier_steps"})
+        if step.concurrency_safe and step.method not in {"GET", "HEAD", "OPTIONS"}:
+            blocked.append({"step": index + 1, "reason": "concurrency_replay_only_allows_read_methods"})
         template_sources = [step.url, step.body or "", step.snapshot_url or "", step.compensation_url or "", step.compensation_body or ""]
         referenced = set().union(*(set(re.findall(r"\{\{([A-Za-z_][A-Za-z0-9_]{0,63})\}\}", value)) for value in template_sources))
         missing = referenced - declared_variables - {"identity_role", "identity_tenant"}
@@ -2471,7 +2500,24 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
                         "replay_actor_identity_ids": replay_map, "replay_default_identity_id": replay_default,
                         "assertions": workflow["invariants"], "executable_invariants": workflow.get("executable_invariants", []),
                     })
-                matrix.append({"kind": "sequence_violation", "workflow_id": workflow["id"], "sequence": list(reversed(range(1, len(workflow["steps"]) + 1))), "assertions": workflow["invariants"]})
+                if any(step.get("requires_steps") for step in workflow["steps"]):
+                    matrix.append({
+                        "kind": "sequence_violation", "workflow_id": workflow["id"], "steps": workflow["steps"],
+                        "sequence": list(reversed(range(1, len(workflow["steps"]) + 1))),
+                        "actor_identity_ids": actor_map, "default_identity_id": default_identity,
+                        "assertions": workflow["invariants"],
+                    })
+                for step_index, step in enumerate(workflow["steps"], start=1):
+                    if step.get("concurrency_safe"):
+                        if not engagement["scope"].get("allow_concurrency_testing") or engagement["scope"].get("environment_class") not in {"local_fixture", "ephemeral_test", "staging_clone"}:
+                            blocked.append({"workflow_id": workflow["id"], "step": step_index, "reason": "concurrency_test_requires_isolated_scope"})
+                        else:
+                            matrix.append({
+                                "kind": "concurrent_step", "workflow_id": workflow["id"], "steps": workflow["steps"],
+                                "target_step": step_index, "replays": step.get("concurrency_replays", 2),
+                                "actor_identity_ids": actor_map, "default_identity_id": default_identity,
+                                "assertions": workflow["invariants"],
+                            })
             continue
         for step_index, step in enumerate(workflow["steps"]):
             eligible = [item for item in ready if not step.get("actor_role") or item["role"] == step["actor_role"]]
@@ -2654,9 +2700,10 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             identity_id=test.get(identity_key),
         ), f"campaign:{campaign_id}:{test['kind']}", include_transient=include_transient)
 
-    def run_sequence(test: dict, actor_identity_ids: dict[str, str], default_identity_id: str, initial_variables: dict[str, Any] | None = None, freeze_extractions: bool = False) -> tuple[list[dict[str, Any]], list[str], dict[str, str], dict[str, Any]]:
+    def run_sequence(test: dict, actor_identity_ids: dict[str, str], default_identity_id: str, initial_variables: dict[str, Any] | None = None, freeze_extractions: bool = False, step_order: list[int] | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, str], dict[str, Any]]:
         variables, sequence_steps, exchange_ids, extraction_hashes = dict(initial_variables or {}), [], [], {}
-        for position, step in enumerate(test["steps"], start=1):
+        ordered = [(position, test["steps"][position - 1]) for position in (step_order or list(range(1, len(test["steps"]) + 1)))]
+        for position, step in ordered:
             identity_id = actor_identity_ids.get(step.get("actor_role")) or default_identity_id
             identity = get_identity(identity_id)
             variables.update({"identity_role": identity["role"], "identity_tenant": identity.get("tenant") or ""})
@@ -2693,9 +2740,6 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
 
     for test in tests:
         kind, workflow_id = test.get("kind"), test.get("workflow_id")
-        if kind == "sequence_violation":
-            results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "sequence_execution_requires_explicit_reversible_state_authorization"})
-            continue
         if kind == "reversible_transition" and not body.confirm_reversible_state_change:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "reversible_state_change_requires_per_execution_confirmation"})
             continue
@@ -2728,6 +2772,70 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                           "extracted_variables": sorted(extraction_hashes), "extracted_value_hashes": extraction_hashes}
                 if failed:
                     result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "executable_invariant_violation", f"{len(failed)} 个业务不变量在多步流程中失败：{', '.join(item['name'] for item in failed)}", [observation["id"]], "使用独立身份与负对照重放失败的不变量")
+                results.append(result)
+            elif kind == "sequence_violation":
+                baseline_steps, baseline_ids, baseline_hashes, baseline_variables = run_sequence(
+                    test, test.get("actor_identity_ids", {}), test["default_identity_id"],
+                )
+                carried = {key: value for key, value in baseline_variables.items() if key not in {"identity_role", "identity_tenant"}}
+                perturbed_steps, perturbed_ids, _, _ = run_sequence(
+                    test, test.get("actor_identity_ids", {}), test["default_identity_id"], carried, True, test["sequence"],
+                )
+                perturbed_by_step = {item["step"]: item for item in perturbed_steps}
+                dependency_checks = []
+                for step_number, step in enumerate(test["steps"], start=1):
+                    if not step.get("requires_steps"):
+                        continue
+                    status = perturbed_by_step[step_number]["status"]
+                    dependency_checks.append({
+                        "step": step_number, "requires_steps": step["requires_steps"], "status": status,
+                        "passed": status in {401, 403, 404, 409, 422},
+                    })
+                suspicious = any(not item["passed"] and 200 <= item["status"] < 300 for item in dependency_checks)
+                summary = f"顺序扰动执行 {len(perturbed_steps)} 步；{sum(item['passed'] for item in dependency_checks)}/{len(dependency_checks)} 个前置条件被服务端拒绝"
+                observation = record_observation(body.run_id, ObservationInput(
+                    observation_type="business_logic.sequence_violation", subject=f"workflow:{workflow_id}",
+                    summary=summary, source_capability="campaign-logic-runner", confidence=.9 if suspicious else .78,
+                    raw_ref=":".join(baseline_ids + perturbed_ids),
+                ))
+                observation_ids.append(observation["id"])
+                result = {"kind": kind, "workflow_id": workflow_id, "status": "observed",
+                          "decision": "suspicious_success" if suspicious else "dependency_enforced",
+                          "dependency_checks": dependency_checks, "baseline_exchange_ids": baseline_ids,
+                          "perturbed_exchange_ids": perturbed_ids, "observation_id": observation["id"],
+                          "carried_variables": sorted(carried), "carried_value_hashes": {key: baseline_hashes[key] for key in carried if key in baseline_hashes}}
+                if suspicious:
+                    result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "workflow_sequence_bypass", "在跳过或颠倒声明的前置步骤后，受依赖步骤仍返回成功响应", [observation["id"]], "加入状态负对照，独立重放受依赖步骤并确认可利用影响")
+                results.append(result)
+            elif kind == "concurrent_step":
+                baseline_steps, baseline_ids, baseline_hashes, baseline_variables = run_sequence(
+                    test, test.get("actor_identity_ids", {}), test["default_identity_id"],
+                )
+                step = test["steps"][int(test["target_step"]) - 1]
+                identity_id = test.get("actor_identity_ids", {}).get(step.get("actor_role")) or test["default_identity_id"]
+                identity = get_identity(identity_id)
+                variables = {**baseline_variables, "identity_role": identity["role"], "identity_tenant": identity.get("tenant") or ""}
+                resolved = {**step, "kind": kind, "identity_id": identity_id,
+                            "url": _render_workflow_template(step["url"], variables, True),
+                            "body": _render_workflow_template(step.get("body"), variables)}
+                workers = min(int(test.get("replays", 2)), int(engagement["policy"].get("max_concurrency", 2)), 10)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    concurrent_results = list(pool.map(lambda _: request(resolved), range(workers)))
+                signatures = {(item["response_status"], item["response_sha256"]) for item in concurrent_results}
+                stable = len(signatures) == 1
+                summary = f"有界并发重放 {workers} 次；响应{'稳定' if stable else '出现分歧'}"
+                observation = record_observation(body.run_id, ObservationInput(
+                    observation_type="business_logic.concurrent_replay", subject=f"{step['method']} {resolved['url']}",
+                    summary=summary, source_capability="campaign-logic-runner", confidence=.88 if not stable else .72,
+                    raw_ref=":".join(item["id"] for item in concurrent_results),
+                ))
+                observation_ids.append(observation["id"])
+                result = {"kind": kind, "workflow_id": workflow_id, "status": "observed", "stable": stable,
+                          "workers": workers, "response_signature_count": len(signatures),
+                          "baseline_exchange_ids": baseline_ids, "exchange_ids": [item["id"] for item in concurrent_results],
+                          "observation_id": observation["id"], "carried_variables": sorted(baseline_hashes)}
+                if not stable:
+                    result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "concurrency_nondeterminism", "同一只读业务步骤的有界并发重放产生不同响应签名，可能存在竞态或不一致读", [observation["id"]], "在隔离环境重复并发批次并加入串行负对照")
                 results.append(result)
             elif kind == "cross_identity_sequence":
                 source_steps, source_ids, source_hashes, source_variables = run_sequence(
@@ -3066,13 +3174,31 @@ def authorize_request(run_id: str, body: RequestAuthorizationInput):
 @router.get("/runs/{run_id}/coverage")
 def run_coverage(run_id: str):
     with connect() as db:
-        rows = [dict(row) for row in db.execute("SELECT * FROM coverage_v2 WHERE run_id=? ORDER BY updated_at DESC", (run_id,))]
+        cleared = db.execute("SELECT value FROM app_metadata WHERE key=?", (f"coverage_hidden_before:{run_id}",)).fetchone()
+        cleared_at = cleared["value"] if cleared else None
+        rows = [dict(row) for row in db.execute(
+            "SELECT * FROM coverage_v2 WHERE run_id=? AND (? IS NULL OR updated_at>?) ORDER BY updated_at DESC",
+            (run_id, cleared_at, cleared_at),
+        )]
         grave = [dict(row) for row in db.execute("""SELECT g.* FROM graveyard g JOIN analysis_runs r ON r.engagement_id=g.engagement_id WHERE r.id=?""", (run_id,))]
     for row in rows:
         row["observation_ids"] = load(row["observation_ids"], [])
     for row in grave:
         row["counterevidence_ids"] = load(row["counterevidence_ids"], [])
     return {"coverage": rows, "graveyard": grave}
+
+
+@router.delete("/runs/{run_id}/coverage-display")
+def clear_run_coverage_display(run_id: str, body: MaintenanceConfirmInput):
+    """Clear the visible ledger while preserving its source records and compiled report."""
+    if body.confirmation != "CLEAR_COVERAGE_DISPLAY":
+        raise HTTPException(422, "覆盖记录清理确认值无效")
+    get_run(run_id)
+    timestamp = utcnow()
+    with connect() as db:
+        count = db.execute("SELECT COUNT(*) FROM coverage_v2 WHERE run_id=?", (run_id,)).fetchone()[0]
+        db.execute("INSERT OR REPLACE INTO app_metadata VALUES(?,?,?)", (f"coverage_hidden_before:{run_id}", timestamp, timestamp))
+    return {"run_id": run_id, "hidden": count, "evidence_preserved": True, "report_preserved": True}
 
 
 @router.post("/candidates/{candidate_id}/graveyard")

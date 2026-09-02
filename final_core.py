@@ -267,7 +267,8 @@ def init_final_db() -> None:
               step_number INTEGER NOT NULL, identity_id TEXT NOT NULL, state TEXT NOT NULL,
               snapshot_exchange_id TEXT, mutation_exchange_id TEXT, after_exchange_id TEXT,
               compensation_exchange_id TEXT, rollback_exchange_id TEXT, error TEXT,
-              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              rollback_probe_baselines TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS oast_probes (
               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, run_id TEXT NOT NULL,
@@ -298,6 +299,9 @@ def init_final_db() -> None:
             db.execute("ALTER TABLE business_workflows ADD COLUMN depends_on_workflow_ids TEXT NOT NULL DEFAULT '[]'")
         if "import_variables" not in workflow_columns:
             db.execute("ALTER TABLE business_workflows ADD COLUMN import_variables TEXT NOT NULL DEFAULT '{}'")
+        journal_columns = {row["name"] for row in db.execute("PRAGMA table_info(state_change_journal)")}
+        if "rollback_probe_baselines" not in journal_columns:
+            db.execute("ALTER TABLE state_change_journal ADD COLUMN rollback_probe_baselines TEXT NOT NULL DEFAULT '[]'")
         migrate_legacy_findings(db)
         # A process restart never leaves a v1 run looking live. Checkpoints stay
         # intact and an explicit Resume continues from the first missing stage.
@@ -481,6 +485,7 @@ class WorkflowStepInput(BaseModel):
     compensation_method: Literal["POST", "PUT", "PATCH", "DELETE"] | None = None
     compensation_url: str | None = Field(default=None, max_length=2048)
     compensation_body: str | None = Field(default=None, max_length=65536)
+    rollback_probe_urls: list[str] = Field(default_factory=list, max_length=10)
     extract: dict[str, str] = Field(default_factory=dict, max_length=20)
     requires_steps: list[int] = Field(default_factory=list, max_length=20)
     concurrency_safe: bool = False
@@ -2226,7 +2231,7 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
             blocked.append({"step": index + 1, "reason": "repeat_until_requires_bounded_loop_and_json_pointer"})
         if step.concurrency_safe and step.max_repeats > 1:
             blocked.append({"step": index + 1, "reason": "loop_and_concurrency_must_be_separate_steps"})
-        template_sources = [step.url, step.body or "", step.snapshot_url or "", step.compensation_url or "", step.compensation_body or ""]
+        template_sources = [step.url, step.body or "", step.snapshot_url or "", step.compensation_url or "", step.compensation_body or "", *step.rollback_probe_urls]
         referenced = set().union(*(set(re.findall(r"\{\{([A-Za-z_][A-Za-z0-9_]{0,63})\}\}", value)) for value in template_sources))
         missing = referenced - declared_variables - {"identity_role", "identity_tenant"}
         if missing:
@@ -2244,12 +2249,14 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
         if step.method not in {"GET", "HEAD", "OPTIONS"} and body.risk_class == "reversible":
             if not all((step.snapshot_url, step.compensation_method, step.compensation_url)):
                 blocked.append({"step": index + 1, "reason": "reversible_step_requires_snapshot_and_compensation"})
-            for proof_url in (step.snapshot_url, step.compensation_url):
+            for proof_url in (step.snapshot_url, step.compensation_url, *step.rollback_probe_urls):
                 if proof_url:
                     safe_proof_url = re.sub(r"\{\{[A-Za-z_][A-Za-z0-9_]{0,63}\}\}", "fieldwork-placeholder", proof_url)
                     proof_policy = execution_policy_check(PolicyCheckInput(engagement_id=engagement["id"], target=safe_proof_url, action="read"))
                     if not proof_policy["allowed"]:
                         blocked.append({"step": index + 1, "reason": f"compensation_or_snapshot_{proof_policy['reason']}"})
+        if step.rollback_probe_urls and (step.method in {"GET", "HEAD", "OPTIONS"} or body.risk_class != "reversible"):
+            blocked.append({"step": index + 1, "reason": "rollback_probes_require_reversible_mutation"})
     for invariant in body.executable_invariants:
         if invariant.step > len(body.steps) or (invariant.other_step and invariant.other_step > len(body.steps)):
             blocked.append({"step": invariant.step, "reason": "invariant_references_unknown_step"})
@@ -2975,6 +2982,32 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             identity_id=test.get(identity_key),
         ), f"campaign:{campaign_id}:{test['kind']}", include_transient=include_transient)
 
+    def capture_rollback_probes(step: dict) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        baselines, exchanges = [], []
+        for probe_url in step.get("rollback_probe_urls", []):
+            exchange = request({"kind": step.get("kind", "rollback_probe"), "url": probe_url, "method": "GET", "identity_id": step["identity_id"]})
+            exchanges.append(exchange)
+            baselines.append({"url": probe_url, "exchange_id": exchange["id"]})
+        return baselines, exchanges
+
+    def verify_rollback_probes(step: dict, baselines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+        checks, exchanges, all_matched = [], [], True
+        for baseline_ref in baselines:
+            baseline = traditional_runtime._get_exchange(baseline_ref["exchange_id"])
+            try:
+                restored = request({"kind": step.get("kind", "rollback_probe"), "url": baseline_ref["url"], "method": "GET", "identity_id": step["identity_id"]})
+                exchanges.append(restored)
+                matched = baseline["response_status"] == restored["response_status"] and baseline["response_sha256"] == restored["response_sha256"]
+                restored_id = restored["id"]
+            except HTTPException:
+                matched, restored_id = False, None
+            all_matched = all_matched and matched
+            checks.append({
+                "url_sha256": hashlib.sha256(baseline_ref["url"].encode()).hexdigest(),
+                "baseline_exchange_id": baseline["id"], "restored_exchange_id": restored_id, "matched": matched,
+            })
+        return checks, exchanges, all_matched
+
     def imported_variables(test: dict) -> dict[str, Any]:
         imported: dict[str, Any] = {}
         for local_name, source_ref in test.get("import_variables", {}).items():
@@ -3213,14 +3246,20 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 for step in test["steps"]:
                     snapshot = request({"kind": kind, "url": step["snapshot_url"], "method": "GET", "identity_id": step["identity_id"]})
                     exchanges.append(snapshot)
+                    probe_baselines, probe_exchanges = capture_rollback_probes({**step, "kind": kind})
+                    exchanges.extend(probe_exchanges)
                     journal_id, journal_time = uid("state-change"), utcnow()
                     with connect() as db:
-                        db.execute("INSERT INTO state_change_journal VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                        db.execute("""INSERT INTO state_change_journal
+                          (id,engagement_id,campaign_id,iteration_id,run_id,workflow_id,step_number,identity_id,state,
+                           snapshot_exchange_id,mutation_exchange_id,after_exchange_id,compensation_exchange_id,
+                           rollback_exchange_id,error,created_at,updated_at,rollback_probe_baselines)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                             journal_id, engagement["id"], campaign_id, iteration_id, body.run_id, workflow_id,
                             int(step["step"]), step["identity_id"], "snapshot_captured", snapshot["id"], None, None,
-                            None, None, None, journal_time, journal_time,
+                            None, None, None, journal_time, journal_time, dump(probe_baselines),
                         ))
-                    transaction_entries.append({"step": step, "journal_id": journal_id, "before": snapshot, "attempted": False})
+                    transaction_entries.append({"step": step, "journal_id": journal_id, "before": snapshot, "probe_baselines": probe_baselines, "attempted": False})
                 for entry in transaction_entries:
                     step, journal_id = entry["step"], entry["journal_id"]
                     try:
@@ -3258,13 +3297,17 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                             db.execute("UPDATE state_change_journal SET compensation_exchange_id=?,rollback_exchange_id=?,updated_at=? WHERE id=?", (compensation["id"], restored["id"], utcnow(), journal_id))
                     except HTTPException as error:
                         compensation_error = str(error.detail)
-                    step_restored = bool(restored and before["response_status"] == restored["response_status"] and before["response_sha256"] == restored["response_sha256"])
+                    probe_results, probe_exchanges, probes_restored = verify_rollback_probes({**step, "kind": kind}, entry["probe_baselines"])
+                    exchanges.extend(probe_exchanges)
+                    snapshot_restored = bool(restored and before["response_status"] == restored["response_status"] and before["response_sha256"] == restored["response_sha256"])
+                    step_restored = snapshot_restored and probes_restored
                     rollback_proven = rollback_proven and step_restored
                     with connect() as db:
                         db.execute("UPDATE state_change_journal SET state=?,error=?,updated_at=? WHERE id=?", (
-                            "restored" if step_restored else "rollback_failed", compensation_error, utcnow(), journal_id,
+                            "restored" if step_restored else "rollback_failed", compensation_error or (None if step_restored else "rollback_probe_or_snapshot_mismatch"), utcnow(), journal_id,
                         ))
-                    rollback_details.append({"step": step["step"], "state": "restored" if step_restored else "rollback_failed", "rollback_proven": step_restored})
+                    rollback_details.append({"step": step["step"], "state": "restored" if step_restored else "rollback_failed", "rollback_proven": step_restored,
+                                             "snapshot_restored": snapshot_restored, "rollback_probe_results": probe_results})
                 summary = f"多步骤可逆事务执行 {sum(item['attempted'] for item in transaction_entries)} 个动作；按逆序补偿，{sum(item['rollback_proven'] for item in rollback_details)}/{len(rollback_details)} 个基线闭合"
                 if primary_error:
                     summary += f"；主流程异常：{primary_error}"
@@ -3286,14 +3329,19 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             elif kind == "reversible_transition":
                 snapshot = {"kind": kind, "url": test["snapshot_url"], "method": "GET", "identity_id": test["identity_id"]}
                 before = request(snapshot)
+                probe_baselines, probe_baseline_exchanges = capture_rollback_probes(test)
                 journal_id, journal_time = uid("state-change"), utcnow()
                 with connect() as db:
-                    db.execute("INSERT INTO state_change_journal VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                    db.execute("""INSERT INTO state_change_journal
+                      (id,engagement_id,campaign_id,iteration_id,run_id,workflow_id,step_number,identity_id,state,
+                       snapshot_exchange_id,mutation_exchange_id,after_exchange_id,compensation_exchange_id,
+                       rollback_exchange_id,error,created_at,updated_at,rollback_probe_baselines)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                         journal_id, engagement["id"], campaign_id, iteration_id, body.run_id, workflow_id,
                         int(test["step"]), test["identity_id"], "snapshot_captured", before["id"], None, None,
-                        None, None, None, journal_time, journal_time,
+                        None, None, None, journal_time, journal_time, dump(probe_baselines),
                     ))
-                exchanges, primary_error, compensation_error = [before], None, None
+                exchanges, primary_error, compensation_error, restored_exchange = [before, *probe_baseline_exchanges], None, None, None
                 try:
                     with connect() as db:
                         db.execute("UPDATE state_change_journal SET state='mutation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
@@ -3324,11 +3372,14 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                             db.execute("UPDATE state_change_journal SET compensation_exchange_id=?,rollback_exchange_id=?,updated_at=? WHERE id=?", (compensation["id"], restored_exchange["id"], utcnow(), journal_id))
                     except HTTPException as error:
                         compensation_error = str(error.detail)
-                restored = exchanges[-1] if len(exchanges) >= 3 and not compensation_error else None
-                rollback_proven = bool(restored and before["response_status"] == restored["response_status"] and before["response_sha256"] == restored["response_sha256"])
+                restored = restored_exchange if not compensation_error else None
+                probe_results, probe_restored_exchanges, probes_restored = verify_rollback_probes(test, probe_baselines)
+                exchanges.extend(probe_restored_exchanges)
+                snapshot_restored = bool(restored and before["response_status"] == restored["response_status"] and before["response_sha256"] == restored["response_sha256"])
+                rollback_proven = snapshot_restored and probes_restored
                 with connect() as db:
                     db.execute("UPDATE state_change_journal SET state=?,error=?,updated_at=? WHERE id=?", (
-                        "restored" if rollback_proven else "rollback_failed", primary_error or compensation_error, utcnow(), journal_id,
+                        "restored" if rollback_proven else "rollback_failed", primary_error or compensation_error or (None if rollback_proven else "rollback_probe_or_snapshot_mismatch"), utcnow(), journal_id,
                     ))
                 summary = f"可逆状态测试已执行；补偿后状态{'恢复' if rollback_proven else '未恢复'}"
                 if primary_error:
@@ -3344,7 +3395,8 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 result_status = "rollback_failed" if not rollback_proven else ("degraded" if primary_error else "observed")
                 result = {"kind": kind, "workflow_id": workflow_id, "status": result_status, "rollback_proven": rollback_proven,
                           "exchange_ids": [item["id"] for item in exchanges], "observation_id": observation["id"],
-                          "primary_error": primary_error, "compensation_error": compensation_error, "journal_id": journal_id}
+                          "primary_error": primary_error, "compensation_error": compensation_error, "journal_id": journal_id,
+                          "snapshot_restored": snapshot_restored, "rollback_probe_results": probe_results}
                 if not rollback_proven:
                     result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "rollback_integrity", "补偿动作未能恢复前置状态，隔离环境需要人工清理并审阅业务副作用", [observation["id"]], "停止状态变更测试并人工恢复隔离环境")
                 results.append(result)
@@ -3415,9 +3467,13 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
 def list_state_change_journals(campaign_id: str):
     get_research_campaign(campaign_id)
     with connect() as db:
-        return [dict(row) for row in db.execute(
+        rows = [dict(row) for row in db.execute(
             "SELECT * FROM state_change_journal WHERE campaign_id=? ORDER BY created_at DESC", (campaign_id,),
         )]
+    for row in rows:
+        baselines = load(row.pop("rollback_probe_baselines", "[]"), [])
+        row["rollback_probe_count"] = len(baselines)
+    return rows
 
 
 @router.post("/state-change-journals/{journal_id}/recover")
@@ -3451,6 +3507,7 @@ def recover_state_change(journal_id: str, body: StateChangeRecoveryInput):
     if not test:
         raise HTTPException(409, "无法从冻结研究计划恢复补偿定义")
     baseline = traditional_runtime._get_exchange(journal["snapshot_exchange_id"])
+    probe_baselines = load(journal["rollback_probe_baselines"], [])
     try:
         with connect() as db:
             db.execute("UPDATE state_change_journal SET state='compensation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
@@ -3461,16 +3518,28 @@ def recover_state_change(journal_id: str, body: StateChangeRecoveryInput):
         restored = traditional_runtime._execute_exchange(journal["run_id"], traditional_runtime.ExchangeRequestInput(
             url=test["snapshot_url"], method="GET", headers={}, body=None, identity_id=journal["identity_id"],
         ), f"campaign-recovery:{journal_id}")
+        probe_results, probe_exchange_ids, probes_restored = [], [], True
+        for probe in probe_baselines:
+            probe_baseline = traditional_runtime._get_exchange(probe["exchange_id"])
+            probe_restored = traditional_runtime._execute_exchange(journal["run_id"], traditional_runtime.ExchangeRequestInput(
+                url=probe["url"], method="GET", headers={}, body=None, identity_id=journal["identity_id"],
+            ), f"campaign-recovery:{journal_id}")
+            matched = probe_baseline["response_status"] == probe_restored["response_status"] and probe_baseline["response_sha256"] == probe_restored["response_sha256"]
+            probes_restored = probes_restored and matched
+            probe_exchange_ids.append(probe_restored["id"])
+            probe_results.append({"url_sha256": hashlib.sha256(probe["url"].encode()).hexdigest(),
+                                  "baseline_exchange_id": probe_baseline["id"], "restored_exchange_id": probe_restored["id"], "matched": matched})
     except HTTPException as error:
         with connect() as db:
             db.execute("UPDATE state_change_journal SET state='rollback_failed',error=?,updated_at=? WHERE id=?", (str(error.detail), utcnow(), journal_id))
         raise HTTPException(409, f"补偿恢复失败：{error.detail}") from error
-    rollback_proven = baseline["response_status"] == restored["response_status"] and baseline["response_sha256"] == restored["response_sha256"]
+    snapshot_restored = baseline["response_status"] == restored["response_status"] and baseline["response_sha256"] == restored["response_sha256"]
+    rollback_proven = snapshot_restored and probes_restored
     state_value = "restored" if rollback_proven else "rollback_failed"
     timestamp = utcnow()
     with connect() as db:
         db.execute("""UPDATE state_change_journal SET state=?,compensation_exchange_id=?,rollback_exchange_id=?,
-          error=?,updated_at=? WHERE id=?""", (state_value, compensation["id"], restored["id"], None if rollback_proven else "snapshot_mismatch", timestamp, journal_id))
+          error=?,updated_at=? WHERE id=?""", (state_value, compensation["id"], restored["id"], None if rollback_proven else "rollback_probe_or_snapshot_mismatch", timestamp, journal_id))
     observation = record_observation(journal["run_id"], ObservationInput(
         observation_type="business_logic.state_recovery", subject=f"journal:{journal_id}",
         summary=f"中断状态变更补偿已执行；基线{'已恢复' if rollback_proven else '仍不一致'}",
@@ -3478,7 +3547,9 @@ def recover_state_change(journal_id: str, body: StateChangeRecoveryInput):
         raw_ref=f"{baseline['id']}:{compensation['id']}:{restored['id']}",
     ))
     add_event(journal["run_id"], "verification", "campaign.state_recovery", observation["summary"], {"journal_id": journal_id, "rollback_proven": rollback_proven})
-    return {"id": journal_id, "state": state_value, "rollback_proven": rollback_proven, "observation_id": observation["id"], "exchange_ids": [compensation["id"], restored["id"]]}
+    return {"id": journal_id, "state": state_value, "rollback_proven": rollback_proven, "snapshot_restored": snapshot_restored,
+            "rollback_probe_results": probe_results, "observation_id": observation["id"],
+            "exchange_ids": [compensation["id"], restored["id"], *probe_exchange_ids]}
 
 
 @router.post("/program-snapshots", status_code=201)

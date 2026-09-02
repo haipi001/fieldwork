@@ -299,7 +299,7 @@ def test_reversible_business_transition_requires_isolation_confirmation_and_prov
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
 
-    state = {"exists": False}
+    state = {"exists": False, "orphan_jobs": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, value: bytes):
@@ -309,14 +309,19 @@ def test_reversible_business_transition_requires_isolation_confirmation_and_prov
             self.wfile.write(value)
 
         def do_GET(self):
-            self._reply(b'{"exists":true}' if state["exists"] else b'{"exists":false}')
+            if self.path == "/jobs":
+                self._reply(json.dumps({"count": state["orphan_jobs"]}, sort_keys=True).encode())
+            else:
+                self._reply(b'{"exists":true}' if state["exists"] else b'{"exists":false}')
 
         def do_POST(self):
             state["exists"] = True
+            state["orphan_jobs"] = 1
             self._reply(b'{"created":true}')
 
         def do_DELETE(self):
             state["exists"] = False
+            state["orphan_jobs"] = 0
             self._reply(b'{"deleted":true}')
 
         def log_message(self, *args):
@@ -344,6 +349,7 @@ def test_reversible_business_transition_requires_isolation_confirmation_and_prov
                 "name": "Create object", "method": "POST", "url": f"{target}/objects", "actor_role": "operator",
                 "body": "{}", "snapshot_url": f"{target}/objects/current", "expected_transition": "absent -> present",
                 "compensation_method": "DELETE", "compensation_url": f"{target}/objects/current", "replay_safe": False,
+                "rollback_probe_urls": [f"{target}/jobs"],
             }],
             "invariants": ["The fixture must return to its initial state after every test"], "risk_class": "reversible",
         })
@@ -360,26 +366,29 @@ def test_reversible_business_transition_requires_isolation_confirmation_and_prov
         assert executed.status_code == 200
         result = next(item for item in executed.json()["results"] if item["kind"] == "reversible_transition")
         assert result["status"] == "observed" and result["rollback_proven"] is True
-        assert len(result["exchange_ids"]) == 5 and state["exists"] is False
+        assert len(result["exchange_ids"]) == 7 and state == {"exists": False, "orphan_jobs": 0}
+        assert result["snapshot_restored"] is True and result["rollback_probe_results"][0]["matched"] is True
         journals = client.get(f"/api/v1/campaigns/{campaign['id']}/state-change-journals").json()
-        assert journals[0]["id"] == result["journal_id"] and journals[0]["state"] == "restored"
+        assert journals[0]["id"] == result["journal_id"] and journals[0]["state"] == "restored" and journals[0]["rollback_probe_count"] == 1
         # Simulate an app interruption after a mutation was attempted. The
         # persisted journal must support compensation-only recovery.
         state["exists"] = True
+        state["orphan_jobs"] = 1
         with sqlite3.connect(final_core.DB) as db:
             db.execute("UPDATE state_change_journal SET state='mutation_attempted' WHERE id=?", (result["journal_id"],))
         unconfirmed = client.post(f"/api/v1/state-change-journals/{result['journal_id']}/recover", json={})
         assert unconfirmed.status_code == 409
         recovered = client.post(f"/api/v1/state-change-journals/{result['journal_id']}/recover", json={"confirm_compensation": True})
         assert recovered.status_code == 200 and recovered.json()["rollback_proven"] is True
-        assert recovered.json()["state"] == "restored" and state["exists"] is False
+        assert recovered.json()["state"] == "restored" and state == {"exists": False, "orphan_jobs": 0}
+        assert recovered.json()["rollback_probe_results"][0]["matched"] is True
     finally:
         server.shutdown()
         server.server_close()
 
 
 def test_multistep_reversible_transaction_rolls_back_in_reverse_order(client):
-    state, events = {"a": False, "b": False}, []
+    state, jobs, events = {"a": False, "b": False}, {"a": False, "b": False}, []
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, payload):
@@ -388,15 +397,15 @@ def test_multistep_reversible_transaction_rolls_back_in_reverse_order(client):
 
         def do_GET(self):
             key = self.path.rsplit("/", 1)[-1]
-            self.reply({"exists": state[key]})
+            self.reply({"exists": (jobs if self.path.startswith("/jobs/") else state)[key]})
 
         def do_POST(self):
             key = self.path.rsplit("/", 1)[-1]
-            state[key] = True; events.append(f"create:{key}"); self.reply({"created": key})
+            state[key] = True; jobs[key] = True; events.append(f"create:{key}"); self.reply({"created": key})
 
         def do_DELETE(self):
             key = self.path.rsplit("/", 1)[-1]
-            state[key] = False; events.append(f"delete:{key}"); self.reply({"deleted": key})
+            state[key] = False; jobs[key] = False; events.append(f"delete:{key}"); self.reply({"deleted": key})
 
         def log_message(self, *args):
             pass
@@ -420,6 +429,7 @@ def test_multistep_reversible_transaction_rolls_back_in_reverse_order(client):
         steps = [{
             "name": f"Create {key}", "method": "POST", "url": f"{target}/{key}", "snapshot_url": f"{target}/{key}",
             "compensation_method": "DELETE", "compensation_url": f"{target}/{key}", "actor_role": "operator",
+            "rollback_probe_urls": [f"{target}/jobs/{key}"],
             "state_before": "absent", "expected_transition": "present then absent", "replay_safe": False,
         } for key in ("a", "b")]
         workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
@@ -439,9 +449,76 @@ def test_multistep_reversible_transaction_rolls_back_in_reverse_order(client):
         result = response.json()["results"][0]
         assert result["rollback_proven"] is True and result["rollback_order"] == [2, 1]
         assert events == ["create:a", "create:b", "delete:b", "delete:a"]
-        assert state == {"a": False, "b": False}
+        assert state == {"a": False, "b": False} and jobs == {"a": False, "b": False}
+        assert all(item["rollback_probe_results"][0]["matched"] for item in result["step_results"])
         journals = client.get(f"/api/v1/campaigns/{campaign['id']}/state-change-journals").json()
         assert len(journals) == 2 and {item["state"] for item in journals} == {"restored"}
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_rollback_probe_detects_orphan_resource_and_blocks_future_mutations(client):
+    state = {"exists": False, "orphan_jobs": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, payload):
+            body = json.dumps(payload, sort_keys=True).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+
+        def do_GET(self):
+            self.reply({"count": state["orphan_jobs"]} if self.path == "/jobs" else {"exists": state["exists"]})
+
+        def do_POST(self):
+            state.update(exists=True, orphan_jobs=1); self.reply({"created": True})
+
+        def do_DELETE(self):
+            # Deliberately restore the primary object but leak the related job.
+            state["exists"] = False; self.reply({"deleted": True})
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Orphan fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True, "allow_reversible_state_change": True, "environment_class": "local_fixture"},
+            "policy": {"allow_state_change": True, "max_requests_per_second": 100, "max_requests": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Operator", "role": "operator", "auth_type": "none", "session_status": "ready",
+        })
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Leak campaign", "objective": "Detect related resources left after compensation",
+        }).json()
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Create with side effect", "objective": "Prove primary and related resource rollback",
+            "steps": [{"name": "Create", "method": "POST", "url": f"{target}/objects", "actor_role": "operator",
+                       "snapshot_url": f"{target}/objects/current", "compensation_method": "DELETE",
+                       "compensation_url": f"{target}/objects/current", "rollback_probe_urls": [f"{target}/jobs"],
+                       "expected_transition": "all state returns to baseline", "replay_safe": False}],
+            "invariants": ["No orphan job remains"], "risk_class": "reversible",
+        })
+        assert workflow.status_code == 201, workflow.text
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        executed = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={
+            "run_id": run_id, "max_tests": 5, "confirm_reversible_state_change": True,
+        }).json()
+        result = executed["results"][0]
+        assert result["status"] == "rollback_failed" and result["snapshot_restored"] is True
+        assert result["rollback_probe_results"][0]["matched"] is False and result["hypothesis_id"]
+        assert state == {"exists": False, "orphan_jobs": 1}
+        next_iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        blocked = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{next_iteration['id']}/execute", json={
+            "run_id": run_id, "max_tests": 5, "confirm_reversible_state_change": True,
+        }).json()["results"][0]
+        assert blocked["status"] == "blocked" and blocked["reason"].startswith("pending_state_recovery:")
     finally:
         server.shutdown(); server.server_close()
 

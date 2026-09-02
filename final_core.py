@@ -478,6 +478,12 @@ class WorkflowStepInput(BaseModel):
     requires_steps: list[int] = Field(default_factory=list, max_length=20)
     concurrency_safe: bool = False
     concurrency_replays: int = Field(default=2, ge=2, le=10)
+    when_variable: str | None = Field(default=None, max_length=64)
+    when_operator: Literal["exists", "not_exists", "equals", "not_equals"] | None = None
+    when_value: str | int | float | bool | None = None
+    max_repeats: int = Field(default=1, ge=1, le=5)
+    repeat_until_pointer: str | None = Field(default=None, max_length=1000)
+    repeat_until_value: str | int | float | bool | None = None
 
 
 class ExecutableInvariantInput(BaseModel):
@@ -2156,6 +2162,23 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
             blocked.append({"step": index + 1, "reason": "requires_steps_must_reference_earlier_steps"})
         if step.concurrency_safe and step.method not in {"GET", "HEAD", "OPTIONS"}:
             blocked.append({"step": index + 1, "reason": "concurrency_replay_only_allows_read_methods"})
+        if bool(step.when_variable) != bool(step.when_operator):
+            blocked.append({"step": index + 1, "reason": "branch_requires_variable_and_operator"})
+        if step.when_variable and (
+            not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", step.when_variable)
+            or step.when_variable not in declared_variables | {"identity_role", "identity_tenant"}
+        ):
+            blocked.append({"step": index + 1, "reason": "branch_variable_not_available"})
+        if step.when_operator in {"equals", "not_equals"} and step.when_value is None:
+            blocked.append({"step": index + 1, "reason": "branch_comparison_requires_value"})
+        if step.max_repeats > 1 and step.method not in {"GET", "HEAD", "OPTIONS"}:
+            blocked.append({"step": index + 1, "reason": "bounded_loop_only_allows_read_methods"})
+        if step.repeat_until_pointer is not None and (
+            step.max_repeats == 1 or not (step.repeat_until_pointer == "" or step.repeat_until_pointer.startswith("/"))
+        ):
+            blocked.append({"step": index + 1, "reason": "repeat_until_requires_bounded_loop_and_json_pointer"})
+        if step.concurrency_safe and step.max_repeats > 1:
+            blocked.append({"step": index + 1, "reason": "loop_and_concurrency_must_be_separate_steps"})
         template_sources = [step.url, step.body or "", step.snapshot_url or "", step.compensation_url or "", step.compensation_body or ""]
         referenced = set().union(*(set(re.findall(r"\{\{([A-Za-z_][A-Za-z0-9_]{0,63})\}\}", value)) for value in template_sources))
         missing = referenced - declared_variables - {"identity_role", "identity_tenant"}
@@ -2468,6 +2491,28 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
     matrix, blocked = [], []
     workflows = [item for item in campaign["workflows"] if not workflow_ids or item["id"] in workflow_ids]
     for workflow in workflows:
+        mutating_steps = [(index, step) for index, step in enumerate(workflow["steps"], start=1) if step.get("method") not in {"GET", "HEAD", "OPTIONS"}]
+        if len(mutating_steps) > 1:
+            transaction_steps, transaction_blocked = [], []
+            for step_index, step in mutating_steps:
+                eligible = [item for item in ready if not step.get("actor_role") or item["role"] == step["actor_role"]]
+                if not eligible:
+                    transaction_blocked.append({"workflow_id": workflow["id"], "step": step_index, "reason": "required_identity_not_ready"})
+                elif workflow["risk_class"] != "reversible":
+                    transaction_blocked.append({"workflow_id": workflow["id"], "step": step_index, "reason": "unbounded_state_change_is_never_executable"})
+                elif not engagement["scope"].get("allow_reversible_state_change") or not engagement["policy"].get("allow_state_change"):
+                    transaction_blocked.append({"workflow_id": workflow["id"], "step": step_index, "reason": "reversible_state_change_not_in_frozen_scope"})
+                elif engagement["scope"].get("environment_class") not in {"local_fixture", "ephemeral_test", "staging_clone"}:
+                    transaction_blocked.append({"workflow_id": workflow["id"], "step": step_index, "reason": "state_change_requires_isolated_environment"})
+                else:
+                    transaction_steps.append({"step": step_index, "identity_id": eligible[0]["id"], **step})
+            blocked.extend(transaction_blocked)
+            if not transaction_blocked:
+                matrix.append({
+                    "kind": "reversible_transaction", "workflow_id": workflow["id"],
+                    "steps": transaction_steps, "assertions": workflow["invariants"],
+                })
+            continue
         if len(workflow["steps"]) > 1 and all(step.get("method") in {"GET", "HEAD", "OPTIONS"} for step in workflow["steps"]):
             actor_map, missing_roles = {}, []
             for role in sorted({step.get("actor_role") for step in workflow["steps"] if step.get("actor_role")}):
@@ -2633,6 +2678,22 @@ def _render_workflow_template(template: str | None, variables: dict[str, Any], u
     return re.sub(r"\{\{([A-Za-z_][A-Za-z0-9_]{0,63})\}\}", replace, template)
 
 
+def _workflow_step_enabled(step: dict[str, Any], variables: dict[str, Any]) -> tuple[bool, str]:
+    variable, operator = step.get("when_variable"), step.get("when_operator")
+    if not variable or not operator:
+        return True, "unconditional"
+    exists = variable in variables
+    if operator == "exists":
+        return exists, f"{variable}_exists" if exists else f"{variable}_missing"
+    if operator == "not_exists":
+        return not exists, f"{variable}_missing" if not exists else f"{variable}_exists"
+    if not exists:
+        return False, f"{variable}_missing"
+    equal = variables[variable] == step.get("when_value")
+    enabled = equal if operator == "equals" else not equal
+    return enabled, f"{variable}_{'matched' if equal else 'different'}"
+
+
 def _evaluate_workflow_invariants(invariants: list[dict[str, Any]], steps: list[dict[str, Any]], variables: dict[str, Any]) -> list[dict[str, Any]]:
     results = []
     for item in invariants:
@@ -2640,6 +2701,10 @@ def _evaluate_workflow_invariants(invariants: list[dict[str, Any]], steps: list[
         result = {"name": name, "kind": kind, "step": step_number, "passed": False, "reason": "not_evaluated"}
         try:
             step = steps[step_number - 1]
+            if step.get("skipped"):
+                result.update({"passed": True, "reason": "step_skipped_not_applicable"})
+                results.append(result)
+                continue
             if kind == "status_in":
                 result["passed"] = step["status"] in item.get("expected_statuses", [])
             elif kind == "json_exists":
@@ -2707,46 +2772,68 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             identity_id = actor_identity_ids.get(step.get("actor_role")) or default_identity_id
             identity = get_identity(identity_id)
             variables.update({"identity_role": identity["role"], "identity_tenant": identity.get("tenant") or ""})
-            resolved = {
-                **step, "kind": test["kind"], "identity_id": identity_id,
-                "url": _render_workflow_template(step["url"], variables, True),
-                "body": _render_workflow_template(step.get("body"), variables),
-            }
-            exchange = request(resolved, include_transient=True)
-            transient = exchange.pop("_transient_body", "")
-            try:
-                parsed = json.loads(transient)
-            except json.JSONDecodeError:
-                parsed = None
-            exchange_ids.append(exchange["id"])
-            sequence_steps.append({
-                "step": position, "status": exchange["response_status"],
-                "body_sha256": exchange["response_sha256"], "json": parsed,
-            })
-            if step.get("extract"):
-                if parsed is None:
-                    raise HTTPException(409, f"step_{position}_response_is_not_json")
-                for variable, pointer in step["extract"].items():
+            enabled, condition_reason = _workflow_step_enabled(step, variables)
+            if not enabled:
+                sequence_steps.append({
+                    "step": position, "status": None, "body_sha256": None, "json": None,
+                    "skipped": True, "condition": condition_reason, "attempts": 0,
+                })
+                continue
+            attempt_ids, final_exchange, final_json, until_satisfied = [], None, None, None
+            for _attempt in range(int(step.get("max_repeats", 1))):
+                resolved = {
+                    **step, "kind": test["kind"], "identity_id": identity_id,
+                    "url": _render_workflow_template(step["url"], variables, True),
+                    "body": _render_workflow_template(step.get("body"), variables),
+                }
+                exchange = request(resolved, include_transient=True)
+                transient = exchange.pop("_transient_body", "")
+                try:
+                    parsed = json.loads(transient)
+                except json.JSONDecodeError:
+                    parsed = None
+                exchange_ids.append(exchange["id"])
+                attempt_ids.append(exchange["id"])
+                final_exchange, final_json = exchange, parsed
+                if step.get("extract"):
+                    if parsed is None:
+                        raise HTTPException(409, f"step_{position}_response_is_not_json")
+                    for variable, pointer in step["extract"].items():
+                        try:
+                            value = _json_pointer(parsed, pointer)
+                        except (KeyError, IndexError, ValueError, TypeError) as error:
+                            raise HTTPException(409, f"step_{position}_extraction_failed:{variable}") from error
+                        if isinstance(value, (dict, list)) or value is None or len(str(value)) > 1024:
+                            raise HTTPException(409, f"step_{position}_extraction_not_scalar:{variable}")
+                        if not freeze_extractions or variable not in variables:
+                            variables[variable] = value
+                        extraction_hashes[variable] = hashlib.sha256(str(variables[variable]).encode()).hexdigest()
+                pointer = step.get("repeat_until_pointer")
+                if pointer is not None:
                     try:
-                        value = _json_pointer(parsed, pointer)
-                    except (KeyError, IndexError, ValueError, TypeError) as error:
-                        raise HTTPException(409, f"step_{position}_extraction_failed:{variable}") from error
-                    if isinstance(value, (dict, list)) or value is None or len(str(value)) > 1024:
-                        raise HTTPException(409, f"step_{position}_extraction_not_scalar:{variable}")
-                    if not freeze_extractions or variable not in variables:
-                        variables[variable] = value
-                    extraction_hashes[variable] = hashlib.sha256(str(variables[variable]).encode()).hexdigest()
+                        until_satisfied = parsed is not None and _json_pointer(parsed, pointer) == step.get("repeat_until_value")
+                    except (KeyError, IndexError, ValueError, TypeError):
+                        until_satisfied = False
+                    if until_satisfied:
+                        break
+            sequence_steps.append({
+                "step": position, "status": final_exchange["response_status"],
+                "body_sha256": final_exchange["response_sha256"], "json": final_json,
+                "skipped": False, "condition": condition_reason, "attempts": len(attempt_ids),
+                "attempt_exchange_ids": attempt_ids, "repeat_until_pointer": step.get("repeat_until_pointer"),
+                "until_satisfied": until_satisfied,
+            })
         return sequence_steps, exchange_ids, extraction_hashes, variables
 
     for test in tests:
         kind, workflow_id = test.get("kind"), test.get("workflow_id")
-        if kind == "reversible_transition" and not body.confirm_reversible_state_change:
+        if kind in {"reversible_transition", "reversible_transaction"} and not body.confirm_reversible_state_change:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "reversible_state_change_requires_per_execution_confirmation"})
             continue
-        if kind == "reversible_transition" and unresolved_state_change:
+        if kind in {"reversible_transition", "reversible_transaction"} and unresolved_state_change:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": f"pending_state_recovery:{unresolved_state_change['id']}:{unresolved_state_change['state']}"})
             continue
-        if test.get("method") and test.get("method") not in {"GET", "HEAD", "OPTIONS"} and kind != "reversible_transition":
+        if test.get("method") and test.get("method") not in {"GET", "HEAD", "OPTIONS"} and kind not in {"reversible_transition", "reversible_transaction"}:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "state_change_not_enabled_for_campaign_executor"})
             continue
         try:
@@ -2754,7 +2841,10 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 sequence_steps, exchange_ids, extraction_hashes, variables = run_sequence(test, test.get("actor_identity_ids", {}), test["default_identity_id"])
                 invariant_results = _evaluate_workflow_invariants(test.get("executable_invariants", []), sequence_steps, variables)
                 failed = [item for item in invariant_results if not item["passed"]]
-                summary = f"多步业务流程完成 {len(sequence_steps)} 步；机器不变量 {len(invariant_results)-len(failed)}/{len(invariant_results)} 通过"
+                skipped = [item for item in sequence_steps if item.get("skipped")]
+                repeated = [item for item in sequence_steps if item.get("attempts", 0) > 1]
+                exhausted = [item for item in repeated if item.get("repeat_until_pointer") is not None and not item.get("until_satisfied")]
+                summary = f"多步业务流程完成 {len(sequence_steps)} 步；{len(skipped)} 个分支跳过，{sum(item['attempts'] for item in repeated)} 次循环尝试；机器不变量 {len(invariant_results)-len(failed)}/{len(invariant_results)} 通过"
                 observation = record_observation(body.run_id, ObservationInput(
                     observation_type="business_logic.workflow_sequence", subject=f"workflow:{workflow_id}",
                     summary=summary, source_capability="campaign-logic-runner", confidence=.92 if failed else .82,
@@ -2764,14 +2854,22 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 with connect() as db:
                     db.execute("INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)", (
                         uid("evidence"), observation["id"], body.run_id, "workflow_invariant_result",
-                        dump({"workflow_id": workflow_id, "steps": len(sequence_steps), "invariants": invariant_results, "extracted_variable_hashes": extraction_hashes}),
-                        None, "supporting" if failed else "neutral", utcnow(),
+                        dump({"workflow_id": workflow_id, "steps": len(sequence_steps), "invariants": invariant_results,
+                              "control_flow": [{"step": item["step"], "skipped": item.get("skipped", False), "attempts": item.get("attempts", 0), "until_satisfied": item.get("until_satisfied")} for item in sequence_steps],
+                              "extracted_variable_hashes": extraction_hashes}),
+                        None, "supporting" if failed or exhausted else "neutral", utcnow(),
                     ))
                 result = {"kind": kind, "workflow_id": workflow_id, "status": "observed", "exchange_ids": exchange_ids,
                           "observation_id": observation["id"], "invariants": invariant_results,
-                          "extracted_variables": sorted(extraction_hashes), "extracted_value_hashes": extraction_hashes}
+                          "extracted_variables": sorted(extraction_hashes), "extracted_value_hashes": extraction_hashes,
+                          "control_flow": [{"step": item["step"], "skipped": item.get("skipped", False), "condition": item.get("condition"), "attempts": item.get("attempts", 0), "until_satisfied": item.get("until_satisfied")} for item in sequence_steps]}
+                hypothesis_ids = []
                 if failed:
-                    result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "executable_invariant_violation", f"{len(failed)} 个业务不变量在多步流程中失败：{', '.join(item['name'] for item in failed)}", [observation["id"]], "使用独立身份与负对照重放失败的不变量")
+                    hypothesis_ids.append(_campaign_hypothesis(campaign_id, workflow_id, "executable_invariant_violation", f"{len(failed)} 个业务不变量在多步流程中失败：{', '.join(item['name'] for item in failed)}", [observation["id"]], "使用独立身份与负对照重放失败的不变量"))
+                if exhausted:
+                    hypothesis_ids.append(_campaign_hypothesis(campaign_id, workflow_id, "bounded_loop_nonconvergence", f"{len(exhausted)} 个只读轮询步骤在声明的有界次数内未收敛", [observation["id"]], "使用新 Run 重复轮询并核对服务端状态机和延迟预算"))
+                if hypothesis_ids:
+                    result["hypothesis_id"], result["hypothesis_ids"] = hypothesis_ids[0], hypothesis_ids
                 results.append(result)
             elif kind == "sequence_violation":
                 baseline_steps, baseline_ids, baseline_hashes, baseline_variables = run_sequence(
@@ -2786,12 +2884,14 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 for step_number, step in enumerate(test["steps"], start=1):
                     if not step.get("requires_steps"):
                         continue
-                    status = perturbed_by_step[step_number]["status"]
+                    perturbed = perturbed_by_step[step_number]
+                    status = perturbed["status"]
                     dependency_checks.append({
                         "step": step_number, "requires_steps": step["requires_steps"], "status": status,
-                        "passed": status in {401, 403, 404, 409, 422},
+                        "skipped": perturbed.get("skipped", False),
+                        "passed": perturbed.get("skipped", False) or status in {401, 403, 404, 409, 422},
                     })
-                suspicious = any(not item["passed"] and 200 <= item["status"] < 300 for item in dependency_checks)
+                suspicious = any(not item["passed"] and item["status"] is not None and 200 <= item["status"] < 300 for item in dependency_checks)
                 summary = f"顺序扰动执行 {len(perturbed_steps)} 步；{sum(item['passed'] for item in dependency_checks)}/{len(dependency_checks)} 个前置条件被服务端拒绝"
                 observation = record_observation(body.run_id, ObservationInput(
                     observation_type="business_logic.sequence_violation", subject=f"workflow:{workflow_id}",
@@ -2871,6 +2971,83 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 if suspicious:
                     result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "cross_identity_sequence_access", "跨身份重放在携带源身份对象变量时仍获得成功响应，需要独立确认是否越权", [observation["id"]], "对源对象执行两轮非所有者重放并加入拒绝型负对照")
                 results.append(result)
+            elif kind == "reversible_transaction":
+                transaction_entries, exchanges, primary_error = [], [], None
+                # Capture every baseline before the first mutation. This makes the
+                # rollback target explicit and prevents a half-observed transaction.
+                for step in test["steps"]:
+                    snapshot = request({"kind": kind, "url": step["snapshot_url"], "method": "GET", "identity_id": step["identity_id"]})
+                    exchanges.append(snapshot)
+                    journal_id, journal_time = uid("state-change"), utcnow()
+                    with connect() as db:
+                        db.execute("INSERT INTO state_change_journal VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                            journal_id, engagement["id"], campaign_id, iteration_id, body.run_id, workflow_id,
+                            int(step["step"]), step["identity_id"], "snapshot_captured", snapshot["id"], None, None,
+                            None, None, None, journal_time, journal_time,
+                        ))
+                    transaction_entries.append({"step": step, "journal_id": journal_id, "before": snapshot, "attempted": False})
+                for entry in transaction_entries:
+                    step, journal_id = entry["step"], entry["journal_id"]
+                    try:
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET state='mutation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
+                        entry["attempted"] = True
+                        mutation = request({**step, "kind": kind})
+                        exchanges.append(mutation)
+                        after = request({"kind": kind, "url": step["snapshot_url"], "method": "GET", "identity_id": step["identity_id"]})
+                        exchanges.append(after)
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET mutation_exchange_id=?,after_exchange_id=?,updated_at=? WHERE id=?", (mutation["id"], after["id"], utcnow(), journal_id))
+                    except HTTPException as error:
+                        primary_error = f"step_{step['step']}:{error.detail}"
+                        break
+                rollback_details, rollback_proven = [], True
+                # Compensations are a stack: the last attempted business action is
+                # always unwound first. Unattempted rows are safely cancelled.
+                for entry in reversed(transaction_entries):
+                    step, journal_id, before = entry["step"], entry["journal_id"], entry["before"]
+                    if not entry["attempted"]:
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET state='cancelled',updated_at=? WHERE id=?", (utcnow(), journal_id))
+                        rollback_details.append({"step": step["step"], "state": "cancelled", "rollback_proven": True})
+                        continue
+                    compensation_error, restored = None, None
+                    try:
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET state='compensation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
+                        compensation = request({**step, "kind": kind, "url": step["compensation_url"], "method": step["compensation_method"], "body": step.get("compensation_body")})
+                        exchanges.append(compensation)
+                        restored = request({"kind": kind, "url": step["snapshot_url"], "method": "GET", "identity_id": step["identity_id"]})
+                        exchanges.append(restored)
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET compensation_exchange_id=?,rollback_exchange_id=?,updated_at=? WHERE id=?", (compensation["id"], restored["id"], utcnow(), journal_id))
+                    except HTTPException as error:
+                        compensation_error = str(error.detail)
+                    step_restored = bool(restored and before["response_status"] == restored["response_status"] and before["response_sha256"] == restored["response_sha256"])
+                    rollback_proven = rollback_proven and step_restored
+                    with connect() as db:
+                        db.execute("UPDATE state_change_journal SET state=?,error=?,updated_at=? WHERE id=?", (
+                            "restored" if step_restored else "rollback_failed", compensation_error, utcnow(), journal_id,
+                        ))
+                    rollback_details.append({"step": step["step"], "state": "restored" if step_restored else "rollback_failed", "rollback_proven": step_restored})
+                summary = f"多步骤可逆事务执行 {sum(item['attempted'] for item in transaction_entries)} 个动作；按逆序补偿，{sum(item['rollback_proven'] for item in rollback_details)}/{len(rollback_details)} 个基线闭合"
+                if primary_error:
+                    summary += f"；主流程异常：{primary_error}"
+                observation = record_observation(body.run_id, ObservationInput(
+                    observation_type="business_logic.reversible_transaction", subject=f"workflow:{workflow_id}",
+                    summary=summary, source_capability="campaign-logic-runner", confidence=.92 if rollback_proven else .99,
+                    raw_ref=":".join(item["id"] for item in exchanges),
+                ))
+                observation_ids.append(observation["id"])
+                result = {"kind": kind, "workflow_id": workflow_id, "status": "observed" if rollback_proven and not primary_error else ("degraded" if rollback_proven else "rollback_failed"),
+                          "rollback_proven": rollback_proven, "rollback_order": [item["step"] for item in rollback_details],
+                          "step_results": rollback_details, "journal_ids": [item["journal_id"] for item in transaction_entries],
+                          "exchange_ids": [item["id"] for item in exchanges], "observation_id": observation["id"], "primary_error": primary_error}
+                if not rollback_proven:
+                    result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "transaction_rollback_integrity", "多步骤补偿栈未能完整恢复全部前置状态，隔离环境需要人工恢复", [observation["id"]], "停止状态变更并按回滚账本逆序完成人工恢复")
+                results.append(result)
+                if not rollback_proven:
+                    break
             elif kind == "reversible_transition":
                 snapshot = {"kind": kind, "url": test["snapshot_url"], "method": "GET", "identity_id": test["identity_id"]}
                 before = request(snapshot)
@@ -3032,6 +3209,10 @@ def recover_state_change(journal_id: str, body: StateChangeRecoveryInput):
         return {"id": journal_id, "state": "cancelled", "rollback_proven": True, "reason": "mutation_was_never_attempted"}
     plan = load(iteration["plan"], {}) if iteration else {}
     test = next((item for item in plan.get("tests", []) if item.get("kind") == "reversible_transition" and item.get("workflow_id") == journal["workflow_id"] and int(item.get("step", 0)) == journal["step_number"]), None)
+    if not test:
+        transaction = next((item for item in plan.get("tests", []) if item.get("kind") == "reversible_transaction" and item.get("workflow_id") == journal["workflow_id"]), None)
+        if transaction:
+            test = next((step for step in transaction.get("steps", []) if int(step.get("step", 0)) == journal["step_number"]), None)
     if not test:
         raise HTTPException(409, "无法从冻结研究计划恢复补偿定义")
     baseline = traditional_runtime._get_exchange(journal["snapshot_exchange_id"])

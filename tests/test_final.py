@@ -350,6 +350,74 @@ def test_reversible_business_transition_requires_isolation_confirmation_and_prov
         server.server_close()
 
 
+def test_multistep_reversible_transaction_rolls_back_in_reverse_order(client):
+    state, events = {"a": False, "b": False}, []
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, payload):
+            body = json.dumps(payload, sort_keys=True).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+
+        def do_GET(self):
+            key = self.path.rsplit("/", 1)[-1]
+            self.reply({"exists": state[key]})
+
+        def do_POST(self):
+            key = self.path.rsplit("/", 1)[-1]
+            state[key] = True; events.append(f"create:{key}"); self.reply({"created": key})
+
+        def do_DELETE(self):
+            key = self.path.rsplit("/", 1)[-1]
+            state[key] = False; events.append(f"delete:{key}"); self.reply({"deleted": key})
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Transaction fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True, "allow_reversible_state_change": True, "environment_class": "local_fixture"},
+            "policy": {"allow_state_change": True, "max_requests_per_second": 100, "max_requests": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Fixture operator", "role": "operator", "auth_type": "none", "session_status": "ready",
+        })
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Transactional lifecycle", "objective": "Prove a two-action flow unwinds as a compensation stack",
+        }).json()
+        steps = [{
+            "name": f"Create {key}", "method": "POST", "url": f"{target}/{key}", "snapshot_url": f"{target}/{key}",
+            "compensation_method": "DELETE", "compensation_url": f"{target}/{key}", "actor_role": "operator",
+            "state_before": "absent", "expected_transition": "present then absent", "replay_safe": False,
+        } for key in ("a", "b")]
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Create two related objects", "objective": "Rollback B before A", "steps": steps,
+            "invariants": ["Both objects return to absent"], "risk_class": "reversible",
+        })
+        assert workflow.status_code == 201, workflow.text
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        assert [item["kind"] for item in iteration["tests"]] == ["reversible_transaction"]
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        response = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={
+            "run_id": run_id, "max_tests": 5, "confirm_reversible_state_change": True,
+        })
+        assert response.status_code == 200, response.text
+        result = response.json()["results"][0]
+        assert result["rollback_proven"] is True and result["rollback_order"] == [2, 1]
+        assert events == ["create:a", "create:b", "delete:b", "delete:a"]
+        assert state == {"a": False, "b": False}
+        journals = client.get(f"/api/v1/campaigns/{campaign['id']}/state-change-journals").json()
+        assert len(journals) == 2 and {item["state"] for item in journals} == {"restored"}
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(client, monkeypatch):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
@@ -443,6 +511,102 @@ def test_multistep_workflow_extracts_transient_values_and_evaluates_invariants(c
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_declarative_branch_and_bounded_read_loop_execute_without_scripts(client):
+    state = {"polls": 0, "guest_hits": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/profile":
+                body = b'{"tier":"premium"}'
+            elif self.path == "/premium":
+                body = b'{"feature":"enabled"}'
+            elif self.path == "/guest":
+                state["guest_hits"] += 1
+                body = b'{"feature":"guest"}'
+            elif self.path == "/poll":
+                state["polls"] += 1
+                body = json.dumps({"ready": state["polls"] >= 3}).encode()
+            else:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Branch and loop fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True}, "policy": {"max_requests": 50, "max_requests_per_second": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Fixture user", "role": "user", "tenant": "tenant-a", "auth_type": "none", "session_status": "ready",
+        })
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Conditional state campaign", "objective": "Follow a declared branch and wait for bounded convergence",
+        }).json()
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Feature branch and completion polling", "objective": "Execute only the matching tier and prove bounded readiness",
+            "steps": [
+                {"name": "Read tier", "method": "GET", "url": f"{target}/profile", "actor_role": "user", "extract": {"tier": "/tier"}},
+                {"name": "Premium branch", "method": "GET", "url": f"{target}/premium", "actor_role": "user", "when_variable": "tier", "when_operator": "equals", "when_value": "premium"},
+                {"name": "Guest branch", "method": "GET", "url": f"{target}/guest", "actor_role": "user", "when_variable": "tier", "when_operator": "equals", "when_value": "guest"},
+                {"name": "Wait for readiness", "method": "GET", "url": f"{target}/poll", "actor_role": "user", "max_repeats": 4, "repeat_until_pointer": "/ready", "repeat_until_value": True},
+            ],
+            "invariants": ["Only the matching tier branch executes", "Readiness converges within four reads"],
+            "executable_invariants": [
+                {"name": "Premium feature loads", "kind": "status_in", "step": 2, "expected_statuses": [200]},
+                {"name": "Skipped guest branch is not applicable", "kind": "status_in", "step": 3, "expected_statuses": [200]},
+                {"name": "Readiness is true", "kind": "json_equals", "step": 4, "pointer": "/ready", "expected": True},
+            ], "risk_class": "read_only",
+        })
+        assert workflow.status_code == 201, workflow.text
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        assert [item["kind"] for item in iteration["tests"]] == ["workflow_sequence"]
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        executed = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={"run_id": run_id, "max_tests": 5})
+        assert executed.status_code == 200, executed.text
+        result = executed.json()["results"][0]
+        assert result["control_flow"] == [
+            {"step": 1, "skipped": False, "condition": "unconditional", "attempts": 1, "until_satisfied": None},
+            {"step": 2, "skipped": False, "condition": "tier_matched", "attempts": 1, "until_satisfied": None},
+            {"step": 3, "skipped": True, "condition": "tier_different", "attempts": 0, "until_satisfied": None},
+            {"step": 4, "skipped": False, "condition": "unconditional", "attempts": 3, "until_satisfied": True},
+        ]
+        assert state["guest_hits"] == 0
+        assert all(item["passed"] for item in result["invariants"])
+        assert "hypothesis_id" not in result
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_branch_and_loop_declarations_fail_closed(client):
+    engagement = create_ready(client, target="https://branch-guard.test")
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Branch guard", "objective": "Reject undeclared control flow and mutating loops",
+    }).json()
+    rejected = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+        "name": "Invalid control flow", "objective": "Must fail before any request can run",
+        "steps": [
+            {"name": "Unknown branch", "method": "GET", "url": "https://branch-guard.test/a", "when_variable": "missing", "when_operator": "exists"},
+            {"name": "Mutating loop", "method": "POST", "url": "https://branch-guard.test/b", "max_repeats": 2},
+        ],
+        "invariants": ["No undeclared branch or write loop"], "risk_class": "state_changing",
+    })
+    assert rejected.status_code == 409
+    reasons = {item["reason"] for item in rejected.json()["detail"]["blocked_steps"]}
+    assert {"branch_variable_not_available", "bounded_loop_only_allows_read_methods"} <= reasons
 def test_oast_probe_is_scope_gated_correlated_and_redacted(client):
     denied_engagement = create_ready(client, target="https://oast-denied.test")
     denied_campaign = client.post(f"/api/v1/engagements/{denied_engagement['id']}/campaigns", json={

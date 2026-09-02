@@ -38,6 +38,8 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - 可逆业务状态测试只允许 `local_fixture / ephemeral_test / staging_clone`，且 Scope、Policy 和每次执行三重确认。每个动作强制执行“前置快照 → 状态动作 → 后置快照 → 补偿 → 回滚快照”，以响应哈希证明恢复；动作前写入持久化 Journal，进程中断后阻断后续变更，并提供补偿恢复入口。生产目标和无补偿的状态动作永远不执行。
 - 多步业务流程支持受限 JSON Pointer 提取和 `{{variable}}` 模板传递，可在后续 URL/Body 中使用前序对象 ID；不执行任意脚本。提取值只存在于本轮内存，证据仅保存变量名和 SHA-256。机器不变量支持状态码、JSON 存在/相等/不等和跨步骤响应哈希比较；跨身份序列会冻结源身份对象变量，用另一角色/租户重放并建立待复验假设，不能直接升级为漏洞。
 - 流程步骤可显式声明 `requires_steps`，系统用逆序扰动检查前置条件绕过。只读步骤还可声明 `concurrency_safe`，但只有冻结 Scope 显式允许、环境属于本地夹具/临时测试/脱敏克隆时才会执行 2–5 路有界并发。顺序或响应分歧只产生待复验 Hypothesis，不直接生成 Finding。
+- 声明式多步流程支持基于前序标量提取变量的条件分支，以及最多 5 次的只读有界轮询。未命中的分支明确记为 `SKIPPED / NOT APPLICABLE`；轮询未收敛会建立长期待证明假设，不会被解释为安全，也不允许脚本或变更型循环。
+- 含多个可逆动作的隔离流程作为一个事务测试执行：先捕获全部基线，动作正序执行，补偿严格逆序执行，每个动作使用独立持久化 Journal 和回滚哈希证明。任一回滚失败会保留恢复入口并阻断后续状态测试。
 - 任务中心和 Coverage Ledger 提供分区清理：只隐藏已结束任务或当前覆盖列表，活动任务、Observation、Evidence、Finding 和报告保留。
 - `benchmarks/logic-v1.json` 将复杂业务逻辑验收固定为版本化门禁：同时评分跨租户动态对象、声明前置步骤绕过、稳定并发负对照和 Finding 证据门禁。`python benchmarking.py captured-results.json` 可对导出的 Campaign `results` 重复评分。
 - OAST 必须由冻结 Scope 显式开启，并为远程自托管回调声明 `oast_allowed_hosts`。每个短期探针绑定 Campaign、真实 Run 和可选假设；token 只存 SHA-256，回调 Header 脱敏后进入 Observation/Evidence/Coverage。探针过期无回调保持 `NOT TESTED`，不能解释为安全。

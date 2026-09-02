@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
@@ -488,13 +489,21 @@ class WorkflowStepInput(BaseModel):
 
 class ExecutableInvariantInput(BaseModel):
     name: str = Field(min_length=2, max_length=200)
-    kind: Literal["status_in", "json_exists", "json_equals", "json_not_equals", "body_equals_step", "body_differs_step"]
+    kind: Literal[
+        "status_in", "json_exists", "json_equals", "json_not_equals",
+        "body_equals_step", "body_differs_step", "json_number_compare",
+        "json_collection_contains", "json_collection_not_contains", "json_collection_unique",
+        "json_collection_size_compare", "json_numeric_delta_equals", "json_sum_equals",
+    ]
     step: int = Field(ge=1, le=100)
     pointer: str | None = Field(default=None, max_length=1000)
     expected: str | int | float | bool | None = None
     expected_template: str | None = Field(default=None, max_length=2000)
     expected_statuses: list[int] = Field(default_factory=list, max_length=20)
     other_step: int | None = Field(default=None, ge=1, le=100)
+    other_pointer: str | None = Field(default=None, max_length=1000)
+    operator: Literal["eq", "ne", "gt", "gte", "lt", "lte"] | None = None
+    tolerance: float = Field(default=0, ge=0, le=1000000000)
 
 
 class BusinessWorkflowInput(BaseModel):
@@ -2212,6 +2221,23 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
             blocked.append({"step": invariant.step, "reason": "status_in_requires_expected_statuses"})
         if invariant.kind.startswith("body_") and invariant.other_step is None:
             blocked.append({"step": invariant.step, "reason": "body_comparison_requires_other_step"})
+        if invariant.other_pointer is not None and not (invariant.other_pointer == "" or invariant.other_pointer.startswith("/")):
+            blocked.append({"step": invariant.step, "reason": "invalid_other_json_pointer"})
+        if invariant.kind in {"json_number_compare", "json_collection_size_compare"}:
+            if invariant.operator is None:
+                blocked.append({"step": invariant.step, "reason": "numeric_comparison_requires_operator"})
+            if invariant.expected is None and invariant.expected_template is None:
+                blocked.append({"step": invariant.step, "reason": "numeric_comparison_requires_expected_value"})
+        if invariant.kind in {"json_collection_contains", "json_collection_not_contains"} and invariant.expected is None and invariant.expected_template is None:
+            blocked.append({"step": invariant.step, "reason": "collection_membership_requires_expected_value"})
+        if invariant.kind == "json_numeric_delta_equals" and (invariant.other_step is None or invariant.other_pointer is None):
+            blocked.append({"step": invariant.step, "reason": "numeric_delta_requires_other_step_and_pointer"})
+        if invariant.kind == "json_numeric_delta_equals" and invariant.expected is None and invariant.expected_template is None:
+            blocked.append({"step": invariant.step, "reason": "numeric_delta_requires_expected_value"})
+        if invariant.kind == "json_sum_equals" and invariant.other_step is not None and invariant.other_pointer is None:
+            blocked.append({"step": invariant.step, "reason": "sum_step_comparison_requires_other_pointer"})
+        if invariant.kind == "json_sum_equals" and invariant.other_step is None and invariant.expected is None and invariant.expected_template is None:
+            blocked.append({"step": invariant.step, "reason": "sum_comparison_requires_expected_or_other_step"})
     if blocked:
         raise HTTPException(409, {"message": "业务流程包含未授权或风险声明不一致的步骤", "blocked_steps": blocked})
     workflow_id, timestamp = uid("workflow"), utcnow()
@@ -2694,6 +2720,40 @@ def _workflow_step_enabled(step: dict[str, Any], variables: dict[str, Any]) -> t
     return enabled, f"{variable}_{'matched' if equal else 'different'}"
 
 
+def _invariant_expected(item: dict[str, Any], variables: dict[str, Any]) -> Any:
+    expected = item.get("expected")
+    template = item.get("expected_template")
+    if template is not None:
+        exact = re.fullmatch(r"\{\{([A-Za-z_][A-Za-z0-9_]{0,63})\}\}", template)
+        return variables[exact.group(1)] if exact else _render_workflow_template(template, variables)
+    return expected
+
+
+def _invariant_decimal(value: Any) -> Decimal:
+    if isinstance(value, bool) or isinstance(value, (dict, list)) or value is None:
+        raise ValueError("not_numeric")
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError("not_finite")
+    return number
+
+
+def _decimal_compare(actual: Decimal, expected: Decimal, operator: str, tolerance: Decimal) -> bool:
+    if operator == "eq":
+        return abs(actual - expected) <= tolerance
+    if operator == "ne":
+        return abs(actual - expected) > tolerance
+    if operator == "gt":
+        return actual > expected + tolerance
+    if operator == "gte":
+        return actual >= expected - tolerance
+    if operator == "lt":
+        return actual < expected - tolerance
+    if operator == "lte":
+        return actual <= expected + tolerance
+    raise ValueError("unknown_numeric_operator")
+
+
 def _evaluate_workflow_invariants(invariants: list[dict[str, Any]], steps: list[dict[str, Any]], variables: dict[str, Any]) -> list[dict[str, Any]]:
     results = []
     for item in invariants:
@@ -2712,18 +2772,54 @@ def _evaluate_workflow_invariants(invariants: list[dict[str, Any]], steps: list[
                 result["passed"] = True
             elif kind in {"json_equals", "json_not_equals"}:
                 actual = _json_pointer(step["json"], item["pointer"])
-                expected = item.get("expected")
-                template = item.get("expected_template")
-                if template is not None:
-                    exact = re.fullmatch(r"\{\{([A-Za-z_][A-Za-z0-9_]{0,63})\}\}", template)
-                    expected = variables[exact.group(1)] if exact else _render_workflow_template(template, variables)
+                expected = _invariant_expected(item, variables)
                 result["passed"] = (actual == expected) if kind == "json_equals" else (actual != expected)
-            else:
+            elif kind in {"body_equals_step", "body_differs_step"}:
                 other = steps[int(item["other_step"]) - 1]
                 equal = step["body_sha256"] == other["body_sha256"]
                 result["passed"] = equal if kind == "body_equals_step" else not equal
+            elif kind == "json_number_compare":
+                actual = _invariant_decimal(_json_pointer(step["json"], item["pointer"]))
+                expected = _invariant_decimal(_invariant_expected(item, variables))
+                result["passed"] = _decimal_compare(actual, expected, item["operator"], _invariant_decimal(item.get("tolerance", 0)))
+            elif kind in {"json_collection_contains", "json_collection_not_contains"}:
+                collection = _json_pointer(step["json"], item["pointer"])
+                if not isinstance(collection, list):
+                    raise ValueError("not_collection")
+                contains = _invariant_expected(item, variables) in collection
+                result["passed"] = contains if kind == "json_collection_contains" else not contains
+            elif kind == "json_collection_unique":
+                collection = _json_pointer(step["json"], item["pointer"])
+                if not isinstance(collection, list):
+                    raise ValueError("not_collection")
+                canonical = [json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for value in collection]
+                result["passed"] = len(canonical) == len(set(canonical))
+            elif kind == "json_collection_size_compare":
+                collection = _json_pointer(step["json"], item["pointer"])
+                if not isinstance(collection, (list, dict)):
+                    raise ValueError("not_collection")
+                expected = _invariant_decimal(_invariant_expected(item, variables))
+                result["passed"] = _decimal_compare(Decimal(len(collection)), expected, item["operator"], _invariant_decimal(item.get("tolerance", 0)))
+            elif kind == "json_numeric_delta_equals":
+                other = steps[int(item["other_step"]) - 1]
+                actual = _invariant_decimal(_json_pointer(step["json"], item["pointer"]))
+                baseline = _invariant_decimal(_json_pointer(other["json"], item["other_pointer"]))
+                expected = _invariant_decimal(_invariant_expected(item, variables))
+                result["passed"] = abs((actual - baseline) - expected) <= _invariant_decimal(item.get("tolerance", 0))
+            elif kind == "json_sum_equals":
+                values = _json_pointer(step["json"], item["pointer"])
+                if not isinstance(values, list):
+                    raise ValueError("not_collection")
+                actual = sum((_invariant_decimal(value) for value in values), Decimal(0))
+                if item.get("other_step") is not None:
+                    other = steps[int(item["other_step"]) - 1]
+                    other_value = _json_pointer(other["json"], item["other_pointer"])
+                    expected = sum((_invariant_decimal(value) for value in other_value), Decimal(0)) if isinstance(other_value, list) else _invariant_decimal(other_value)
+                else:
+                    expected = _invariant_decimal(_invariant_expected(item, variables))
+                result["passed"] = abs(actual - expected) <= _invariant_decimal(item.get("tolerance", 0))
             result["reason"] = "assertion_satisfied" if result["passed"] else "assertion_failed"
-        except (IndexError, KeyError, ValueError, TypeError, json.JSONDecodeError):
+        except (IndexError, KeyError, ValueError, TypeError, InvalidOperation, json.JSONDecodeError):
             result["reason"] = "assertion_input_unavailable"
         results.append(result)
     return results
@@ -2861,6 +2957,7 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                     ))
                 result = {"kind": kind, "workflow_id": workflow_id, "status": "observed", "exchange_ids": exchange_ids,
                           "observation_id": observation["id"], "invariants": invariant_results,
+                          "invariant_failures": len(failed), "failed_invariant_kinds": sorted({item["kind"] for item in failed}),
                           "extracted_variables": sorted(extraction_hashes), "extracted_value_hashes": extraction_hashes,
                           "control_flow": [{"step": item["step"], "skipped": item.get("skipped", False), "condition": item.get("condition"), "attempts": item.get("attempts", 0), "until_satisfied": item.get("until_satisfied")} for item in sequence_steps]}
                 hypothesis_ids = []

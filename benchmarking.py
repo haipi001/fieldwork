@@ -54,7 +54,7 @@ def score_logic_benchmark(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Score captured Campaign results against a versioned logic benchmark")
     parser.add_argument("results", type=Path, help="JSON file containing a results array or an object with a results field")
-    parser.add_argument("--manifest", type=Path, default=Path(__file__).parent / "benchmarks" / "logic-v1.json")
+    parser.add_argument("--manifest", type=Path, default=Path(__file__).parent / "benchmarks" / "logic-v2.json")
     parser.add_argument("--verified-findings", type=int, default=0)
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())

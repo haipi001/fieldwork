@@ -39,9 +39,10 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - 多步业务流程支持受限 JSON Pointer 提取和 `{{variable}}` 模板传递，可在后续 URL/Body 中使用前序对象 ID；不执行任意脚本。提取值只存在于本轮内存，证据仅保存变量名和 SHA-256。机器不变量支持状态码、JSON 存在/相等/不等和跨步骤响应哈希比较；跨身份序列会冻结源身份对象变量，用另一角色/租户重放并建立待复验假设，不能直接升级为漏洞。
 - 流程步骤可显式声明 `requires_steps`，系统用逆序扰动检查前置条件绕过。只读步骤还可声明 `concurrency_safe`，但只有冻结 Scope 显式允许、环境属于本地夹具/临时测试/脱敏克隆时才会执行 2–5 路有界并发。顺序或响应分歧只产生待复验 Hypothesis，不直接生成 Finding。
 - 声明式多步流程支持基于前序标量提取变量的条件分支，以及最多 5 次的只读有界轮询。未命中的分支明确记为 `SKIPPED / NOT APPLICABLE`；轮询未收敛会建立长期待证明假设，不会被解释为安全，也不允许脚本或变更型循环。
+- 机器不变量可证明数值边界、跨步骤数值增量、列表金额求和、集合成员存在/禁止、集合唯一性和集合数量边界。数值使用十进制计算和显式容差，不执行用户表达式；断言失败只建立可定向复测的 Hypothesis。
 - 含多个可逆动作的隔离流程作为一个事务测试执行：先捕获全部基线，动作正序执行，补偿严格逆序执行，每个动作使用独立持久化 Journal 和回滚哈希证明。任一回滚失败会保留恢复入口并阻断后续状态测试。
 - 任务中心和 Coverage Ledger 提供分区清理：只隐藏已结束任务或当前覆盖列表，活动任务、Observation、Evidence、Finding 和报告保留。
-- `benchmarks/logic-v1.json` 将复杂业务逻辑验收固定为版本化门禁：同时评分跨租户动态对象、声明前置步骤绕过、稳定并发负对照和 Finding 证据门禁。`python benchmarking.py captured-results.json` 可对导出的 Campaign `results` 重复评分。
+- `benchmarks/logic-v2.json` 将复杂业务逻辑验收固定为版本化门禁：同时评分跨租户动态对象、声明前置步骤绕过、金额守恒破坏、稳定并发负对照、健康账本负对照和 Finding 证据门禁。`python benchmarking.py captured-results.json` 可对导出的 Campaign `results` 重复评分；v1 清单继续保留用于历史可比性。
 - OAST 必须由冻结 Scope 显式开启，并为远程自托管回调声明 `oast_allowed_hosts`。每个短期探针绑定 Campaign、真实 Run 和可选假设；token 只存 SHA-256，回调 Header 脱敏后进入 Observation/Evidence/Coverage。探针过期无回调保持 `NOT TESTED`，不能解释为安全。
 - “设置与工具”提供自定义 OpenAI-compatible API Base、模型 ID 和 API Key。本机 Key 只写入 `~/.strix/cli-config.json`（权限 `600`），不进入 SQLite、事件、报告或 API 响应。
 - Scanner / tool output 必须先成为 Observation，不能直接生成 Verified Finding。

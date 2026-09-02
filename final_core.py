@@ -276,6 +276,19 @@ def init_final_db() -> None:
               lease_token TEXT, lease_expires_at TEXT, failure_count INTEGER NOT NULL DEFAULT 0,
               last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS campaign_iteration_metrics (
+              iteration_id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+              planned_tests INTEGER NOT NULL, tested_tests INTEGER NOT NULL, blocked_tests INTEGER NOT NULL,
+              test_signature_count INTEGER NOT NULL, new_test_signature_count INTEGER NOT NULL,
+              cumulative_test_signature_count INTEGER NOT NULL, signature_hashes TEXT NOT NULL,
+              hypotheses_before INTEGER NOT NULL, hypotheses_after INTEGER NOT NULL,
+              new_hypothesis_count INTEGER NOT NULL, retested_hypothesis_id TEXT,
+              open_hypotheses_before INTEGER NOT NULL, open_hypotheses_after INTEGER NOT NULL,
+              resolved_hypothesis_count INTEGER NOT NULL,
+              invariant_passes INTEGER NOT NULL, invariant_failures INTEGER NOT NULL,
+              execution_rate REAL NOT NULL, novelty_rate REAL NOT NULL,
+              observation_count INTEGER NOT NULL, created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS state_change_journal (
               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
               iteration_id TEXT NOT NULL, run_id TEXT NOT NULL, workflow_id TEXT NOT NULL,
@@ -306,6 +319,7 @@ def init_final_db() -> None:
             CREATE INDEX IF NOT EXISTS oast_probe_event_idx ON oast_events(probe_id,received_at);
             CREATE INDEX IF NOT EXISTS state_change_engagement_idx ON state_change_journal(engagement_id,state,updated_at);
             CREATE INDEX IF NOT EXISTS campaign_schedule_due_idx ON campaign_schedules(enabled,next_run_at,lease_expires_at);
+            CREATE INDEX IF NOT EXISTS campaign_metrics_sequence_idx ON campaign_iteration_metrics(campaign_id,sequence);
             """
         )
         workflow_columns = {row["name"] for row in db.execute("PRAGMA table_info(business_workflows)")}
@@ -2216,6 +2230,46 @@ def get_research_campaign(campaign_id: str):
     }
 
 
+@router.get("/campaigns/{campaign_id}/trend")
+def get_campaign_trend(campaign_id: str):
+    get_research_campaign(campaign_id)
+    with connect() as db:
+        rows = [dict(row) for row in db.execute(
+            "SELECT * FROM campaign_iteration_metrics WHERE campaign_id=? ORDER BY sequence", (campaign_id,),
+        )]
+    for row in rows:
+        row.pop("signature_hashes", None)
+    plateau_streak = 0
+    for row in reversed(rows):
+        if row["new_test_signature_count"]:
+            break
+        plateau_streak += 1
+    latest = rows[-1] if rows else None
+    if not latest:
+        recommendation = "execute_first_iteration"
+    elif latest["execution_rate"] < .7:
+        recommendation = "resolve_execution_blockers"
+    elif latest["invariant_failures"]:
+        recommendation = "prioritize_invariant_reproduction"
+    elif plateau_streak >= 2 and latest["open_hypotheses_after"]:
+        recommendation = "prioritize_directed_retests"
+    elif plateau_streak >= 2:
+        recommendation = "expand_workflows_and_identity_dimensions"
+    else:
+        recommendation = "continue_scheduled_coverage"
+    return {
+        "campaign_id": campaign_id, "iterations": rows, "latest": latest,
+        "summary": {
+            "measured_iterations": len(rows), "cumulative_test_signatures": latest["cumulative_test_signature_count"] if latest else 0,
+            "plateau_streak": plateau_streak,
+            "open_hypothesis_delta": (latest["open_hypotheses_after"] - rows[0]["open_hypotheses_before"]) if latest else 0,
+            "total_new_hypotheses": sum(row["new_hypothesis_count"] for row in rows),
+            "total_resolved_hypotheses": sum(row["resolved_hypothesis_count"] for row in rows),
+            "recommendation": recommendation,
+        },
+    }
+
+
 @router.post("/campaigns/{campaign_id}/workflows", status_code=201)
 def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
     campaign = get_research_campaign(campaign_id)
@@ -3182,6 +3236,69 @@ def _evaluate_workflow_invariants(invariants: list[dict[str, Any]], steps: list[
     return results
 
 
+def _campaign_test_signature(test: dict[str, Any]) -> str:
+    identity_fields = {key: test[key] for key in sorted(test) if "identity_id" in key}
+    signature = {
+        "kind": test.get("kind"), "workflow_id": test.get("workflow_id"), "step": test.get("step"),
+        "target_step": test.get("target_step"), "sequence": test.get("sequence"),
+        "url_sha256": hashlib.sha256(str(test.get("url", "")).encode()).hexdigest() if test.get("url") else None,
+        "invariant_kinds": sorted(item.get("kind", "") for item in test.get("executable_invariants", [])),
+        "identity_dimensions": identity_fields,
+    }
+    return hashlib.sha256(json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _build_campaign_iteration_metrics(db: sqlite3.Connection, campaign_id: str, iteration_id: str, sequence: int,
+                                      tests: list[dict[str, Any]], results: list[dict[str, Any]],
+                                      hypotheses_before: dict[str, str], observation_count: int,
+                                      retested_hypothesis_id: str | None) -> dict[str, Any]:
+    signatures = sorted({_campaign_test_signature(test) for test in tests})
+    historical: set[str] = set()
+    for row in db.execute("SELECT signature_hashes FROM campaign_iteration_metrics WHERE campaign_id=?", (campaign_id,)):
+        historical.update(load(row["signature_hashes"], []))
+    new_signatures = set(signatures) - historical
+    hypotheses_after = {row["id"]: row["status"] for row in db.execute(
+        "SELECT id,status FROM research_hypotheses WHERE campaign_id=? AND status!='archived'", (campaign_id,),
+    )}
+    open_states = {"new", "planned", "testing", "open_proof_gap"}
+    open_before = {item_id for item_id, status in hypotheses_before.items() if status in open_states}
+    open_after = {item_id for item_id, status in hypotheses_after.items() if status in open_states}
+    invariant_rows = [assertion for result in results for assertion in result.get("invariants", [])]
+    tested = sum(result.get("status") == "observed" for result in results)
+    blocked = len(results) - tested
+    metrics = {
+        "iteration_id": iteration_id, "campaign_id": campaign_id, "sequence": sequence,
+        "planned_tests": len(tests), "tested_tests": tested, "blocked_tests": blocked,
+        "test_signature_count": len(signatures), "new_test_signature_count": len(new_signatures),
+        "cumulative_test_signature_count": len(historical | set(signatures)), "signature_hashes": signatures,
+        "hypotheses_before": len(hypotheses_before), "hypotheses_after": len(hypotheses_after),
+        "new_hypothesis_count": len(set(hypotheses_after) - set(hypotheses_before)),
+        "retested_hypothesis_id": retested_hypothesis_id,
+        "open_hypotheses_before": len(open_before), "open_hypotheses_after": len(open_after),
+        "resolved_hypothesis_count": len(open_before - open_after),
+        "invariant_passes": sum(bool(item.get("passed")) for item in invariant_rows),
+        "invariant_failures": sum(not bool(item.get("passed")) for item in invariant_rows),
+        "execution_rate": round(tested / len(results), 4) if results else 0.0,
+        "novelty_rate": round(len(new_signatures) / len(signatures), 4) if signatures else 0.0,
+        "observation_count": observation_count, "created_at": utcnow(),
+    }
+    db.execute("""INSERT OR REPLACE INTO campaign_iteration_metrics
+      (iteration_id,campaign_id,sequence,planned_tests,tested_tests,blocked_tests,test_signature_count,
+       new_test_signature_count,cumulative_test_signature_count,signature_hashes,hypotheses_before,hypotheses_after,
+       new_hypothesis_count,retested_hypothesis_id,open_hypotheses_before,open_hypotheses_after,
+       resolved_hypothesis_count,invariant_passes,invariant_failures,execution_rate,novelty_rate,
+       observation_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+        metrics["iteration_id"], metrics["campaign_id"], metrics["sequence"], metrics["planned_tests"],
+        metrics["tested_tests"], metrics["blocked_tests"], metrics["test_signature_count"],
+        metrics["new_test_signature_count"], metrics["cumulative_test_signature_count"], dump(metrics["signature_hashes"]),
+        metrics["hypotheses_before"], metrics["hypotheses_after"], metrics["new_hypothesis_count"],
+        metrics["retested_hypothesis_id"], metrics["open_hypotheses_before"], metrics["open_hypotheses_after"],
+        metrics["resolved_hypothesis_count"], metrics["invariant_passes"], metrics["invariant_failures"],
+        metrics["execution_rate"], metrics["novelty_rate"], metrics["observation_count"], metrics["created_at"],
+    ))
+    return metrics
+
+
 @router.post("/campaigns/{campaign_id}/iterations/{iteration_id}/execute")
 def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: CampaignExecuteInput):
     """Execute bounded probes; mutations require isolated scope and proven compensation."""
@@ -3206,6 +3323,10 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
         if plan.get("hypothesis_id"):
             db.execute("UPDATE research_hypotheses SET status='testing',updated_at=? WHERE id=? AND campaign_id=?", (timestamp, plan["hypothesis_id"], campaign_id))
     results, observation_ids = [], []
+    with connect() as db:
+        hypothesis_ids_before = {row["id"]: row["status"] for row in db.execute(
+            "SELECT id,status FROM research_hypotheses WHERE campaign_id=? AND status!='archived'", (campaign_id,),
+        )}
     workflow_outcomes: dict[str, dict[str, Any]] = {}
     workflow_exports: dict[str, dict[str, Any]] = {}
     engagement = get_engagement(campaign["engagement_id"])
@@ -3683,12 +3804,18 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
     blocked = len(results) - tested
     coverage_key = f"campaign:{campaign_id}:iteration:{iteration['sequence']}"
     with connect() as db:
+        metrics = _build_campaign_iteration_metrics(
+            db, campaign_id, iteration_id, int(iteration["sequence"]), tests, results,
+            hypothesis_ids_before, len(observation_ids), plan.get("hypothesis_id"),
+        )
         db.execute("""INSERT INTO coverage_v2 VALUES(?,?,?,?,?,?,?)
           ON CONFLICT(run_id,surface_key) DO UPDATE SET state=excluded.state,reason=excluded.reason,observation_ids=excluded.observation_ids,updated_at=excluded.updated_at""", (
             uid("coverage"), body.run_id, coverage_key, "tested" if tested else "blocked",
             f"长期业务逻辑轮次：{tested} 已执行，{blocked} 阻塞", dump(observation_ids), utcnow(),
         ))
-        db.execute("UPDATE campaign_iterations SET status='completed',results=?,completed_at=? WHERE id=?", (dump({"tests": results, "tested": tested, "blocked": blocked}), utcnow(), iteration_id))
+        db.execute("UPDATE campaign_iterations SET status='completed',results=?,completed_at=? WHERE id=?", (
+            dump({"tests": results, "tested": tested, "blocked": blocked, "metrics": {key: value for key, value in metrics.items() if key != "signature_hashes"}}), utcnow(), iteration_id,
+        ))
         db.execute("UPDATE research_campaigns SET iterations_completed=iterations_completed+1,updated_at=? WHERE id=?", (utcnow(), campaign_id))
         if plan.get("hypothesis_id"):
             db.execute("""UPDATE research_hypotheses SET status=?,attempts=attempts+1,last_tested_at=?,
@@ -3698,7 +3825,8 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 utcnow(), plan["hypothesis_id"], campaign_id,
             ))
     add_event(body.run_id, "verification", "campaign.iteration_completed", f"长期研究第 {iteration['sequence']} 轮完成：{tested} 已执行，{blocked} 阻塞", {"campaign_id": campaign_id, "iteration_id": iteration_id})
-    return {"campaign_id": campaign_id, "iteration_id": iteration_id, "run_id": body.run_id, "status": "completed", "tested": tested, "blocked": blocked, "results": results, "observation_ids": observation_ids}
+    return {"campaign_id": campaign_id, "iteration_id": iteration_id, "run_id": body.run_id, "status": "completed", "tested": tested, "blocked": blocked, "results": results, "observation_ids": observation_ids,
+            "metrics": {key: value for key, value in metrics.items() if key != "signature_hashes"}}
 
 
 @router.get("/campaigns/{campaign_id}/state-change-journals")

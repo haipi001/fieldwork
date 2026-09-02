@@ -315,7 +315,7 @@ def test_campaign_schedule_only_auto_executes_explicit_read_only_plan(client, mo
         campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
             "name": "Read-only background campaign", "objective": "Safely continue bounded read-only coverage while the app is running",
         }).json()
-        client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
             "name": "Read fixture order", "objective": "Observe a stable authorized order without changing state",
             "steps": [{"name": "Read", "method": "GET", "url": f"{target}/orders/42", "actor_role": "user", "replay_safe": True}],
             "invariants": ["Read must not mutate state"], "risk_class": "read_only",
@@ -338,6 +338,20 @@ def test_campaign_schedule_only_auto_executes_explicit_read_only_plan(client, mo
         assert outcome.json()["tested"] >= 1 and state["requests"] >= 1
         detail = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
         assert detail["iterations"][0]["status"] == "completed" and detail["iterations_completed"] == 1
+        hypothesis = client.post(f"/api/v1/campaigns/{campaign['id']}/hypotheses", json={
+            "workflow_id": workflow.json()["id"], "category": "authorization",
+            "statement": "Scheduled order access needs repeated cross-identity proof", "priority": 90,
+        })
+        assert hypothesis.status_code == 201
+        second = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now").json()
+        third = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now").json()
+        assert second["status"] == third["status"] == "completed"
+        trend = client.get(f"/api/v1/campaigns/{campaign['id']}/trend").json()
+        assert trend["summary"]["measured_iterations"] == 3 and trend["summary"]["plateau_streak"] == 2
+        assert trend["summary"]["recommendation"] == "prioritize_directed_retests"
+        assert trend["iterations"][0]["new_test_signature_count"] > 0
+        assert trend["iterations"][1]["new_test_signature_count"] == trend["iterations"][2]["new_test_signature_count"] == 0
+        assert "signature_hashes" not in trend["iterations"][0]
         monkeypatch.setattr(final_core, "execute_campaign_iteration", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fixture execution failed")))
         failed = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now")
         assert failed.status_code == 200 and failed.json()["status"] == "failed"
@@ -423,6 +437,31 @@ def test_logic_v3_benchmark_scores_nested_projection_controls():
     ]
     score = benchmarking.score_logic_benchmark(manifest, results, verified_findings=0)
     assert score["passed"] is True and score["metrics"]["positive_recall"] == 1.0
+
+
+def test_logic_v4_multi_application_benchmark_enforces_each_application_and_proof_gate():
+    manifest = json.loads((app.ROOT / "benchmarks" / "logic-v4.json").read_text())
+    results = [
+        {"benchmark_app": "commerce", "kind": "cross_identity_sequence", "decision": "suspicious_success", "hypothesis_id": "hyp-commerce-owner"},
+        {"benchmark_app": "commerce", "kind": "sequence_violation", "decision": "suspicious_success", "hypothesis_id": "hyp-commerce-sequence"},
+        {"benchmark_app": "commerce", "kind": "concurrent_step", "stable": True},
+        {"benchmark_app": "fintech", "kind": "workflow_sequence", "invariant_failures": 1, "failed_invariant_kinds": ["json_sum_equals"], "hypothesis_id": "hyp-fintech-ledger"},
+        {"benchmark_app": "fintech", "kind": "workflow_sequence", "invariant_failures": 0},
+        {"benchmark_app": "marketplace", "kind": "workflow_sequence", "invariant_failures": 1, "failed_invariant_kinds": ["json_filtered_sum_equals"], "hypothesis_id": "hyp-marketplace-settlement"},
+        {"benchmark_app": "marketplace", "kind": "reversible_transition", "status": "rollback_failed", "snapshot_restored": True, "hypothesis_id": "hyp-marketplace-orphan"},
+        {"benchmark_app": "marketplace", "kind": "reversible_transition", "rollback_proven": True},
+        {"benchmark_app": "saas", "kind": "cross_identity_sequence", "decision": "suspicious_success", "hypothesis_id": "hyp-saas-role"},
+        {"benchmark_app": "saas", "kind": "workflow_sequence", "status": "blocked", "reason": "workflow_dependency_invariants_failed"},
+    ]
+    score = benchmarking.score_logic_benchmark(manifest, results, verified_findings=0)
+    assert score["passed"] is True and score["application_gate_passed"] is True
+    assert set(score["applications"]) == {"commerce", "fintech", "marketplace", "saas"}
+    test_source = (app.ROOT / "tests" / "test_final.py").read_text()
+    assert all(f"def {test_name}(" in test_source for names in manifest["fixture_tests"].values() for test_name in names)
+    missing_fintech = benchmarking.score_logic_benchmark(manifest, [item for item in results if item.get("hypothesis_id") != "hyp-fintech-ledger"], 0)
+    assert missing_fintech["passed"] is False and missing_fintech["applications"]["fintech"]["positive_recall"] == 0.0
+    proof_failure = benchmarking.score_logic_benchmark(manifest, results, verified_findings=1)
+    assert proof_failure["passed"] is False and proof_failure["proof_gate_passed"] is False
 
 
 def test_reversible_business_transition_requires_isolation_confirmation_and_proves_rollback(client):

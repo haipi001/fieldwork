@@ -500,6 +500,8 @@ class ExecutableInvariantInput(BaseModel):
         "body_equals_step", "body_differs_step", "json_number_compare",
         "json_collection_contains", "json_collection_not_contains", "json_collection_unique",
         "json_collection_size_compare", "json_numeric_delta_equals", "json_sum_equals",
+        "json_project_unique", "json_project_contains", "json_project_not_contains",
+        "json_all_items_equal", "json_any_item_equals", "json_filtered_sum_equals",
     ]
     step: int = Field(ge=1, le=100)
     pointer: str | None = Field(default=None, max_length=1000)
@@ -510,6 +512,9 @@ class ExecutableInvariantInput(BaseModel):
     other_pointer: str | None = Field(default=None, max_length=1000)
     operator: Literal["eq", "ne", "gt", "gte", "lt", "lte"] | None = None
     tolerance: float = Field(default=0, ge=0, le=1000000000)
+    item_pointer: str | None = Field(default=None, max_length=1000)
+    filter_pointer: str | None = Field(default=None, max_length=1000)
+    filter_expected: str | int | float | bool | None = None
 
 
 class BusinessWorkflowInput(BaseModel):
@@ -2271,6 +2276,18 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
             blocked.append({"step": invariant.step, "reason": "sum_step_comparison_requires_other_pointer"})
         if invariant.kind == "json_sum_equals" and invariant.other_step is None and invariant.expected is None and invariant.expected_template is None:
             blocked.append({"step": invariant.step, "reason": "sum_comparison_requires_expected_or_other_step"})
+        projection_kinds = {"json_project_unique", "json_project_contains", "json_project_not_contains", "json_all_items_equal", "json_any_item_equals", "json_filtered_sum_equals"}
+        if invariant.kind in projection_kinds and (invariant.item_pointer is None or not (invariant.item_pointer == "" or invariant.item_pointer.startswith("/"))):
+            blocked.append({"step": invariant.step, "reason": "collection_projection_requires_item_pointer"})
+        if invariant.kind in {"json_project_contains", "json_project_not_contains", "json_all_items_equal", "json_any_item_equals"} and invariant.expected is None and invariant.expected_template is None:
+            blocked.append({"step": invariant.step, "reason": "collection_projection_requires_expected_value"})
+        if invariant.kind == "json_filtered_sum_equals":
+            if invariant.filter_pointer is None or not (invariant.filter_pointer == "" or invariant.filter_pointer.startswith("/")) or invariant.filter_expected is None:
+                blocked.append({"step": invariant.step, "reason": "filtered_sum_requires_filter_pointer_and_value"})
+            if invariant.other_step is not None and invariant.other_pointer is None:
+                blocked.append({"step": invariant.step, "reason": "filtered_sum_step_comparison_requires_other_pointer"})
+            if invariant.other_step is None and invariant.expected is None and invariant.expected_template is None:
+                blocked.append({"step": invariant.step, "reason": "filtered_sum_requires_expected_or_other_step"})
     if blocked:
         raise HTTPException(409, {"message": "业务流程包含未授权或风险声明不一致的步骤", "blocked_steps": blocked})
     workflow_id, timestamp = uid("workflow"), utcnow()
@@ -2813,6 +2830,18 @@ def _decimal_compare(actual: Decimal, expected: Decimal, operator: str, toleranc
     raise ValueError("unknown_numeric_operator")
 
 
+def _project_collection(document: Any, collection_pointer: str, item_pointer: str, filter_pointer: str | None = None, filter_expected: Any = None) -> list[Any]:
+    collection = _json_pointer(document, collection_pointer)
+    if not isinstance(collection, list) or len(collection) > 1000:
+        raise ValueError("collection_projection_requires_bounded_list")
+    selected = []
+    for item in collection:
+        if filter_pointer is not None and _json_pointer(item, filter_pointer) != filter_expected:
+            continue
+        selected.append(_json_pointer(item, item_pointer))
+    return selected
+
+
 def _evaluate_workflow_invariants(invariants: list[dict[str, Any]], steps: list[dict[str, Any]], variables: dict[str, Any]) -> list[dict[str, Any]]:
     results = []
     for item in invariants:
@@ -2874,6 +2903,30 @@ def _evaluate_workflow_invariants(invariants: list[dict[str, Any]], steps: list[
                     other = steps[int(item["other_step"]) - 1]
                     other_value = _json_pointer(other["json"], item["other_pointer"])
                     expected = sum((_invariant_decimal(value) for value in other_value), Decimal(0)) if isinstance(other_value, list) else _invariant_decimal(other_value)
+                else:
+                    expected = _invariant_decimal(_invariant_expected(item, variables))
+                result["passed"] = abs(actual - expected) <= _invariant_decimal(item.get("tolerance", 0))
+            elif kind in {"json_project_unique", "json_project_contains", "json_project_not_contains", "json_all_items_equal", "json_any_item_equals"}:
+                projected = _project_collection(step["json"], item["pointer"], item["item_pointer"])
+                if kind == "json_project_unique":
+                    canonical = [json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for value in projected]
+                    result["passed"] = len(canonical) == len(set(canonical))
+                else:
+                    expected = _invariant_expected(item, variables)
+                    if kind == "json_project_contains":
+                        result["passed"] = expected in projected
+                    elif kind == "json_project_not_contains":
+                        result["passed"] = expected not in projected
+                    elif kind == "json_all_items_equal":
+                        result["passed"] = bool(projected) and all(value == expected for value in projected)
+                    else:
+                        result["passed"] = any(value == expected for value in projected)
+            elif kind == "json_filtered_sum_equals":
+                projected = _project_collection(step["json"], item["pointer"], item["item_pointer"], item["filter_pointer"], item.get("filter_expected"))
+                actual = sum((_invariant_decimal(value) for value in projected), Decimal(0))
+                if item.get("other_step") is not None:
+                    other = steps[int(item["other_step"]) - 1]
+                    expected = _invariant_decimal(_json_pointer(other["json"], item["other_pointer"]))
                 else:
                     expected = _invariant_decimal(_invariant_expected(item, variables))
                 result["passed"] = abs(actual - expected) <= _invariant_decimal(item.get("tolerance", 0))

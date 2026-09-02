@@ -281,6 +281,20 @@ def test_logic_v2_benchmark_scores_accounting_and_collection_controls():
     assert score["metrics"] == {"positive_recall": 1.0, "negative_control_failure_rate": 0.0, "verified_findings": 0}
 
 
+def test_logic_v3_benchmark_scores_nested_projection_controls():
+    manifest = json.loads((app.ROOT / "benchmarks" / "logic-v3.json").read_text())
+    results = [
+        {"kind": "cross_identity_sequence", "decision": "suspicious_success", "hypothesis_id": "hyp-a"},
+        {"kind": "sequence_violation", "decision": "suspicious_success", "hypothesis_id": "hyp-b"},
+        {"kind": "workflow_sequence", "invariant_failures": 1, "failed_invariant_kinds": ["json_sum_equals"], "hypothesis_id": "hyp-c"},
+        {"kind": "workflow_sequence", "invariant_failures": 1, "failed_invariant_kinds": ["json_filtered_sum_equals"], "hypothesis_id": "hyp-d"},
+        {"kind": "concurrent_step", "stable": True},
+        {"kind": "workflow_sequence", "invariant_failures": 0, "failed_invariant_kinds": []},
+    ]
+    score = benchmarking.score_logic_benchmark(manifest, results, verified_findings=0)
+    assert score["passed"] is True and score["metrics"]["positive_recall"] == 1.0
+
+
 def test_reversible_business_transition_requires_isolation_confirmation_and_proves_rollback(client):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
@@ -696,11 +710,89 @@ def test_complex_invariant_declarations_fail_closed(client):
             {"name": "Missing operator", "kind": "json_number_compare", "step": 1, "pointer": "/amount", "expected": 1},
             {"name": "Missing member", "kind": "json_collection_contains", "step": 1, "pointer": "/owners"},
             {"name": "Missing comparison", "kind": "json_numeric_delta_equals", "step": 1, "pointer": "/amount"},
+            {"name": "Missing item pointer", "kind": "json_project_unique", "step": 1, "pointer": "/transfers"},
+            {"name": "Missing filter", "kind": "json_filtered_sum_equals", "step": 1, "pointer": "/transfers", "item_pointer": "/amount", "expected": 10},
         ], "risk_class": "read_only",
     })
     assert response.status_code == 409
     reasons = {item["reason"] for item in response.json()["detail"]["blocked_steps"]}
-    assert {"numeric_comparison_requires_operator", "collection_membership_requires_expected_value", "numeric_delta_requires_other_step_and_pointer", "numeric_delta_requires_expected_value"} <= reasons
+    assert {"numeric_comparison_requires_operator", "collection_membership_requires_expected_value", "numeric_delta_requires_other_step_and_pointer", "numeric_delta_requires_expected_value", "collection_projection_requires_item_pointer", "filtered_sum_requires_filter_pointer_and_value"} <= reasons
+
+
+def test_nested_collection_projection_detects_filtered_accounting_drift(client):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            healthy = {
+                "total": "100.00", "transfers": [
+                    {"id": "t1", "status": "posted", "amount": "60.00", "tenant": "tenant-a"},
+                    {"id": "t2", "status": "posted", "amount": "40.00", "tenant": "tenant-a"},
+                    {"id": "t3", "status": "void", "amount": "999.00", "tenant": "tenant-a"},
+                ],
+            }
+            broken = {**healthy, "transfers": [
+                {"id": "t1", "status": "posted", "amount": "60.00", "tenant": "tenant-a"},
+                {"id": "t2", "status": "posted", "amount": "50.00", "tenant": "tenant-a"},
+                {"id": "t3", "status": "void", "amount": "999.00", "tenant": "tenant-a"},
+            ]}
+            payload = healthy if self.path.startswith("/healthy") else broken if self.path.startswith("/broken") else None
+            if payload is None:
+                self.send_response(404); self.end_headers(); return
+            body = json.dumps(payload).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Projection fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True}, "policy": {"max_requests": 100, "max_requests_per_second": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Tenant auditor", "role": "auditor", "tenant": "tenant-a", "auth_type": "none", "session_status": "ready",
+        })
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Nested transfer campaign", "objective": "Prove posted transfer sums and nested tenant membership",
+        }).json()
+
+        def create_workflow(prefix):
+            return client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+                "name": f"{prefix} transfer ledger", "objective": "Project nested transfer fields without executing expressions",
+                "steps": [
+                    {"name": "Read ledger", "method": "GET", "url": f"{target}/{prefix}/ledger", "actor_role": "auditor"},
+                    {"name": "Read confirmation", "method": "GET", "url": f"{target}/{prefix}/confirmation", "actor_role": "auditor"},
+                ], "invariants": ["Posted transfers conserve total and all entries belong to the active tenant"],
+                "executable_invariants": [
+                    {"name": "Posted transfers sum to total", "kind": "json_filtered_sum_equals", "step": 2, "pointer": "/transfers", "item_pointer": "/amount", "filter_pointer": "/status", "filter_expected": "posted", "other_step": 2, "other_pointer": "/total", "tolerance": 0.001},
+                    {"name": "Transfer ids are unique", "kind": "json_project_unique", "step": 2, "pointer": "/transfers", "item_pointer": "/id"},
+                    {"name": "Every transfer stays in tenant", "kind": "json_all_items_equal", "step": 2, "pointer": "/transfers", "item_pointer": "/tenant", "expected_template": "{{identity_tenant}}"},
+                    {"name": "Posted status exists", "kind": "json_project_contains", "step": 2, "pointer": "/transfers", "item_pointer": "/status", "expected": "posted"},
+                    {"name": "No failed status", "kind": "json_project_not_contains", "step": 2, "pointer": "/transfers", "item_pointer": "/status", "expected": "failed"},
+                    {"name": "At least one void entry is retained", "kind": "json_any_item_equals", "step": 2, "pointer": "/transfers", "item_pointer": "/status", "expected": "void"},
+                ], "risk_class": "read_only",
+            })
+
+        healthy, broken = create_workflow("healthy"), create_workflow("broken")
+        assert healthy.status_code == broken.status_code == 201
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        response = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={"run_id": run_id, "max_tests": 10})
+        assert response.status_code == 200, response.text
+        sequences = {item["workflow_id"]: item for item in response.json()["results"] if item["kind"] == "workflow_sequence"}
+        healthy_result, broken_result = sequences[healthy.json()["id"]], sequences[broken.json()["id"]]
+        assert healthy_result["invariant_failures"] == 0 and "hypothesis_id" not in healthy_result
+        assert broken_result["invariant_failures"] == 1
+        assert broken_result["failed_invariant_kinds"] == ["json_filtered_sum_equals"] and broken_result["hypothesis_id"]
+        with sqlite3.connect(final_core.DB) as db:
+            assert db.execute("SELECT COUNT(*) FROM canonical_findings").fetchone()[0] == 0
+    finally:
+        server.shutdown(); server.server_close()
 
 
 def test_cross_workflow_dependencies_import_transient_values_and_fail_closed(client):

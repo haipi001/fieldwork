@@ -626,6 +626,83 @@ def test_multistep_reversible_transaction_rolls_back_in_reverse_order(client):
         server.shutdown(); server.server_close()
 
 
+def test_cross_workflow_reversible_transaction_uses_global_compensation_stack(client):
+    state = {"order": False, "reservation": False, "job": False}
+    events = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, payload):
+            body = json.dumps(payload, sort_keys=True).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+
+        def do_GET(self):
+            key = self.path.rsplit("/", 1)[-1]
+            self.reply({"exists": state[key]})
+
+        def do_POST(self):
+            key = self.path.rsplit("/", 1)[-1]
+            state[key] = True; events.append(f"create:{key}"); self.reply({"created": key})
+
+        def do_DELETE(self):
+            key = self.path.rsplit("/", 1)[-1]
+            state[key] = False; events.append(f"delete:{key}"); self.reply({"deleted": key})
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Cross workflow fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True, "allow_reversible_state_change": True, "environment_class": "local_fixture"},
+            "policy": {"allow_state_change": True, "max_requests_per_second": 100, "max_requests": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Fixture operator", "role": "operator", "auth_type": "none", "session_status": "ready",
+        })
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Order lifecycle", "objective": "Prove a three-workflow business transaction unwinds globally",
+        }).json()
+        workflow_ids = []
+        for key in ("order", "reservation", "job"):
+            response = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+                "name": f"Create {key}", "objective": f"Create and compensate {key}",
+                "steps": [{
+                    "name": f"Create {key}", "method": "POST", "url": f"{target}/{key}",
+                    "snapshot_url": f"{target}/{key}", "compensation_method": "DELETE",
+                    "compensation_url": f"{target}/{key}", "actor_role": "operator",
+                    "state_before": "absent", "expected_transition": "present then absent", "replay_safe": False,
+                }],
+                "invariants": [f"{key} returns to absent"], "risk_class": "reversible",
+                "depends_on_workflow_ids": workflow_ids[-1:],
+            })
+            assert response.status_code == 201, response.text
+            workflow_ids.append(response.json()["id"])
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        assert len(iteration["tests"]) == 1
+        transaction = iteration["tests"][0]
+        assert transaction["kind"] == "cross_workflow_reversible_transaction"
+        assert transaction["workflow_ids"] == workflow_ids
+        assert transaction["depends_on_workflow_ids"] == []
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        executed = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={
+            "run_id": run_id, "max_tests": 5, "confirm_reversible_state_change": True,
+        })
+        assert executed.status_code == 200, executed.text
+        result = executed.json()["results"][0]
+        assert result["rollback_proven"] is True and result["workflow_ids"] == workflow_ids
+        assert events == ["create:order", "create:reservation", "create:job", "delete:job", "delete:reservation", "delete:order"]
+        assert state == {"order": False, "reservation": False, "job": False}
+        assert [item["source_workflow_id"] for item in result["step_results"]] == list(reversed(workflow_ids))
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def test_rollback_probe_detects_orphan_resource_and_blocks_future_mutations(client):
     state = {"exists": False, "orphan_jobs": 0}
 

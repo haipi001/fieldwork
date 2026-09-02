@@ -2279,14 +2279,26 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
     blocked, declared_variables = [], set(body.import_variables)
     if len(dependencies) != len(body.depends_on_workflow_ids):
         blocked.append({"step": 0, "reason": "duplicate_workflow_dependency"})
-    if dependencies and (body.risk_class != "read_only" or len(body.steps) < 2 or any(step.method not in {"GET", "HEAD", "OPTIONS"} for step in body.steps)):
-        blocked.append({"step": 0, "reason": "cross_workflow_dependency_requires_multistep_read_only_workflow"})
+    read_methods = {"GET", "HEAD", "OPTIONS"}
+    dependent_read_only = body.risk_class == "read_only" and len(body.steps) >= 2 and all(step.method in read_methods for step in body.steps)
+    dependent_reversible = body.risk_class == "reversible" and bool(body.steps) and all(step.method not in read_methods for step in body.steps)
+    if dependencies and not (dependent_read_only or dependent_reversible):
+        blocked.append({"step": 0, "reason": "cross_workflow_dependency_requires_read_only_sequence_or_reversible_dag"})
+    if dependencies and dependent_reversible and body.import_variables:
+        blocked.append({"step": 0, "reason": "reversible_dependency_does_not_support_transient_imports"})
     for dependency_id in dependencies:
         source = existing.get(dependency_id)
         if not source:
             blocked.append({"step": 0, "reason": f"dependency_not_in_campaign:{dependency_id}"})
-        elif source["risk_class"] != "read_only" or len(source["steps"]) < 2 or any(step.get("method") not in {"GET", "HEAD", "OPTIONS"} for step in source["steps"]):
+        elif dependent_read_only and (source["risk_class"] != "read_only" or len(source["steps"]) < 2 or any(step.get("method") not in read_methods for step in source["steps"])):
             blocked.append({"step": 0, "reason": f"dependency_not_read_only_sequence:{dependency_id}"})
+        elif dependent_reversible and (
+            source["risk_class"] != "reversible"
+            or not source["steps"]
+            or any(step.get("method") in read_methods for step in source["steps"])
+            or source.get("import_variables")
+        ):
+            blocked.append({"step": 0, "reason": f"dependency_not_reversible_transaction:{dependency_id}"})
     for local_name, source_ref in body.import_variables.items():
         match = re.fullmatch(r"([^.]+)\.([A-Za-z_][A-Za-z0-9_]{0,63})", source_ref)
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", local_name) or not match:
@@ -2684,7 +2696,73 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
         for workflow_id in ready_ids:
             workflows.append(selected_by_id[workflow_id])
             remaining.remove(workflow_id)
+    # Reversible workflows linked by dependency edges form one frozen business
+    # transaction.  They must not execute (and compensate) independently,
+    # otherwise a downstream action would observe an already-rolled-back parent.
+    read_methods = {"GET", "HEAD", "OPTIONS"}
+    reversible_ids = {
+        item["id"] for item in workflows
+        if item["risk_class"] == "reversible" and item["steps"]
+        and all(step.get("method") not in read_methods for step in item["steps"])
+        and not item.get("import_variables")
+    }
+    adjacency = {workflow_id: set() for workflow_id in reversible_ids}
+    for workflow_id in reversible_ids:
+        for dependency_id in selected_by_id[workflow_id].get("depends_on_workflow_ids", []):
+            if dependency_id in reversible_ids:
+                adjacency[workflow_id].add(dependency_id)
+                adjacency[dependency_id].add(workflow_id)
+    cross_group_by_workflow: dict[str, tuple[str, ...]] = {}
+    seen_groups: set[str] = set()
+    workflow_order = {item["id"]: index for index, item in enumerate(workflows)}
+    for workflow_id in reversible_ids:
+        if workflow_id in seen_groups or not adjacency[workflow_id]:
+            continue
+        component, frontier = set(), [workflow_id]
+        while frontier:
+            current_id = frontier.pop()
+            if current_id in component:
+                continue
+            component.add(current_id)
+            frontier.extend(adjacency[current_id] - component)
+        seen_groups.update(component)
+        ordered_component = tuple(sorted(component, key=workflow_order.get))
+        for member_id in ordered_component:
+            cross_group_by_workflow[member_id] = ordered_component
     for workflow in workflows:
+        cross_group = cross_group_by_workflow.get(workflow["id"])
+        if cross_group:
+            if workflow["id"] != cross_group[-1]:
+                continue
+            transaction_steps, transaction_blocked, assertions = [], [], []
+            global_step = 0
+            for source_workflow_id in cross_group:
+                source_workflow = selected_by_id[source_workflow_id]
+                assertions.extend(f"{source_workflow['name']}: {value}" for value in source_workflow["invariants"])
+                for workflow_step, step in enumerate(source_workflow["steps"], start=1):
+                    global_step += 1
+                    eligible = [item for item in ready if not step.get("actor_role") or item["role"] == step["actor_role"]]
+                    if not eligible:
+                        transaction_blocked.append({"workflow_id": source_workflow_id, "step": workflow_step, "reason": "required_identity_not_ready"})
+                    elif not engagement["scope"].get("allow_reversible_state_change") or not engagement["policy"].get("allow_state_change"):
+                        transaction_blocked.append({"workflow_id": source_workflow_id, "step": workflow_step, "reason": "reversible_state_change_not_in_frozen_scope"})
+                    elif engagement["scope"].get("environment_class") not in {"local_fixture", "ephemeral_test", "staging_clone"}:
+                        transaction_blocked.append({"workflow_id": source_workflow_id, "step": workflow_step, "reason": "state_change_requires_isolated_environment"})
+                    else:
+                        transaction_steps.append({
+                            "step": global_step, "workflow_step": workflow_step,
+                            "source_workflow_id": source_workflow_id,
+                            "identity_id": eligible[0]["id"], **step,
+                        })
+            blocked.extend(transaction_blocked)
+            if not transaction_blocked:
+                matrix.append({
+                    "kind": "cross_workflow_reversible_transaction",
+                    "workflow_id": cross_group[-1], "workflow_ids": list(cross_group),
+                    "internalized_dependency_ids": list(cross_group[:-1]),
+                    "steps": transaction_steps, "assertions": assertions,
+                })
+            continue
         mutating_steps = [(index, step) for index, step in enumerate(workflow["steps"], start=1) if step.get("method") not in {"GET", "HEAD", "OPTIONS"}]
         if len(mutating_steps) > 1:
             transaction_steps, transaction_blocked = [], []
@@ -2790,7 +2868,8 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
     for test in matrix:
         workflow = selected_by_id.get(test.get("workflow_id"))
         if workflow:
-            test["depends_on_workflow_ids"] = workflow.get("depends_on_workflow_ids", [])
+            internalized = set(test.get("internalized_dependency_ids", []))
+            test["depends_on_workflow_ids"] = [item for item in workflow.get("depends_on_workflow_ids", []) if item not in internalized]
             test["import_variables"] = workflow.get("import_variables", {})
     return {"tests": matrix, "blocked": blocked, "identity_count": len(ready), "workflow_count": len(workflows)}
 
@@ -2965,7 +3044,7 @@ def run_due_campaign_schedules(now: str | None = None, campaign_id: str | None =
                 outcome.update(status="planned", iteration_id=iteration["id"], sequence=iteration["sequence"],
                                hypothesis_id=iteration.get("hypothesis_id"), test_count=len(iteration["tests"]))
                 if schedule["execution_mode"] == "read_only_execute":
-                    has_mutation = any(item.get("kind") in {"reversible_transition", "reversible_transaction"} for item in iteration["tests"])
+                    has_mutation = any(item.get("kind") in {"reversible_transition", "reversible_transaction", "cross_workflow_reversible_transaction"} for item in iteration["tests"])
                     if has_mutation:
                         outcome["execution"] = "blocked_reversible_requires_human_confirmation"
                     else:
@@ -3446,13 +3525,14 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": reason,
                             "dependency_workflow_ids": dependencies, "blocked_dependency_ids": missing_dependencies or failed_dependencies})
             continue
-        if kind in {"reversible_transition", "reversible_transaction"} and not body.confirm_reversible_state_change:
+        reversible_kinds = {"reversible_transition", "reversible_transaction", "cross_workflow_reversible_transaction"}
+        if kind in reversible_kinds and not body.confirm_reversible_state_change:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "reversible_state_change_requires_per_execution_confirmation"})
             continue
-        if kind in {"reversible_transition", "reversible_transaction"} and unresolved_state_change:
+        if kind in reversible_kinds and unresolved_state_change:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": f"pending_state_recovery:{unresolved_state_change['id']}:{unresolved_state_change['state']}"})
             continue
-        if test.get("method") and test.get("method") not in {"GET", "HEAD", "OPTIONS"} and kind not in {"reversible_transition", "reversible_transaction"}:
+        if test.get("method") and test.get("method") not in {"GET", "HEAD", "OPTIONS"} and kind not in reversible_kinds:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "state_change_not_enabled_for_campaign_executor"})
             continue
         try:
@@ -3598,7 +3678,7 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 if suspicious:
                     result["hypothesis_id"] = _campaign_hypothesis(campaign_id, workflow_id, "cross_identity_sequence_access", "跨身份重放在携带源身份对象变量时仍获得成功响应，需要独立确认是否越权", [observation["id"]], "对源对象执行两轮非所有者重放并加入拒绝型负对照")
                 results.append(result)
-            elif kind == "reversible_transaction":
+            elif kind in {"reversible_transaction", "cross_workflow_reversible_transaction"}:
                 transaction_entries, exchanges, primary_error = [], [], None
                 # Capture every baseline before the first mutation. This makes the
                 # rollback target explicit and prevents a half-observed transaction.
@@ -3614,7 +3694,8 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                            snapshot_exchange_id,mutation_exchange_id,after_exchange_id,compensation_exchange_id,
                            rollback_exchange_id,error,created_at,updated_at,rollback_probe_baselines)
                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-                            journal_id, engagement["id"], campaign_id, iteration_id, body.run_id, workflow_id,
+                            journal_id, engagement["id"], campaign_id, iteration_id, body.run_id,
+                            step.get("source_workflow_id", workflow_id),
                             int(step["step"]), step["identity_id"], "snapshot_captured", snapshot["id"], None, None,
                             None, None, None, journal_time, journal_time, dump(probe_baselines),
                         ))
@@ -3627,10 +3708,14 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                         entry["attempted"] = True
                         mutation = request({**step, "kind": kind})
                         exchanges.append(mutation)
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET mutation_exchange_id=?,updated_at=? WHERE id=?", (mutation["id"], utcnow(), journal_id))
+                        if mutation["response_status"] >= 400:
+                            raise HTTPException(409, f"mutation_http_status:{mutation['response_status']}")
                         after = request({"kind": kind, "url": step["snapshot_url"], "method": "GET", "identity_id": step["identity_id"]})
                         exchanges.append(after)
                         with connect() as db:
-                            db.execute("UPDATE state_change_journal SET mutation_exchange_id=?,after_exchange_id=?,updated_at=? WHERE id=?", (mutation["id"], after["id"], utcnow(), journal_id))
+                            db.execute("UPDATE state_change_journal SET after_exchange_id=?,updated_at=? WHERE id=?", (after["id"], utcnow(), journal_id))
                     except HTTPException as error:
                         primary_error = f"step_{step['step']}:{error.detail}"
                         break
@@ -3642,7 +3727,11 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                     if not entry["attempted"]:
                         with connect() as db:
                             db.execute("UPDATE state_change_journal SET state='cancelled',updated_at=? WHERE id=?", (utcnow(), journal_id))
-                        rollback_details.append({"step": step["step"], "state": "cancelled", "rollback_proven": True})
+                        rollback_details.append({
+                            "step": step["step"], "workflow_step": step.get("workflow_step", step["step"]),
+                            "source_workflow_id": step.get("source_workflow_id", workflow_id),
+                            "state": "cancelled", "rollback_proven": True,
+                        })
                         continue
                     compensation_error, restored = None, None
                     try:
@@ -3650,10 +3739,14 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                             db.execute("UPDATE state_change_journal SET state='compensation_attempted',updated_at=? WHERE id=?", (utcnow(), journal_id))
                         compensation = request({**step, "kind": kind, "url": step["compensation_url"], "method": step["compensation_method"], "body": step.get("compensation_body")})
                         exchanges.append(compensation)
+                        with connect() as db:
+                            db.execute("UPDATE state_change_journal SET compensation_exchange_id=?,updated_at=? WHERE id=?", (compensation["id"], utcnow(), journal_id))
+                        if compensation["response_status"] >= 400:
+                            raise HTTPException(409, f"compensation_http_status:{compensation['response_status']}")
                         restored = request({"kind": kind, "url": step["snapshot_url"], "method": "GET", "identity_id": step["identity_id"]})
                         exchanges.append(restored)
                         with connect() as db:
-                            db.execute("UPDATE state_change_journal SET compensation_exchange_id=?,rollback_exchange_id=?,updated_at=? WHERE id=?", (compensation["id"], restored["id"], utcnow(), journal_id))
+                            db.execute("UPDATE state_change_journal SET rollback_exchange_id=?,updated_at=? WHERE id=?", (restored["id"], utcnow(), journal_id))
                     except HTTPException as error:
                         compensation_error = str(error.detail)
                     probe_results, probe_exchanges, probes_restored = verify_rollback_probes({**step, "kind": kind}, entry["probe_baselines"])
@@ -3665,18 +3758,21 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                         db.execute("UPDATE state_change_journal SET state=?,error=?,updated_at=? WHERE id=?", (
                             "restored" if step_restored else "rollback_failed", compensation_error or (None if step_restored else "rollback_probe_or_snapshot_mismatch"), utcnow(), journal_id,
                         ))
-                    rollback_details.append({"step": step["step"], "state": "restored" if step_restored else "rollback_failed", "rollback_proven": step_restored,
+                    rollback_details.append({"step": step["step"], "workflow_step": step.get("workflow_step", step["step"]),
+                                             "source_workflow_id": step.get("source_workflow_id", workflow_id),
+                                             "state": "restored" if step_restored else "rollback_failed", "rollback_proven": step_restored,
                                              "snapshot_restored": snapshot_restored, "rollback_probe_results": probe_results})
                 summary = f"多步骤可逆事务执行 {sum(item['attempted'] for item in transaction_entries)} 个动作；按逆序补偿，{sum(item['rollback_proven'] for item in rollback_details)}/{len(rollback_details)} 个基线闭合"
                 if primary_error:
                     summary += f"；主流程异常：{primary_error}"
                 observation = record_observation(body.run_id, ObservationInput(
-                    observation_type="business_logic.reversible_transaction", subject=f"workflow:{workflow_id}",
+                    observation_type=f"business_logic.{kind}", subject=f"workflow:{workflow_id}",
                     summary=summary, source_capability="campaign-logic-runner", confidence=.92 if rollback_proven else .99,
                     raw_ref=":".join(item["id"] for item in exchanges),
                 ))
                 observation_ids.append(observation["id"])
                 result = {"kind": kind, "workflow_id": workflow_id, "status": "observed" if rollback_proven and not primary_error else ("degraded" if rollback_proven else "rollback_failed"),
+                          "workflow_ids": test.get("workflow_ids", [workflow_id]),
                           "rollback_proven": rollback_proven, "rollback_order": [item["step"] for item in rollback_details],
                           "step_results": rollback_details, "journal_ids": [item["journal_id"] for item in transaction_entries],
                           "exchange_ids": [item["id"] for item in exchanges], "observation_id": observation["id"], "primary_error": primary_error}
@@ -3870,6 +3966,18 @@ def recover_state_change(journal_id: str, body: StateChangeRecoveryInput):
         transaction = next((item for item in plan.get("tests", []) if item.get("kind") == "reversible_transaction" and item.get("workflow_id") == journal["workflow_id"]), None)
         if transaction:
             test = next((step for step in transaction.get("steps", []) if int(step.get("step", 0)) == journal["step_number"]), None)
+    if not test:
+        transaction = next((
+            item for item in plan.get("tests", [])
+            if item.get("kind") == "cross_workflow_reversible_transaction"
+            and journal["workflow_id"] in item.get("workflow_ids", [])
+        ), None)
+        if transaction:
+            test = next((
+                step for step in transaction.get("steps", [])
+                if step.get("source_workflow_id") == journal["workflow_id"]
+                and int(step.get("step", 0)) == journal["step_number"]
+            ), None)
     if not test:
         raise HTTPException(409, "无法从冻结研究计划恢复补偿定义")
     baseline = traditional_runtime._get_exchange(journal["snapshot_exchange_id"])

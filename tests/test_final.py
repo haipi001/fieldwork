@@ -703,6 +703,111 @@ def test_complex_invariant_declarations_fail_closed(client):
     assert {"numeric_comparison_requires_operator", "collection_membership_requires_expected_value", "numeric_delta_requires_other_step_and_pointer", "numeric_delta_requires_expected_value"} <= reasons
 
 
+def test_cross_workflow_dependencies_import_transient_values_and_fail_closed(client):
+    state = {"good_dependent_hits": 0, "blocked_dependent_hits": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            routes = {
+                "/good/session": {"case_id": "case-42", "ready": True},
+                "/good/context": {"ready": True},
+                "/good/cases/case-42": {"id": "case-42", "owner": "tenant-a"},
+                "/good/proof": {"ok": True},
+                "/bad/session": {"case_id": "case-secret", "ready": False},
+                "/bad/context": {"ready": False},
+                "/bad/cases/case-secret": {"id": "case-secret"},
+                "/bad/proof": {"ok": True},
+            }
+            payload = routes.get(self.path)
+            if payload is None:
+                self.send_response(404); self.end_headers(); return
+            if self.path == "/good/cases/case-42": state["good_dependent_hits"] += 1
+            if self.path == "/bad/cases/case-secret": state["blocked_dependent_hits"] += 1
+            body = json.dumps(payload).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Cross workflow fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True}, "policy": {"max_requests": 100, "max_requests_per_second": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Tenant A", "role": "user", "tenant": "tenant-a", "auth_type": "none", "session_status": "ready",
+        })
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Cross workflow campaign", "objective": "Carry transient case context only after prerequisite invariants pass",
+        }).json()
+
+        def create_source(prefix, expected_ready):
+            return client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+                "name": f"{prefix} discovery", "objective": "Discover a transient case id and establish prerequisite state",
+                "steps": [
+                    {"name": "Session", "method": "GET", "url": f"{target}/{prefix}/session", "actor_role": "user", "extract": {"case_id": "/case_id"}},
+                    {"name": "Context", "method": "GET", "url": f"{target}/{prefix}/context", "actor_role": "user"},
+                ], "invariants": ["The prerequisite context is ready"],
+                "executable_invariants": [{"name": "Context ready", "kind": "json_equals", "step": 2, "pointer": "/ready", "expected": expected_ready}],
+                "risk_class": "read_only",
+            })
+
+        good_source = create_source("good", True)
+        bad_source = create_source("bad", True)
+        assert good_source.status_code == bad_source.status_code == 201
+
+        def create_dependent(prefix, source_id):
+            return client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+                "name": f"{prefix} dependent", "objective": "Use a prerequisite case id without persisting its raw value",
+                "depends_on_workflow_ids": [source_id], "import_variables": {"upstream_case_id": f"{source_id}.case_id"},
+                "steps": [
+                    {"name": "Read imported case", "method": "GET", "url": f"{target}/{prefix}/cases/{{{{upstream_case_id}}}}", "actor_role": "user"},
+                    {"name": "Read proof", "method": "GET", "url": f"{target}/{prefix}/proof", "actor_role": "user"},
+                ], "invariants": ["Imported case is reachable only after prerequisite success"],
+                "executable_invariants": [{"name": "Imported id matches", "kind": "json_equals", "step": 1, "pointer": "/id", "expected_template": "{{upstream_case_id}}"}],
+                "risk_class": "read_only",
+            })
+
+        good_dependent = create_dependent("good", good_source.json()["id"])
+        bad_dependent = create_dependent("bad", bad_source.json()["id"])
+        assert good_dependent.status_code == bad_dependent.status_code == 201
+        invalid_import = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Invalid import", "objective": "Must fail before planning when an upstream variable was never exported",
+            "depends_on_workflow_ids": [good_source.json()["id"]],
+            "import_variables": {"missing": f"{good_source.json()['id']}.not_exported"},
+            "steps": [
+                {"name": "Read", "method": "GET", "url": f"{target}/good/cases/{{{{missing}}}}"},
+                {"name": "Proof", "method": "GET", "url": f"{target}/good/proof"},
+            ], "invariants": ["Imports must be declared by the upstream workflow"], "risk_class": "read_only",
+        })
+        assert invalid_import.status_code == 409
+        assert any(item["reason"].startswith("imported_variable_not_exported") for item in invalid_import.json()["detail"]["blocked_steps"])
+        iteration = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/plan").json()
+        sequence_order = [item["workflow_id"] for item in iteration["tests"] if item["kind"] == "workflow_sequence"]
+        assert sequence_order.index(good_source.json()["id"]) < sequence_order.index(good_dependent.json()["id"])
+        assert sequence_order.index(bad_source.json()["id"]) < sequence_order.index(bad_dependent.json()["id"])
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        response = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={"run_id": run_id, "max_tests": 20})
+        assert response.status_code == 200, response.text
+        results = response.json()["results"]
+        good = next(item for item in results if item["kind"] == "workflow_sequence" and item["workflow_id"] == good_dependent.json()["id"])
+        blocked = next(item for item in results if item["kind"] == "workflow_sequence" and item["workflow_id"] == bad_dependent.json()["id"])
+        assert good["invariant_failures"] == 0 and good["imported_variables"] == ["upstream_case_id"]
+        assert good["dependency_workflow_ids"] == [good_source.json()["id"]]
+        assert blocked["status"] == "blocked" and blocked["reason"] == "workflow_dependency_invariants_failed"
+        assert state == {"good_dependent_hits": 1, "blocked_dependent_hits": 0}
+        serialized = json.dumps(results)
+        assert "case-secret" not in serialized and "case-42" not in serialized
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def test_branch_and_loop_declarations_fail_closed(client):
     engagement = create_ready(client, target="https://branch-guard.test")
     campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={

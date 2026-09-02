@@ -40,6 +40,7 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - 流程步骤可显式声明 `requires_steps`，系统用逆序扰动检查前置条件绕过。只读步骤还可声明 `concurrency_safe`，但只有冻结 Scope 显式允许、环境属于本地夹具/临时测试/脱敏克隆时才会执行 2–5 路有界并发。顺序或响应分歧只产生待复验 Hypothesis，不直接生成 Finding。
 - 声明式多步流程支持基于前序标量提取变量的条件分支，以及最多 5 次的只读有界轮询。未命中的分支明确记为 `SKIPPED / NOT APPLICABLE`；轮询未收敛会建立长期待证明假设，不会被解释为安全，也不允许脚本或变更型循环。
 - 机器不变量可证明数值边界、跨步骤数值增量、列表金额求和、集合成员存在/禁止、集合唯一性和集合数量边界。数值使用十进制计算和显式容差，不执行用户表达式；断言失败只建立可定向复测的 Hypothesis。
+- Campaign 流程可声明同项目上游依赖并导入其显式提取变量。规划器按依赖图排序；只有上游多步只读流程的机器不变量全部通过，下游才会执行。原始导入值只在本轮内存存在，Evidence 仅保存变量名和 SHA-256；上游失败或变量缺失时下游失败关闭。
 - 含多个可逆动作的隔离流程作为一个事务测试执行：先捕获全部基线，动作正序执行，补偿严格逆序执行，每个动作使用独立持久化 Journal 和回滚哈希证明。任一回滚失败会保留恢复入口并阻断后续状态测试。
 - 任务中心和 Coverage Ledger 提供分区清理：只隐藏已结束任务或当前覆盖列表，活动任务、Observation、Evidence、Finding 和报告保留。
 - `benchmarks/logic-v2.json` 将复杂业务逻辑验收固定为版本化门禁：同时评分跨租户动态对象、声明前置步骤绕过、金额守恒破坏、稳定并发负对照、健康账本负对照和 Finding 证据门禁。`python benchmarking.py captured-results.json` 可对导出的 Campaign `results` 重复评分；v1 清单继续保留用于历史可比性。

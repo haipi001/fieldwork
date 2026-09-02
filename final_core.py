@@ -242,7 +242,9 @@ def init_final_db() -> None:
               name TEXT NOT NULL, objective TEXT NOT NULL, preconditions TEXT NOT NULL,
               steps TEXT NOT NULL, invariants TEXT NOT NULL, risk_class TEXT NOT NULL,
               status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-              executable_invariants TEXT NOT NULL DEFAULT '[]'
+              executable_invariants TEXT NOT NULL DEFAULT '[]',
+              depends_on_workflow_ids TEXT NOT NULL DEFAULT '[]',
+              import_variables TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS research_hypotheses (
               id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, workflow_id TEXT,
@@ -292,6 +294,10 @@ def init_final_db() -> None:
         workflow_columns = {row["name"] for row in db.execute("PRAGMA table_info(business_workflows)")}
         if "executable_invariants" not in workflow_columns:
             db.execute("ALTER TABLE business_workflows ADD COLUMN executable_invariants TEXT NOT NULL DEFAULT '[]'")
+        if "depends_on_workflow_ids" not in workflow_columns:
+            db.execute("ALTER TABLE business_workflows ADD COLUMN depends_on_workflow_ids TEXT NOT NULL DEFAULT '[]'")
+        if "import_variables" not in workflow_columns:
+            db.execute("ALTER TABLE business_workflows ADD COLUMN import_variables TEXT NOT NULL DEFAULT '{}'")
         migrate_legacy_findings(db)
         # A process restart never leaves a v1 run looking live. Checkpoints stay
         # intact and an explicit Resume continues from the first missing stage.
@@ -513,6 +519,8 @@ class BusinessWorkflowInput(BaseModel):
     steps: list[WorkflowStepInput] = Field(min_length=1, max_length=100)
     invariants: list[str] = Field(min_length=1, max_length=100)
     executable_invariants: list[ExecutableInvariantInput] = Field(default_factory=list, max_length=100)
+    depends_on_workflow_ids: list[str] = Field(default_factory=list, max_length=20)
+    import_variables: dict[str, str] = Field(default_factory=dict, max_length=20)
     risk_class: Literal["read_only", "reversible", "state_changing"] = "read_only"
 
 
@@ -2142,8 +2150,9 @@ def get_research_campaign(campaign_id: str):
     if not row:
         raise HTTPException(404, "Research Campaign 不存在")
     for workflow in workflows:
-        for key in ("preconditions", "steps", "invariants", "executable_invariants"):
+        for key in ("preconditions", "steps", "invariants", "executable_invariants", "depends_on_workflow_ids"):
             workflow[key] = load(workflow[key], [])
+        workflow["import_variables"] = load(workflow.get("import_variables"), {})
     for hypothesis in hypotheses:
         hypothesis["evidence_ids"] = load(hypothesis["evidence_ids"], [])
         hypothesis["counterevidence_ids"] = load(hypothesis["counterevidence_ids"], [])
@@ -2165,7 +2174,31 @@ def get_research_campaign(campaign_id: str):
 def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
     campaign = get_research_campaign(campaign_id)
     engagement = get_engagement(campaign["engagement_id"])
-    blocked, declared_variables = [], set()
+    existing = {item["id"]: item for item in campaign["workflows"]}
+    dependencies = list(dict.fromkeys(body.depends_on_workflow_ids))
+    blocked, declared_variables = [], set(body.import_variables)
+    if len(dependencies) != len(body.depends_on_workflow_ids):
+        blocked.append({"step": 0, "reason": "duplicate_workflow_dependency"})
+    if dependencies and (body.risk_class != "read_only" or len(body.steps) < 2 or any(step.method not in {"GET", "HEAD", "OPTIONS"} for step in body.steps)):
+        blocked.append({"step": 0, "reason": "cross_workflow_dependency_requires_multistep_read_only_workflow"})
+    for dependency_id in dependencies:
+        source = existing.get(dependency_id)
+        if not source:
+            blocked.append({"step": 0, "reason": f"dependency_not_in_campaign:{dependency_id}"})
+        elif source["risk_class"] != "read_only" or len(source["steps"]) < 2 or any(step.get("method") not in {"GET", "HEAD", "OPTIONS"} for step in source["steps"]):
+            blocked.append({"step": 0, "reason": f"dependency_not_read_only_sequence:{dependency_id}"})
+    for local_name, source_ref in body.import_variables.items():
+        match = re.fullmatch(r"([^.]+)\.([A-Za-z_][A-Za-z0-9_]{0,63})", source_ref)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", local_name) or not match:
+            blocked.append({"step": 0, "reason": "invalid_cross_workflow_import"})
+            continue
+        source_id, source_variable = match.groups()
+        source = existing.get(source_id)
+        exported = {name for step in source["steps"] for name in step.get("extract", {})} if source else set()
+        if source_id not in dependencies:
+            blocked.append({"step": 0, "reason": f"import_source_must_be_declared_dependency:{source_id}"})
+        elif source_variable not in exported:
+            blocked.append({"step": 0, "reason": f"imported_variable_not_exported:{source_id}.{source_variable}"})
     for index, step in enumerate(body.steps):
         if any(required < 1 or required >= index + 1 for required in step.requires_steps):
             blocked.append({"step": index + 1, "reason": "requires_steps_must_reference_earlier_steps"})
@@ -2243,11 +2276,12 @@ def create_business_workflow(campaign_id: str, body: BusinessWorkflowInput):
     workflow_id, timestamp = uid("workflow"), utcnow()
     with connect() as db:
         db.execute("""INSERT INTO business_workflows
-          (id,campaign_id,engagement_id,name,objective,preconditions,steps,invariants,risk_class,status,created_at,updated_at,executable_invariants)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+          (id,campaign_id,engagement_id,name,objective,preconditions,steps,invariants,risk_class,status,created_at,updated_at,executable_invariants,depends_on_workflow_ids,import_variables)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             workflow_id, campaign_id, engagement["id"], body.name.strip(), body.objective.strip(),
             dump(body.preconditions), dump([step.model_dump() for step in body.steps]), dump(body.invariants),
             body.risk_class, "active", timestamp, timestamp, dump([item.model_dump() for item in body.executable_invariants]),
+            dump(dependencies), dump(body.import_variables),
         ))
         db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
     return {"id": workflow_id, "campaign_id": campaign_id, **body.model_dump(), "status": "active"}
@@ -2515,7 +2549,27 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
     engagement = get_engagement(campaign["engagement_id"])
     ready = [item for item in list_identities(engagement["id"]) if item["session_status"] == "ready"]
     matrix, blocked = [], []
-    workflows = [item for item in campaign["workflows"] if not workflow_ids or item["id"] in workflow_ids]
+    requested = set(workflow_ids or [])
+    if requested:
+        all_by_id = {item["id"]: item for item in campaign["workflows"]}
+        frontier = list(requested)
+        while frontier:
+            current_id = frontier.pop()
+            for dependency_id in all_by_id.get(current_id, {}).get("depends_on_workflow_ids", []):
+                if dependency_id not in requested:
+                    requested.add(dependency_id)
+                    frontier.append(dependency_id)
+    selected = [item for item in campaign["workflows"] if not requested or item["id"] in requested]
+    selected_by_id = {item["id"]: item for item in selected}
+    workflows, remaining = [], set(selected_by_id)
+    while remaining:
+        ready_ids = sorted(workflow_id for workflow_id in remaining if not (set(selected_by_id[workflow_id].get("depends_on_workflow_ids", [])) & remaining))
+        if not ready_ids:
+            blocked.append({"workflow_id": "campaign", "step": 0, "reason": "workflow_dependency_cycle"})
+            break
+        for workflow_id in ready_ids:
+            workflows.append(selected_by_id[workflow_id])
+            remaining.remove(workflow_id)
     for workflow in workflows:
         mutating_steps = [(index, step) for index, step in enumerate(workflow["steps"], start=1) if step.get("method") not in {"GET", "HEAD", "OPTIONS"}]
         if len(mutating_steps) > 1:
@@ -2619,6 +2673,11 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
                 matrix.append({"kind": "duplicate_replay", "workflow_id": workflow["id"], "step": step_index + 1, "identity_id": eligible[0]["id"], "method": step["method"], "url": step["url"], "assertions": workflow["invariants"]})
         if len(workflow["steps"]) > 1:
             matrix.append({"kind": "sequence_violation", "workflow_id": workflow["id"], "sequence": list(reversed(range(1, len(workflow["steps"]) + 1))), "assertions": workflow["invariants"]})
+    for test in matrix:
+        workflow = selected_by_id.get(test.get("workflow_id"))
+        if workflow:
+            test["depends_on_workflow_ids"] = workflow.get("depends_on_workflow_ids", [])
+            test["import_variables"] = workflow.get("import_variables", {})
     return {"tests": matrix, "blocked": blocked, "identity_count": len(ready), "workflow_count": len(workflows)}
 
 
@@ -2849,6 +2908,8 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
         if plan.get("hypothesis_id"):
             db.execute("UPDATE research_hypotheses SET status='testing',updated_at=? WHERE id=? AND campaign_id=?", (timestamp, plan["hypothesis_id"], campaign_id))
     results, observation_ids = [], []
+    workflow_outcomes: dict[str, dict[str, Any]] = {}
+    workflow_exports: dict[str, dict[str, Any]] = {}
     engagement = get_engagement(campaign["engagement_id"])
     delay = 1 / max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
     with connect() as db:
@@ -2860,6 +2921,15 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             url=test["url"], method=test.get("method", "GET"), headers={}, body=test.get("body"),
             identity_id=test.get(identity_key),
         ), f"campaign:{campaign_id}:{test['kind']}", include_transient=include_transient)
+
+    def imported_variables(test: dict) -> dict[str, Any]:
+        imported: dict[str, Any] = {}
+        for local_name, source_ref in test.get("import_variables", {}).items():
+            source_id, source_name = source_ref.rsplit(".", 1)
+            if source_name not in workflow_exports.get(source_id, {}):
+                raise HTTPException(409, f"cross_workflow_variable_unavailable:{source_ref}")
+            imported[local_name] = workflow_exports[source_id][source_name]
+        return imported
 
     def run_sequence(test: dict, actor_identity_ids: dict[str, str], default_identity_id: str, initial_variables: dict[str, Any] | None = None, freeze_extractions: bool = False, step_order: list[int] | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, str], dict[str, Any]]:
         variables, sequence_steps, exchange_ids, extraction_hashes = dict(initial_variables or {}), [], [], {}
@@ -2923,6 +2993,14 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
 
     for test in tests:
         kind, workflow_id = test.get("kind"), test.get("workflow_id")
+        dependencies = test.get("depends_on_workflow_ids", [])
+        missing_dependencies = [item for item in dependencies if item not in workflow_outcomes]
+        failed_dependencies = [item for item in dependencies if workflow_outcomes.get(item, {}).get("status") != "passed"]
+        if missing_dependencies or failed_dependencies:
+            reason = "workflow_dependency_not_executed" if missing_dependencies else "workflow_dependency_invariants_failed"
+            results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": reason,
+                            "dependency_workflow_ids": dependencies, "blocked_dependency_ids": missing_dependencies or failed_dependencies})
+            continue
         if kind in {"reversible_transition", "reversible_transaction"} and not body.confirm_reversible_state_change:
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": "reversible_state_change_requires_per_execution_confirmation"})
             continue
@@ -2934,7 +3012,9 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             continue
         try:
             if kind == "workflow_sequence":
-                sequence_steps, exchange_ids, extraction_hashes, variables = run_sequence(test, test.get("actor_identity_ids", {}), test["default_identity_id"])
+                imported = imported_variables(test)
+                import_hashes = {key: hashlib.sha256(str(value).encode()).hexdigest() for key, value in imported.items()}
+                sequence_steps, exchange_ids, extraction_hashes, variables = run_sequence(test, test.get("actor_identity_ids", {}), test["default_identity_id"], imported)
                 invariant_results = _evaluate_workflow_invariants(test.get("executable_invariants", []), sequence_steps, variables)
                 failed = [item for item in invariant_results if not item["passed"]]
                 skipped = [item for item in sequence_steps if item.get("skipped")]
@@ -2952,13 +3032,15 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                         uid("evidence"), observation["id"], body.run_id, "workflow_invariant_result",
                         dump({"workflow_id": workflow_id, "steps": len(sequence_steps), "invariants": invariant_results,
                               "control_flow": [{"step": item["step"], "skipped": item.get("skipped", False), "attempts": item.get("attempts", 0), "until_satisfied": item.get("until_satisfied")} for item in sequence_steps],
-                              "extracted_variable_hashes": extraction_hashes}),
+                              "extracted_variable_hashes": extraction_hashes, "imported_variable_hashes": import_hashes,
+                              "dependency_workflow_ids": dependencies}),
                         None, "supporting" if failed or exhausted else "neutral", utcnow(),
                     ))
                 result = {"kind": kind, "workflow_id": workflow_id, "status": "observed", "exchange_ids": exchange_ids,
                           "observation_id": observation["id"], "invariants": invariant_results,
                           "invariant_failures": len(failed), "failed_invariant_kinds": sorted({item["kind"] for item in failed}),
                           "extracted_variables": sorted(extraction_hashes), "extracted_value_hashes": extraction_hashes,
+                          "imported_variables": sorted(import_hashes), "imported_value_hashes": import_hashes,
                           "control_flow": [{"step": item["step"], "skipped": item.get("skipped", False), "condition": item.get("condition"), "attempts": item.get("attempts", 0), "until_satisfied": item.get("until_satisfied")} for item in sequence_steps]}
                 hypothesis_ids = []
                 if failed:
@@ -2967,10 +3049,13 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                     hypothesis_ids.append(_campaign_hypothesis(campaign_id, workflow_id, "bounded_loop_nonconvergence", f"{len(exhausted)} 个只读轮询步骤在声明的有界次数内未收敛", [observation["id"]], "使用新 Run 重复轮询并核对服务端状态机和延迟预算"))
                 if hypothesis_ids:
                     result["hypothesis_id"], result["hypothesis_ids"] = hypothesis_ids[0], hypothesis_ids
+                workflow_exports[workflow_id] = {key: value for key, value in variables.items() if key not in {"identity_role", "identity_tenant"}}
+                workflow_outcomes[workflow_id] = {"status": "passed" if not failed and not exhausted else "failed", "observation_id": observation["id"]}
+                result["dependency_workflow_ids"] = dependencies
                 results.append(result)
             elif kind == "sequence_violation":
                 baseline_steps, baseline_ids, baseline_hashes, baseline_variables = run_sequence(
-                    test, test.get("actor_identity_ids", {}), test["default_identity_id"],
+                    test, test.get("actor_identity_ids", {}), test["default_identity_id"], imported_variables(test),
                 )
                 carried = {key: value for key, value in baseline_variables.items() if key not in {"identity_role", "identity_tenant"}}
                 perturbed_steps, perturbed_ids, _, _ = run_sequence(
@@ -3006,7 +3091,7 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 results.append(result)
             elif kind == "concurrent_step":
                 baseline_steps, baseline_ids, baseline_hashes, baseline_variables = run_sequence(
-                    test, test.get("actor_identity_ids", {}), test["default_identity_id"],
+                    test, test.get("actor_identity_ids", {}), test["default_identity_id"], imported_variables(test),
                 )
                 step = test["steps"][int(test["target_step"]) - 1]
                 identity_id = test.get("actor_identity_ids", {}).get(step.get("actor_role")) or test["default_identity_id"]
@@ -3036,7 +3121,7 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
                 results.append(result)
             elif kind == "cross_identity_sequence":
                 source_steps, source_ids, source_hashes, source_variables = run_sequence(
-                    test, test.get("source_actor_identity_ids", {}), test["source_default_identity_id"],
+                    test, test.get("source_actor_identity_ids", {}), test["source_default_identity_id"], imported_variables(test),
                 )
                 carried = {key: value for key, value in source_variables.items() if key not in {"identity_role", "identity_tenant"}}
                 replay_steps, replay_ids, replay_hashes, replay_variables = run_sequence(

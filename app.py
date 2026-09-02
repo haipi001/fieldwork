@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import sqlite3
 import socket
@@ -21,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from final_core import init_final_db, router as final_router
+from final_core import init_final_db, mark_campaign_scheduler, router as final_router, run_due_campaign_schedules
 from web3_lab import router as web3_router, shutdown_labs
 from web3_analysis import router as web3_analysis_router
 from traditional_runtime import router as traditional_router
@@ -171,8 +172,31 @@ async def lifespan(_: FastAPI):
     init_db()
     init_final_db()
     finalize_database_version(DB)
-    yield
-    shutdown_labs()
+    scheduler_task = None
+    if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER") != "1":
+        async def scheduler_loop():
+            mark_campaign_scheduler(running=True, last_error=None)
+            while True:
+                try:
+                    processed = await asyncio.to_thread(run_due_campaign_schedules)
+                    mark_campaign_scheduler(last_tick_at=now(), last_processed=len(processed), last_error=None)
+                except Exception as error:
+                    # Individual schedule failures are persisted by the scheduler.
+                    # A database/startup race must not permanently kill the loop.
+                    mark_campaign_scheduler(last_tick_at=now(), last_processed=0, last_error=type(error).__name__)
+                await asyncio.sleep(30)
+        scheduler_task = asyncio.create_task(scheduler_loop())
+    try:
+        yield
+    finally:
+        if scheduler_task:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except asyncio.CancelledError:
+                pass
+            mark_campaign_scheduler(running=False)
+        shutdown_labs()
 
 
 app = FastAPI(title="Security Research OS", version=APP_VERSION, lifespan=lifespan)

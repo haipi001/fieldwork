@@ -218,6 +218,136 @@ def test_long_running_business_logic_campaign_builds_memory_and_test_matrix(clie
     assert detail["hypotheses"][0]["status"] == "open_proof_gap"
 
 
+def test_campaign_schedule_persists_prioritizes_hypotheses_and_claims_once(client):
+    from concurrent.futures import ThreadPoolExecutor
+
+    engagement = create_ready(client, target="https://schedule.test")
+    client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+        "label": "Scheduled reader", "role": "user", "tenant": "tenant-a",
+        "auth_type": "none", "session_status": "ready",
+    })
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Persistent scheduler", "objective": "Continue prioritized business logic research after application restarts",
+        "max_iterations": 20,
+    }).json()
+    workflows = []
+    for suffix in ("high", "low"):
+        workflow = client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": f"Read {suffix} object", "objective": f"Compare authorization for {suffix} priority object",
+            "steps": [{"name": "Read", "method": "GET", "url": f"https://schedule.test/api/{suffix}", "actor_role": "user"}],
+            "invariants": ["Cross-tenant access must be rejected"], "risk_class": "read_only",
+        })
+        assert workflow.status_code == 201, workflow.text
+        workflows.append(workflow.json()["id"])
+    low = client.post(f"/api/v1/campaigns/{campaign['id']}/hypotheses", json={
+        "workflow_id": workflows[1], "category": "authorization", "statement": "Low priority object may cross tenant boundary",
+        "priority": 20, "next_action": "Retest after high priority hypotheses",
+    }).json()
+    high = client.post(f"/api/v1/campaigns/{campaign['id']}/hypotheses", json={
+        "workflow_id": workflows[0], "category": "authorization", "statement": "High priority object may cross tenant boundary",
+        "priority": 95, "next_action": "Retest first",
+    }).json()
+    configured = client.put(f"/api/v1/campaigns/{campaign['id']}/schedule", json={
+        "cadence_minutes": 15, "execution_mode": "plan_only", "start_immediately": True,
+    })
+    assert configured.status_code == 200 and configured.json()["enabled"] is True
+    first = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now")
+    assert first.status_code == 200 and first.json()["status"] == "planned"
+    assert first.json()["hypothesis_id"] == high["id"]
+    detail = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
+    assert detail["iterations"][0]["plan"]["strategy"] == "scheduled_directed_retest"
+    assert detail["schedule"]["last_planned_at"] and "lease_token" not in detail["schedule"]
+
+    paused = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/pause")
+    assert paused.status_code == 200 and paused.json()["enabled"] is False
+    assert client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now").status_code == 409
+    # Simulate completion and process restart. The durable schedule and next
+    # lower-priority hypothesis must survive, while two workers claim it once.
+    with sqlite3.connect(final_core.DB) as db:
+        db.execute("UPDATE campaign_iterations SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), first.json()["iteration_id"]))
+        db.execute("UPDATE research_campaigns SET iterations_completed=iterations_completed+1 WHERE id=?", (campaign["id"],))
+    final_core.init_final_db()
+    resumed = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/resume")
+    assert resumed.status_code == 200 and resumed.json()["enabled"] is True
+    now = final_core.utcnow()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _: final_core.run_due_campaign_schedules(now, campaign["id"], 1), range(2)))
+    claimed = [item for batch in outcomes for item in batch]
+    assert len(claimed) == 1 and claimed[0]["status"] == "planned"
+    assert claimed[0]["hypothesis_id"] == low["id"]
+    with sqlite3.connect(final_core.DB) as db:
+        assert db.execute("SELECT COUNT(*) FROM campaign_iterations WHERE campaign_id=?", (campaign["id"],)).fetchone()[0] == 2
+        second_id = db.execute("SELECT id FROM campaign_iterations WHERE campaign_id=? ORDER BY sequence DESC LIMIT 1", (campaign["id"],)).fetchone()[0]
+        db.execute("UPDATE campaign_iterations SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), second_id))
+        db.execute("UPDATE research_campaigns SET iterations_completed=2,max_iterations=2 WHERE id=?", (campaign["id"],))
+        db.execute("UPDATE campaign_schedules SET next_run_at=? WHERE campaign_id=?", (now, campaign["id"]))
+    exhausted = final_core.run_due_campaign_schedules(now, campaign["id"], 1)
+    assert exhausted[0]["status"] == "failed" and "最大研究轮次" in exhausted[0]["error"]
+    exhausted_schedule = client.get(f"/api/v1/campaigns/{campaign['id']}").json()["schedule"]
+    assert exhausted_schedule["failure_count"] == 1 and exhausted_schedule["lease_expires_at"] is None
+
+
+def test_campaign_schedule_only_auto_executes_explicit_read_only_plan(client, monkeypatch):
+    state = {"requests": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"] += 1
+            body = json.dumps({"object": "order-42", "owner": "tenant-a"}, sort_keys=True).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{server.server_port}"
+    try:
+        draft = client.post("/api/v1/engagements", json={
+            "name": "Scheduled read-only fixture", "target": target, "mode": "traditional",
+            "scope": {"allow_private_ips": True, "environment_class": "local_fixture"},
+            "policy": {"max_requests_per_second": 100, "max_requests": 100},
+        }).json()
+        engagement = client.post(f"/api/v1/engagements/{draft['id']}/confirm").json()
+        client.post(f"/api/v1/engagements/{engagement['id']}/identities", json={
+            "label": "Reader", "role": "user", "auth_type": "none", "session_status": "ready",
+        })
+        campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+            "name": "Read-only background campaign", "objective": "Safely continue bounded read-only coverage while the app is running",
+        }).json()
+        client.post(f"/api/v1/campaigns/{campaign['id']}/workflows", json={
+            "name": "Read fixture order", "objective": "Observe a stable authorized order without changing state",
+            "steps": [{"name": "Read", "method": "GET", "url": f"{target}/orders/42", "actor_role": "user", "replay_safe": True}],
+            "invariants": ["Read must not mutate state"], "risk_class": "read_only",
+        })
+        run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        with sqlite3.connect(final_core.DB) as db:
+            db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
+        invalid = client.put(f"/api/v1/campaigns/{campaign['id']}/schedule", json={
+            "cadence_minutes": 15, "execution_mode": "read_only_execute", "preferred_run_id": "run-outside",
+        })
+        assert invalid.status_code == 422
+        configured = client.put(f"/api/v1/campaigns/{campaign['id']}/schedule", json={
+            "cadence_minutes": 15, "execution_mode": "read_only_execute", "preferred_run_id": run_id,
+            "max_tests": 10, "start_immediately": True,
+        })
+        assert configured.status_code == 200
+        outcome = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now")
+        assert outcome.status_code == 200, outcome.text
+        assert outcome.json()["status"] == "completed" and outcome.json()["execution"] == "read_only"
+        assert outcome.json()["tested"] >= 1 and state["requests"] >= 1
+        detail = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
+        assert detail["iterations"][0]["status"] == "completed" and detail["iterations_completed"] == 1
+        monkeypatch.setattr(final_core, "execute_campaign_iteration", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fixture execution failed")))
+        failed = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now")
+        assert failed.status_code == 200 and failed.json()["status"] == "failed"
+        after_failure = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
+        assert after_failure["iterations"][0]["status"] == "failed"
+        assert after_failure["schedule"]["failure_count"] == 1 and "fixture execution failed" in after_failure["schedule"]["last_error"]
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def test_business_workflow_rejects_out_of_scope_and_read_only_post(client):
     engagement = create_ready(client, target="https://workflow-scope.test")
     campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={

@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
@@ -33,6 +33,13 @@ ROOT = Path(__file__).resolve().parent
 DB = ROOT / "data" / "src_control.db"
 LOCAL_DATA_ROOT = ROOT / "data"
 router = APIRouter(prefix="/api/v1", tags=["FINAL v1"])
+CAMPAIGN_SCHEDULER_STATE: dict[str, Any] = {
+    "running": False, "last_tick_at": None, "last_processed": 0, "last_error": None,
+}
+
+
+def mark_campaign_scheduler(**values: Any) -> None:
+    CAMPAIGN_SCHEDULER_STATE.update(values)
 
 
 @router.get("/system/version")
@@ -261,6 +268,14 @@ def init_final_db() -> None:
               results TEXT NOT NULL, started_at TEXT, completed_at TEXT,
               created_at TEXT NOT NULL, UNIQUE(campaign_id,sequence)
             );
+            CREATE TABLE IF NOT EXISTS campaign_schedules (
+              campaign_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+              cadence_minutes INTEGER NOT NULL, execution_mode TEXT NOT NULL,
+              preferred_run_id TEXT, max_tests INTEGER NOT NULL,
+              next_run_at TEXT NOT NULL, last_planned_at TEXT, paused_at TEXT,
+              lease_token TEXT, lease_expires_at TEXT, failure_count INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS state_change_journal (
               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
               iteration_id TEXT NOT NULL, run_id TEXT NOT NULL, workflow_id TEXT NOT NULL,
@@ -290,6 +305,7 @@ def init_final_db() -> None:
             CREATE INDEX IF NOT EXISTS oast_campaign_idx ON oast_probes(campaign_id,created_at);
             CREATE INDEX IF NOT EXISTS oast_probe_event_idx ON oast_events(probe_id,received_at);
             CREATE INDEX IF NOT EXISTS state_change_engagement_idx ON state_change_journal(engagement_id,state,updated_at);
+            CREATE INDEX IF NOT EXISTS campaign_schedule_due_idx ON campaign_schedules(enabled,next_run_at,lease_expires_at);
             """
         )
         workflow_columns = {row["name"] for row in db.execute("PRAGMA table_info(business_workflows)")}
@@ -470,6 +486,21 @@ class ResearchCampaignInput(BaseModel):
     max_iterations: int = Field(default=20, ge=1, le=500)
     horizon_days: int = Field(default=30, ge=1, le=3650)
     coverage_target: float = Field(default=.85, ge=.1, le=1)
+
+
+class CampaignScheduleInput(BaseModel):
+    cadence_minutes: int = Field(default=1440, ge=15, le=10080)
+    execution_mode: Literal["plan_only", "read_only_execute"] = "plan_only"
+    preferred_run_id: str | None = Field(default=None, max_length=80)
+    max_tests: int = Field(default=20, ge=1, le=50)
+    start_immediately: bool = False
+
+
+class CampaignScheduleUpdateInput(BaseModel):
+    cadence_minutes: int | None = Field(default=None, ge=15, le=10080)
+    execution_mode: Literal["plan_only", "read_only_execute"] | None = None
+    preferred_run_id: str | None = Field(default=None, max_length=80)
+    max_tests: int | None = Field(default=None, ge=1, le=50)
 
 
 class WorkflowStepInput(BaseModel):
@@ -2122,6 +2153,11 @@ def hydrate_campaign(row: sqlite3.Row) -> dict[str, Any]:
         value["workflow_count"] = db.execute("SELECT COUNT(*) FROM business_workflows WHERE campaign_id=? AND status='active'", (value["id"],)).fetchone()[0]
         value["hypothesis_count"] = db.execute("SELECT COUNT(*) FROM research_hypotheses WHERE campaign_id=? AND status!='archived'", (value["id"],)).fetchone()[0]
         value["open_hypotheses"] = db.execute("SELECT COUNT(*) FROM research_hypotheses WHERE campaign_id=? AND status IN ('new','planned','testing','open_proof_gap')", (value["id"],)).fetchone()[0]
+        schedule = db.execute("SELECT * FROM campaign_schedules WHERE campaign_id=?", (value["id"],)).fetchone()
+        value["schedule"] = dict(schedule) if schedule else None
+        if value["schedule"]:
+            value["schedule"]["enabled"] = bool(value["schedule"]["enabled"])
+            value["schedule"].pop("lease_token", None)
     return value
 
 
@@ -2705,24 +2741,39 @@ def _build_campaign_matrix(campaign: dict[str, Any], workflow_ids: set[str] | No
     return {"tests": matrix, "blocked": blocked, "identity_count": len(ready), "workflow_count": len(workflows)}
 
 
+def _insert_campaign_iteration(campaign: dict[str, Any], matrix: dict[str, Any], strategy: str,
+                               hypothesis_id: str | None = None) -> dict[str, Any]:
+    campaign_id, iteration_id, timestamp = campaign["id"], uid("iteration"), utcnow()
+    plan = {"strategy": strategy, **({"hypothesis_id": hypothesis_id} if hypothesis_id else {}), **matrix}
+    with connect() as db:
+        sequence = db.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM campaign_iterations WHERE campaign_id=?", (campaign_id,)).fetchone()[0]
+        db.execute("INSERT INTO campaign_iterations VALUES(?,?,?,?,?,?,?,?,?,?)", (
+            iteration_id, campaign_id, None, sequence, "planned", dump(plan), dump({}), None, None, timestamp,
+        ))
+        if hypothesis_id:
+            db.execute("UPDATE research_hypotheses SET status='planned',next_action=?,updated_at=? WHERE id=? AND campaign_id=?", (
+                f"执行第 {sequence} 轮定向复测", timestamp, hypothesis_id, campaign_id,
+            ))
+        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
+    return {"id": iteration_id, "campaign_id": campaign_id, "sequence": sequence, "status": "planned", **plan}
+
+
 @router.post("/campaigns/{campaign_id}/iterations/plan", status_code=201)
 def plan_campaign_iteration(campaign_id: str):
     campaign = get_research_campaign(campaign_id)
+    if campaign["status"] != "active":
+        raise HTTPException(409, "Campaign 已暂停或归档，不能生成新轮次")
     if campaign["iterations_completed"] >= campaign["max_iterations"]:
         raise HTTPException(409, "Campaign 已达到最大研究轮次")
     matrix = _build_campaign_matrix(campaign)
-    sequence = len(campaign["iterations"]) + 1
-    plan = {"strategy": campaign["strategy"], **matrix}
-    iteration_id, timestamp = uid("iteration"), utcnow()
-    with connect() as db:
-        db.execute("INSERT INTO campaign_iterations VALUES(?,?,?,?,?,?,?,?,?,?)", (iteration_id, campaign_id, None, sequence, "planned", dump(plan), dump({}), None, None, timestamp))
-        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
-    return {"id": iteration_id, "campaign_id": campaign_id, "sequence": sequence, "status": "planned", **plan}
+    return _insert_campaign_iteration(campaign, matrix, campaign["strategy"])
 
 
 @router.post("/campaigns/{campaign_id}/hypotheses/{hypothesis_id}/retest-plan", status_code=201)
 def plan_hypothesis_retest(campaign_id: str, hypothesis_id: str):
     campaign = get_research_campaign(campaign_id)
+    if campaign["status"] != "active":
+        raise HTTPException(409, "Campaign 已暂停或归档，不能生成定向复测")
     hypothesis = next((item for item in campaign["hypotheses"] if item["id"] == hypothesis_id), None)
     if not hypothesis:
         raise HTTPException(404, "长期研究假设不存在")
@@ -2731,14 +2782,201 @@ def plan_hypothesis_retest(campaign_id: str, hypothesis_id: str):
     if hypothesis["status"] in {"archived", "verified"}:
         raise HTTPException(409, "当前假设状态不能直接定向复测")
     matrix = _build_campaign_matrix(campaign, {hypothesis["workflow_id"]})
-    sequence = len(campaign["iterations"]) + 1
-    plan = {"strategy": "directed_retest", "hypothesis_id": hypothesis_id, **matrix}
-    iteration_id, timestamp = uid("iteration"), utcnow()
+    return _insert_campaign_iteration(campaign, matrix, "directed_retest", hypothesis_id)
+
+
+def _validate_campaign_schedule(campaign: dict[str, Any], execution_mode: str, preferred_run_id: str | None) -> None:
+    if campaign["status"] != "active":
+        raise HTTPException(409, "只有 active Campaign 可以启用长期调度")
+    if execution_mode == "read_only_execute":
+        if not preferred_run_id:
+            raise HTTPException(422, "自动执行只读轮次必须绑定同项目 Run")
+        with connect() as db:
+            run = db.execute("SELECT engagement_id,mode,status FROM analysis_runs WHERE id=?", (preferred_run_id,)).fetchone()
+        if not run or run["engagement_id"] != campaign["engagement_id"] or run["mode"] != "traditional":
+            raise HTTPException(422, "preferred_run_id 必须属于同一 Traditional 项目")
+        if run["status"] not in {"running", "paused", "completed"}:
+            raise HTTPException(409, "绑定 Run 当前不能用于长期只读研究")
+
+
+@router.put("/campaigns/{campaign_id}/schedule")
+def configure_campaign_schedule(campaign_id: str, body: CampaignScheduleInput):
+    campaign = get_research_campaign(campaign_id)
+    _validate_campaign_schedule(campaign, body.execution_mode, body.preferred_run_id)
+    timestamp = utcnow()
+    next_run = timestamp if body.start_immediately else (datetime.now(timezone.utc) + timedelta(minutes=body.cadence_minutes)).isoformat()
     with connect() as db:
-        db.execute("INSERT INTO campaign_iterations VALUES(?,?,?,?,?,?,?,?,?,?)", (iteration_id, campaign_id, None, sequence, "planned", dump(plan), dump({}), None, None, timestamp))
-        db.execute("UPDATE research_hypotheses SET status='planned',next_action=?,updated_at=? WHERE id=?", (f"执行第 {sequence} 轮定向复测", timestamp, hypothesis_id))
-        db.execute("UPDATE research_campaigns SET updated_at=? WHERE id=?", (timestamp, campaign_id))
-    return {"id": iteration_id, "campaign_id": campaign_id, "sequence": sequence, "status": "planned", **plan}
+        db.execute("""INSERT INTO campaign_schedules
+          (campaign_id,enabled,cadence_minutes,execution_mode,preferred_run_id,max_tests,next_run_at,last_planned_at,
+           paused_at,lease_token,lease_expires_at,failure_count,last_error,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(campaign_id) DO UPDATE SET enabled=1,cadence_minutes=excluded.cadence_minutes,
+          execution_mode=excluded.execution_mode,preferred_run_id=excluded.preferred_run_id,max_tests=excluded.max_tests,
+          next_run_at=excluded.next_run_at,paused_at=NULL,lease_token=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=excluded.updated_at""", (
+            campaign_id, 1, body.cadence_minutes, body.execution_mode, body.preferred_run_id, body.max_tests,
+            next_run, None, None, None, None, 0, None, timestamp, timestamp,
+        ))
+    return get_research_campaign(campaign_id)["schedule"]
+
+
+@router.patch("/campaigns/{campaign_id}/schedule")
+def update_campaign_schedule(campaign_id: str, body: CampaignScheduleUpdateInput):
+    campaign = get_research_campaign(campaign_id)
+    schedule = campaign.get("schedule")
+    if not schedule:
+        raise HTTPException(404, "Campaign 调度尚未配置")
+    values = body.model_dump(exclude_none=True)
+    if not values:
+        raise HTTPException(422, "至少提供一个调度更新字段")
+    mode = values.get("execution_mode", schedule["execution_mode"])
+    run_id = values.get("preferred_run_id", schedule.get("preferred_run_id"))
+    _validate_campaign_schedule(campaign, mode, run_id)
+    values["updated_at"] = utcnow()
+    with connect() as db:
+        db.execute("UPDATE campaign_schedules SET " + ",".join(f"{key}=?" for key in values) + " WHERE campaign_id=?", (*values.values(), campaign_id))
+    return get_research_campaign(campaign_id)["schedule"]
+
+
+@router.post("/campaigns/{campaign_id}/schedule/pause")
+def pause_campaign_schedule(campaign_id: str):
+    get_research_campaign(campaign_id)
+    timestamp = utcnow()
+    with connect() as db:
+        changed = db.execute("""UPDATE campaign_schedules SET enabled=0,paused_at=?,lease_token=NULL,
+          lease_expires_at=NULL,updated_at=? WHERE campaign_id=? AND enabled=1""", (timestamp, timestamp, campaign_id)).rowcount
+    if not changed:
+        raise HTTPException(409, "Campaign 调度未启用")
+    return get_research_campaign(campaign_id)["schedule"]
+
+
+@router.post("/campaigns/{campaign_id}/schedule/resume")
+def resume_campaign_schedule(campaign_id: str):
+    campaign = get_research_campaign(campaign_id)
+    schedule = campaign.get("schedule")
+    if not schedule:
+        raise HTTPException(404, "Campaign 调度尚未配置")
+    _validate_campaign_schedule(campaign, schedule["execution_mode"], schedule.get("preferred_run_id"))
+    timestamp = utcnow()
+    with connect() as db:
+        db.execute("""UPDATE campaign_schedules SET enabled=1,paused_at=NULL,next_run_at=?,lease_token=NULL,
+          lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE campaign_id=?""", (timestamp, timestamp, campaign_id))
+    return get_research_campaign(campaign_id)["schedule"]
+
+
+def _claim_due_campaign_schedule(campaign_id: str, now: str) -> tuple[dict[str, Any], str] | None:
+    token = secrets.token_urlsafe(18)
+    lease_expires = (datetime.fromisoformat(now) + timedelta(minutes=5)).isoformat()
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute("""UPDATE campaign_schedules SET lease_token=?,lease_expires_at=?,updated_at=?
+          WHERE campaign_id=? AND enabled=1 AND next_run_at<=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)""",
+          (token, lease_expires, now, campaign_id, now, now)).rowcount
+        if not changed:
+            return None
+        row = db.execute("SELECT * FROM campaign_schedules WHERE campaign_id=?", (campaign_id,)).fetchone()
+    return dict(row), token
+
+
+def run_due_campaign_schedules(now: str | None = None, campaign_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    now = now or utcnow()
+    with connect() as db:
+        query = """SELECT s.campaign_id FROM campaign_schedules s JOIN research_campaigns c ON c.id=s.campaign_id
+          WHERE s.enabled=1 AND c.status='active' AND s.next_run_at<=? AND (s.lease_expires_at IS NULL OR s.lease_expires_at<=?)"""
+        params: list[Any] = [now, now]
+        if campaign_id:
+            query += " AND s.campaign_id=?"
+            params.append(campaign_id)
+        due = [row["campaign_id"] for row in db.execute(query + " ORDER BY s.next_run_at LIMIT ?", (*params, limit))]
+    outcomes = []
+    for due_id in due:
+        claimed = _claim_due_campaign_schedule(due_id, now)
+        if not claimed:
+            continue
+        schedule, token = claimed
+        outcome: dict[str, Any] = {"campaign_id": due_id, "status": "claimed"}
+        try:
+            campaign = get_research_campaign(due_id)
+            if campaign["iterations_completed"] >= campaign["max_iterations"]:
+                raise HTTPException(409, "Campaign 已达到最大研究轮次")
+            pending = next((item for item in campaign["iterations"] if item["status"] in {"planned", "executing"}), None)
+            if pending:
+                outcome.update(status="waiting", iteration_id=pending["id"], reason="previous_iteration_pending")
+            else:
+                hypothesis = next((item for item in campaign["hypotheses"] if item.get("workflow_id") and item["status"] in {"new", "open_proof_gap", "rejected"}), None)
+                if hypothesis:
+                    matrix = _build_campaign_matrix(campaign, {hypothesis["workflow_id"]})
+                    iteration = _insert_campaign_iteration(campaign, matrix, "scheduled_directed_retest", hypothesis["id"])
+                else:
+                    iteration = _insert_campaign_iteration(campaign, _build_campaign_matrix(campaign), "scheduled_coverage")
+                outcome.update(status="planned", iteration_id=iteration["id"], sequence=iteration["sequence"],
+                               hypothesis_id=iteration.get("hypothesis_id"), test_count=len(iteration["tests"]))
+                if schedule["execution_mode"] == "read_only_execute":
+                    has_mutation = any(item.get("kind") in {"reversible_transition", "reversible_transaction"} for item in iteration["tests"])
+                    if has_mutation:
+                        outcome["execution"] = "blocked_reversible_requires_human_confirmation"
+                    else:
+                        executed = execute_campaign_iteration(due_id, iteration["id"], CampaignExecuteInput(
+                            run_id=schedule["preferred_run_id"], max_tests=schedule["max_tests"], confirm_reversible_state_change=False,
+                        ))
+                        outcome.update(status="completed", execution="read_only", tested=executed["tested"], blocked=executed["blocked"])
+            next_run = (datetime.fromisoformat(now) + timedelta(minutes=schedule["cadence_minutes"])).isoformat()
+            with connect() as db:
+                db.execute("""UPDATE campaign_schedules SET next_run_at=?,last_planned_at=?,lease_token=NULL,
+                  lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE campaign_id=? AND lease_token=?""",
+                  (next_run, now, utcnow(), due_id, token))
+        except Exception as error:
+            message = redact(str(error.detail) if isinstance(error, HTTPException) else str(error))
+            with connect() as db:
+                if outcome.get("iteration_id"):
+                    db.execute("UPDATE campaign_iterations SET status='failed',results=?,completed_at=? WHERE id=? AND status IN ('planned','executing')", (
+                        dump({"scheduler_error": message[:1000]}), utcnow(), outcome["iteration_id"],
+                    ))
+                if outcome.get("hypothesis_id"):
+                    db.execute("UPDATE research_hypotheses SET status='planned',next_action=?,updated_at=? WHERE id=? AND status='testing'", (
+                        "调度执行失败；修复条件后重试", utcnow(), outcome["hypothesis_id"],
+                    ))
+                db.execute("""UPDATE campaign_schedules SET failure_count=failure_count+1,last_error=?,lease_token=NULL,
+                  lease_expires_at=NULL,next_run_at=?,updated_at=? WHERE campaign_id=? AND lease_token=?""", (
+                    message[:1000], (datetime.fromisoformat(now) + timedelta(minutes=schedule["cadence_minutes"])).isoformat(), utcnow(), due_id, token,
+                ))
+            outcome.update(status="failed", error=message)
+        outcomes.append(outcome)
+    return outcomes
+
+
+@router.get("/campaign-scheduler/due")
+def list_due_campaign_schedules():
+    now = utcnow()
+    with connect() as db:
+        rows = [dict(row) for row in db.execute("""SELECT s.campaign_id,s.next_run_at,s.execution_mode,s.failure_count,s.last_error
+          FROM campaign_schedules s JOIN research_campaigns c ON c.id=s.campaign_id
+          WHERE s.enabled=1 AND c.status='active' AND s.next_run_at<=? ORDER BY s.next_run_at""", (now,))]
+    return {"now": now, "due": rows}
+
+
+@router.get("/campaign-scheduler/status")
+def campaign_scheduler_status():
+    with connect() as db:
+        enabled = db.execute("SELECT COUNT(*) FROM campaign_schedules WHERE enabled=1").fetchone()[0]
+        paused = db.execute("SELECT COUNT(*) FROM campaign_schedules WHERE enabled=0").fetchone()[0]
+    return {**CAMPAIGN_SCHEDULER_STATE, "enabled_schedules": enabled, "paused_schedules": paused, "poll_seconds": 30}
+
+
+@router.post("/campaign-scheduler/tick")
+def tick_campaign_scheduler():
+    return {"processed": run_due_campaign_schedules()}
+
+
+@router.post("/campaigns/{campaign_id}/schedule/run-now")
+def run_campaign_schedule_now(campaign_id: str):
+    campaign = get_research_campaign(campaign_id)
+    if not campaign.get("schedule") or not campaign["schedule"]["enabled"]:
+        raise HTTPException(409, "Campaign 调度未启用")
+    timestamp = utcnow()
+    with connect() as db:
+        db.execute("UPDATE campaign_schedules SET next_run_at=?,lease_token=NULL,lease_expires_at=NULL,updated_at=? WHERE campaign_id=?", (timestamp, timestamp, campaign_id))
+    outcomes = run_due_campaign_schedules(timestamp, campaign_id, 1)
+    return outcomes[0] if outcomes else {"campaign_id": campaign_id, "status": "not_claimed"}
 
 
 def _campaign_hypothesis(campaign_id: str, workflow_id: str, category: str, statement: str, evidence_ids: list[str], next_action: str) -> str:

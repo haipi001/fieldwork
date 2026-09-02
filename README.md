@@ -45,6 +45,8 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - 含多个可逆动作的隔离流程作为一个事务测试执行：先捕获全部主状态与旁路资源基线，动作正序执行，补偿严格逆序执行，每个动作使用独立持久化 Journal 和回滚探针证明。任一主对象或关联资源回滚失败会保留恢复入口并阻断后续状态测试。
 - 任务中心和 Coverage Ledger 提供分区清理：只隐藏已结束任务或当前覆盖列表，活动任务、Observation、Evidence、Finding 和报告保留。
 - `benchmarks/logic-v3.json` 将复杂业务逻辑验收固定为版本化门禁：同时评分跨租户动态对象、声明前置步骤绕过、标量与嵌套分账守恒破坏、稳定并发负对照、健康账本负对照和 Finding 证据门禁。`python benchmarking.py captured-results.json` 可对导出的 Campaign `results` 重复评分；v1/v2 清单继续保留用于历史可比性。
+- 长期 Campaign 可配置 15 分钟至 7 天的持久化调度。调度器使用 SQLite 原子租约避免多进程/多触发重复领取，应用重启后继续处理到期轮次，并优先选择已绑定流程的最高优先级开放假设做定向复测。存在未完成轮次时不会堆叠新计划；达到最大轮次、执行失败和最近错误均持久化可见。
+- 调度默认 `plan_only`。只有用户显式选择 `read_only_execute` 并绑定同项目 Traditional Run 时才自动发送只读请求；计划中出现任何可逆状态步骤时只生成计划并等待人工逐轮确认，不允许后台调度绕过 Scope、Policy、预算或补偿门禁。
 - OAST 必须由冻结 Scope 显式开启，并为远程自托管回调声明 `oast_allowed_hosts`。每个短期探针绑定 Campaign、真实 Run 和可选假设；token 只存 SHA-256，回调 Header 脱敏后进入 Observation/Evidence/Coverage。探针过期无回调保持 `NOT TESTED`，不能解释为安全。
 - “设置与工具”提供自定义 OpenAI-compatible API Base、模型 ID 和 API Key。本机 Key 只写入 `~/.strix/cli-config.json`（权限 `600`），不进入 SQLite、事件、报告或 API 响应。
 - Scanner / tool output 必须先成为 Observation，不能直接生成 Verified Finding。

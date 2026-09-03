@@ -2,10 +2,10 @@
   const dialog = document.createElement('dialog');
   dialog.id = 'onboardingDialog';
   dialog.className = 'onboarding-dialog';
-  dialog.innerHTML = `<div class="onboarding-shell"><aside><span class="brand-mark">F</span><p>FIRST RUN</p><h2>启动前，先证明环境真实可用。</h2><ol><li>运行时</li><li>模型与浏览器</li><li>Traditional</li><li>Web3</li><li>本地恢复</li></ol></aside><main><div class="onboarding-head"><div><p class="eyebrow">ENVIRONMENT PROOF</p><h2>Fieldwork 首次启动诊断</h2><p>系统只根据真实探测给出结论。测试项目不会访问外部目标。</p></div><span id="onboardingVersion"></span></div><div id="onboardingChecks" class="onboarding-checks"><div class="onboarding-loading">正在检查本机运行环境…</div></div><section id="onboardingVerdict" class="onboarding-verdict"></section><div class="onboarding-actions"><button id="onboardingSettings" class="quiet-button">打开设置</button><button id="onboardingRetest" class="quiet-button">运行测试项目自检</button><button id="onboardingContinue" class="primary-action compact" disabled><span>进入 Fieldwork</span><b>→</b></button></div></main></div>`;
+  dialog.innerHTML = `<div class="onboarding-shell"><aside><span class="brand-mark">F</span><p>FIRST RUN</p><h2>启动前，先证明环境真实可用。</h2><ol><li>运行时</li><li>模型与浏览器</li><li>Traditional</li><li>Web3</li><li>本地恢复</li></ol></aside><main><div class="onboarding-head"><div><p class="eyebrow">ENVIRONMENT PROOF</p><h2>Fieldwork 首次启动诊断</h2><p>系统只根据真实探测给出结论。测试项目不会访问外部目标。</p></div><span id="onboardingVersion"></span></div><div id="onboardingChecks" class="onboarding-checks"><div class="onboarding-loading">正在检查本机运行环境…</div></div><section id="onboardingVerdict" class="onboarding-verdict"></section><p id="onboardingRepairMessage" class="onboarding-repair-message" role="status"></p><div class="onboarding-actions"><button id="onboardingSettings" class="quiet-button">打开设置</button><button id="onboardingRepair" class="quiet-button">一键修复并重新探测</button><button id="onboardingRetest" class="quiet-button">运行测试项目自检</button><button id="onboardingContinue" class="primary-action compact" disabled><span>进入 Fieldwork</span><b>→</b></button></div></main></div>`;
   document.body.append(dialog);
 
-  const completedKey = 'fieldwork-onboarding-0.14.0';
+  const completedKey = 'fieldwork-onboarding-0.31.1';
   const shouldOpen = !localStorage.getItem(completedKey) || new URLSearchParams(location.search).get('onboarding') === '1';
   const mark = ok => `<i class="onboarding-mark ${ok ? 'ok' : 'bad'}">${ok ? '✓' : '!'}</i>`;
 
@@ -16,6 +16,7 @@
     verdict.className = `onboarding-verdict ${result.ready ? 'ready' : 'blocked'}`;
     verdict.innerHTML = result.ready ? `<small>FINAL CHECK</small><h3>可以开始真实任务</h3><p>${result.self_tested ? 'Traditional 与 Web3 本地测试项目均已真实运行通过。' : '核心环境已就绪；建议再运行一次测试项目自检。'}</p>` : `<small>需要处理 ${result.blockers.length} 项</small><h3>暂不建议启动真实任务</h3><p>${result.blockers.map(item => esc(item.label)).join('、')}</p>`;
     $('#onboardingContinue').disabled = !result.ready;
+    $('#onboardingRepair').hidden = result.ready;
   }
 
   async function load(runTests = false) {
@@ -27,6 +28,12 @@
   }
 
   $('#onboardingRetest').onclick = () => load(true);
+  $('#onboardingRepair').onclick = async () => {
+    const button=$('#onboardingRepair'),message=$('#onboardingRepairMessage');
+    button.disabled=true;message.textContent='正在刷新工具路径与运行时证据…';
+    try { const result=await api('/api/v1/onboarding/repair',{method:'POST'});render(result);message.textContent=result.ready?'修复完成：所有必需项已就绪，现在可以进入 Fieldwork。':`修复后仍有 ${result.blockers.length} 项需处理，请打开设置查看具体条件。`; }
+    catch(error){message.textContent=`修复失败：${error.message}`;} finally {button.disabled=false;}
+  };
   $('#onboardingSettings').onclick = () => { dialog.close(); go('settings'); };
   $('#onboardingContinue').onclick = () => { localStorage.setItem(completedKey, new Date().toISOString()); dialog.close(); };
   if (shouldOpen) { dialog.showModal(); load(false); }

@@ -1885,6 +1885,21 @@ def onboarding_self_test():
     return onboarding_checks(True)
 
 
+@router.post("/onboarding/repair")
+def onboarding_repair():
+    """Refresh installed-tool discovery and return an actionable proof result."""
+    import capability_registry
+    capability_registry.inventory(refresh=True)
+    result = onboarding_checks(False)
+    result["repair_attempted"] = True
+    result["repair_actions"] = [
+        "refreshed_standard_tool_paths",
+        "refreshed_capability_inventory",
+        "rechecked_runtime_model_browser_storage_and_database",
+    ]
+    return result
+
+
 def _directory_usage(path: Path) -> tuple[int, int]:
     if not path.exists():
         return 0, 0

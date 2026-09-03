@@ -63,14 +63,20 @@ def resolve_executable(name: str) -> str | None:
     found = shutil.which(name)
     if found:
         return found
-    environment_local = Path(sys.executable).resolve().parent / name
-    if environment_local.is_file():
-        return str(environment_local)
-    local = Path.home() / ".foundry" / "bin" / name
-    if local.is_file():
-        return str(local)
-    strix_local = Path.home() / ".strix" / "bin" / name
-    return str(strix_local) if strix_local.is_file() else None
+    # Finder-launched apps inherit a minimal PATH. Probe standard package
+    # manager and runtime locations explicitly so desktop and shell agree.
+    candidates = (
+        Path(sys.executable).resolve().parent / name,
+        Path("/opt/homebrew/bin") / name,
+        Path("/usr/local/bin") / name,
+        Path.home() / ".foundry" / "bin" / name,
+        Path.home() / ".local" / "bin" / name,
+        Path.home() / ".cargo" / "bin" / name,
+        Path.home() / "anaconda3" / "bin" / name,
+        Path.home() / ".strix" / "bin" / name,
+        Path.home() / ".hermes" / "node" / "bin" / name,
+    )
+    return next((str(candidate) for candidate in candidates if candidate.is_file()), None)
 
 
 def executable_candidates(name: str) -> list[str]:

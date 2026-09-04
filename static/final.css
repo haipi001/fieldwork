@@ -85,3 +85,27 @@ body{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;letter
 .onboarding-repair-message{font-size:.75rem;line-height:1.5;color:var(--reading)}
 @media(max-width:900px){.advanced-intro{align-items:start;flex-direction:column}.advanced-panel{grid-template-columns:1fr 1fr}.advanced-group.wide{grid-column:1/-1}.onboarding-shell>main{padding:2rem}.onboarding-head h2{font-size:2rem}}
 @media(max-width:720px){.page-intro p,.run-header p{font-size:.88rem}.section-heading{align-items:flex-start}.section-heading,.advanced-intro{flex-direction:column}.advanced-panel{grid-template-columns:1fr}.advanced-group.wide{grid-column:auto}.advanced-intro,.advanced-group{padding:1.25rem}.recent-heading-actions,.finding-heading-actions,.panel-heading-actions{width:100%;justify-content:space-between;flex-wrap:wrap}.project-row{padding:1.25rem 0}.onboarding-shell>main{padding:1.35rem}.onboarding-head{display:block}.onboarding-head>span{display:block;margin-top:1rem}.onboarding-checks article{min-height:auto}.onboarding-actions{gap:.5rem}}
+
+/* v0.31.3 — larger desktop reading scale */
+html{font-size:17px}
+.nav-link{font-size:.82rem}.nav-link span{font-size:.66rem}.brand strong{font-size:.96rem}.brand small{font-size:.7rem}
+.flow-context small,.flow-context span,.flow-context li{font-size:max(.68rem,11px)}
+.eyebrow{font-size:.74rem}.truth-index{font-size:.69rem}.truth-chain{font-size:.63rem}
+.target-composer>label,.advanced-panel label,.provider-form label,.result-context label,.report-builder label{font-size:.76rem}
+.target-hint,.inline-error{font-size:.8rem}.scope-strip small{font-size:.67rem}.scope-strip strong{font-size:.87rem}.text-action{font-size:.76rem}
+.advanced-group header p,.option-card small{font-size:.75rem}.advanced-intro>p{font-size:.84rem}
+.section-heading p{font-size:.86rem}.section-heading>span,.section-heading>strong{font-size:.76rem}
+.project-name strong{font-size:.97rem}.project-name small{font-size:.73rem}.domain-label,.state-badge,.status-label{font-size:.67rem}
+.quiet-button,.danger-button,.primary-action{font-size:.84rem}.empty-state{font-size:1.04rem}
+.metric small{font-size:.72rem}.run-guide small{font-size:.68rem}.run-guide p{font-size:.86rem}
+.timeline h3{font-size:.96rem}.timeline p{font-size:.78rem}.detail-toggle{font-size:.68rem}.stage-detail[open] .detail-toggle:after{font-size:.68rem}
+.test-item b{font-size:.83rem}.test-item p{font-size:.77rem}.test-item small{font-size:.69rem}.test-item>span strong{font-size:.65rem}.stage-empty{font-size:.79rem}
+.activity-item time{font-size:.67rem}.activity-item b{font-size:.81rem}.activity-item span{font-size:.81rem}
+.candidate-row h3{font-size:.98rem}.candidate-row p{font-size:.8rem}.run-summary small{font-size:.67rem}.run-summary p{font-size:.86rem}
+.verification-legend,.no-submit{font-size:.72rem}.finding-card p{font-size:.84rem}.finding-meta{font-size:.69rem}
+.setting-block small,.tool-card header small,.tool-version,.tool-card footer>span{font-size:max(.66rem,11px)}
+.setting-block p,.tool-card>p{font-size:.82rem}.status-cell small{font-size:.65rem}.status-cell p{font-size:.75rem}.tool-group-title small{font-size:.72rem}
+.task-center-row small,.task-center-row p,.task-center-meta span{font-size:max(.72rem,12px)}
+.http-request-editor label{font-size:12px}.http-request-editor input,.http-request-editor select,.http-request-editor textarea,.candidate-from-http input,.candidate-from-http textarea{font-size:12px}.http-exchange-row b{font-size:12px}.http-exchange-row small{font-size:11px}.http-method,.http-exchange-row>strong{font-size:11px}.http-exchange-detail dt{font-size:10px}.http-exchange-detail dd,.http-exchange-detail pre{font-size:11px}
+.onboarding-head p{font-size:.88rem}.onboarding-checks article b{font-size:.9rem}.onboarding-checks article p{font-size:.77rem}.onboarding-checks article>span{font-size:.63rem}.onboarding-verdict p{font-size:.82rem}.onboarding-repair-message{font-size:.79rem}
+@media(max-width:720px){html{font-size:16px}.nav-link{font-size:.68rem}.page-intro p,.run-header p{font-size:.92rem}}

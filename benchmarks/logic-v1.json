@@ -1,0 +1,27 @@
+{
+  "id": "fieldwork-business-logic-v1",
+  "version": 1,
+  "description": "Deterministic local benchmark for dynamic object flow, sequence dependencies, bounded concurrency controls, and proof gating.",
+  "cases": [
+    {
+      "id": "cross_tenant_dynamic_object",
+      "class": "positive",
+      "match": {"kind": "cross_identity_sequence", "decision": "suspicious_success", "hypothesis_id": {"present": true}}
+    },
+    {
+      "id": "declared_prerequisite_bypass",
+      "class": "positive",
+      "match": {"kind": "sequence_violation", "decision": "suspicious_success", "hypothesis_id": {"present": true}}
+    },
+    {
+      "id": "stable_bounded_read_control",
+      "class": "negative_control",
+      "match": {"kind": "concurrent_step", "stable": true, "hypothesis_id": {"present": false}}
+    }
+  ],
+  "gates": {
+    "minimum_positive_recall": 1.0,
+    "maximum_negative_control_failure_rate": 0.0,
+    "maximum_verified_findings": 0
+  }
+}

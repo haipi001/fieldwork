@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "CanonicalFinding.schema.json",
+  "title": "CanonicalFinding",
+  "type": "object",
+  "required": [
+    "id",
+    "engagement_id",
+    "mode",
+    "title",
+    "summary",
+    "status",
+    "affected_asset",
+    "root_cause",
+    "reproduction",
+    "impact",
+    "evidence_ids",
+    "scope"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "engagement_id": {
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "traditional_src",
+        "web3"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "candidate",
+        "verified",
+        "disproved",
+        "human_review"
+      ]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "affected_asset": {
+      "type": "object"
+    },
+    "location": {
+      "type": "object"
+    },
+    "weakness": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwe": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owasp": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "platform_taxonomy": {
+          "type": "object"
+        }
+      }
+    },
+    "root_cause": {
+      "type": "string"
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "poc_artifact_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expected": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actual": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "environment": {
+          "type": "object"
+        }
+      }
+    },
+    "impact": {
+      "type": "object",
+      "required": [
+        "description"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "affected_users": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "affected_assets": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "amount_estimate": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "currency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repeatability": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "feasibility": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "severity": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cvss_v4_vector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cvss_v4_score": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cvss_v31_vector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "platform_score": {
+          "type": "object"
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "snapshot_id",
+        "in_scope"
+      ],
+      "properties": {
+        "snapshot_id": {
+          "type": "string"
+        },
+        "in_scope": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "oracle": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "successes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "counterevidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "eligibility": {
+      "type": "object",
+      "properties": {
+        "verdict": {
+          "enum": [
+            "unknown",
+            "eligible",
+            "likely_eligible",
+            "needs_review",
+            "out_of_scope",
+            "known_issue",
+            "rule_conflict",
+            "insufficient_poc"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "evidence_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "remediation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "platform_custom": {
+      "type": "object"
+    }
+  }
+}

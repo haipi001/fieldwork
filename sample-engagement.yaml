@@ -1,0 +1,34 @@
+engagement_id: src-demo-001
+program: Demo SRC Program
+valid_from: 2026-08-27
+valid_until: 2026-09-27
+allowed_hosts:
+  - demo.local
+denied_hosts:
+  - payment.demo.local
+allowed_methods:
+  - GET
+  - HEAD
+allowed_ports:
+  - 443
+allowed_paths:
+  - /api
+denied_paths:
+  - /api/admin
+max_requests: 50
+max_tool_calls: 100
+max_model_budget: 10
+max_requests_per_second: 1
+max_runtime_minutes: 30
+allow_state_change: false
+allow_account_creation: false
+allow_oast: false
+allow_private_ips: false
+allow_file_upload: false
+prohibited:
+  - denial_of_service
+  - credential_stuffing
+  - social_engineering
+  - real_payment
+  - persistent_access
+  - bulk_data_download

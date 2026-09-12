@@ -1,0 +1,33 @@
+{
+  "id": "fieldwork-business-logic-v4",
+  "version": 4,
+  "description": "Deterministic multi-application benchmark contract for commerce authorization, fintech accounting, marketplace settlement, SaaS workflow controls, rollback integrity, negative controls, and proof gating.",
+  "applications": ["commerce", "fintech", "marketplace", "saas"],
+  "fixture_tests": {
+    "commerce": ["test_campaign_iteration_executes_guarded_cross_identity_and_duplicate_replay"],
+    "fintech": ["test_numeric_and_collection_invariants_create_candidate_without_promoting_finding"],
+    "marketplace": ["test_nested_collection_projection_detects_filtered_accounting_drift", "test_rollback_probe_detects_orphan_resource_and_blocks_future_mutations"],
+    "saas": ["test_cross_workflow_dependencies_import_transient_values_and_fail_closed"]
+  },
+  "cases": [
+    {"id": "commerce_cross_tenant_order", "application": "commerce", "class": "positive", "match": {"benchmark_app": "commerce", "kind": "cross_identity_sequence", "decision": "suspicious_success", "hypothesis_id": {"present": true}}},
+    {"id": "commerce_checkout_prerequisite_bypass", "application": "commerce", "class": "positive", "match": {"benchmark_app": "commerce", "kind": "sequence_violation", "decision": "suspicious_success", "hypothesis_id": {"present": true}}},
+    {"id": "commerce_stable_inventory_read", "application": "commerce", "class": "negative_control", "match": {"benchmark_app": "commerce", "kind": "concurrent_step", "stable": true, "hypothesis_id": {"present": false}}},
+
+    {"id": "fintech_ledger_conservation", "application": "fintech", "class": "positive", "match": {"benchmark_app": "fintech", "kind": "workflow_sequence", "invariant_failures": 1, "failed_invariant_kinds": ["json_sum_equals"], "hypothesis_id": {"present": true}}},
+    {"id": "fintech_healthy_ledger", "application": "fintech", "class": "negative_control", "match": {"benchmark_app": "fintech", "kind": "workflow_sequence", "invariant_failures": 0, "hypothesis_id": {"present": false}}},
+
+    {"id": "marketplace_filtered_settlement", "application": "marketplace", "class": "positive", "match": {"benchmark_app": "marketplace", "kind": "workflow_sequence", "invariant_failures": 1, "failed_invariant_kinds": ["json_filtered_sum_equals"], "hypothesis_id": {"present": true}}},
+    {"id": "marketplace_orphan_job_after_rollback", "application": "marketplace", "class": "positive", "match": {"benchmark_app": "marketplace", "kind": "reversible_transition", "status": "rollback_failed", "snapshot_restored": true, "hypothesis_id": {"present": true}}},
+    {"id": "marketplace_healthy_rollback", "application": "marketplace", "class": "negative_control", "match": {"benchmark_app": "marketplace", "kind": "reversible_transition", "rollback_proven": true, "hypothesis_id": {"present": false}}},
+
+    {"id": "saas_role_sequence_access", "application": "saas", "class": "positive", "match": {"benchmark_app": "saas", "kind": "cross_identity_sequence", "decision": "suspicious_success", "hypothesis_id": {"present": true}}},
+    {"id": "saas_dependency_fail_closed", "application": "saas", "class": "negative_control", "match": {"benchmark_app": "saas", "kind": "workflow_sequence", "status": "blocked", "reason": "workflow_dependency_invariants_failed", "hypothesis_id": {"present": false}}}
+  ],
+  "gates": {
+    "minimum_positive_recall": 1.0,
+    "minimum_application_positive_recall": 1.0,
+    "maximum_negative_control_failure_rate": 0.0,
+    "maximum_verified_findings": 0
+  }
+}

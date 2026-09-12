@@ -1,0 +1,37 @@
+{
+  "id": "fieldwork-business-logic-v2",
+  "version": 2,
+  "description": "Deterministic local benchmark for dynamic authorization, sequence and concurrency controls, accounting conservation, collection integrity, and proof gating.",
+  "cases": [
+    {
+      "id": "cross_tenant_dynamic_object",
+      "class": "positive",
+      "match": {"kind": "cross_identity_sequence", "decision": "suspicious_success", "hypothesis_id": {"present": true}}
+    },
+    {
+      "id": "declared_prerequisite_bypass",
+      "class": "positive",
+      "match": {"kind": "sequence_violation", "decision": "suspicious_success", "hypothesis_id": {"present": true}}
+    },
+    {
+      "id": "accounting_conservation_violation",
+      "class": "positive",
+      "match": {"kind": "workflow_sequence", "invariant_failures": 1, "failed_invariant_kinds": ["json_sum_equals"], "hypothesis_id": {"present": true}}
+    },
+    {
+      "id": "stable_bounded_read_control",
+      "class": "negative_control",
+      "match": {"kind": "concurrent_step", "stable": true, "hypothesis_id": {"present": false}}
+    },
+    {
+      "id": "healthy_accounting_control",
+      "class": "negative_control",
+      "match": {"kind": "workflow_sequence", "invariant_failures": 0, "hypothesis_id": {"present": false}}
+    }
+  ],
+  "gates": {
+    "minimum_positive_recall": 1.0,
+    "maximum_negative_control_failure_rate": 0.0,
+    "maximum_verified_findings": 0
+  }
+}

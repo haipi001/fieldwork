@@ -1,0 +1,64 @@
+# macOS / editors
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python / test / coverage caches
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.py[cod]
+
+# Local builds and packaged applications
+build/
+dist/
+*.app/
+*.dmg
+*.pkg
+
+# Runtime state: never commit live research data or evidence
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+exports/
+reports/
+artifacts/
+agent_workspaces/
+repositories/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets and local provider / RPC configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+local-config.json
+provider-config.json
+
+# Tool-generated reports and corpora
+report.json
+report.md
+aderyn-report.*
+crytic-export/
+corpus/
+cache/
+out/
+broadcast/

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Security Research OS — Final UX Prototype</title>
+<style>
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#151515;background:#f7f7f5}
+*{box-sizing:border-box} body{margin:0}.app{min-height:100vh}
+header{height:64px;background:white;border-bottom:1px solid #e5e5e2;display:flex;align-items:center;justify-content:space-between;padding:0 28px;position:sticky;top:0}
+.brand{font-weight:750}.mode{display:flex;gap:4px;border:1px solid #d7d7d3;border-radius:12px;padding:4px;background:#fafafa}
+.mode button,.nav button,.primary,.ghost{border:0;border-radius:9px;padding:9px 13px;cursor:pointer;background:transparent}
+.mode button.active{background:#151515;color:#fff}.layout{display:grid;grid-template-columns:210px 1fr}
+aside{min-height:calc(100vh - 64px);background:#fff;border-right:1px solid #e5e5e2;padding:18px 12px}.nav button{width:100%;text-align:left;margin:2px 0}.nav button.active{background:#f0f0ed;font-weight:650}
+main{padding:42px;max-width:1100px;width:100%}.hero{max-width:820px;margin:40px auto}.eyebrow{font-size:12px;letter-spacing:.08em;opacity:.55}.hero h1{font-size:38px;line-height:1.12;margin:8px 0 12px}
+.target{background:#fff;border:1px solid #d8d8d4;border-radius:16px;padding:10px;display:flex;gap:10px;box-shadow:0 4px 18px rgba(0,0,0,.03)}
+.target input{flex:1;border:0;outline:0;font-size:16px;padding:12px}.primary{background:#151515;color:#fff;font-weight:650}
+.card{background:#fff;border:1px solid #e0e0dc;border-radius:14px;padding:18px}.muted{opacity:.6}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:18px}
+.scope{margin-top:14px;display:flex;justify-content:space-between;align-items:center}.timeline{margin-top:26px}.step{display:grid;grid-template-columns:32px 1fr 95px;gap:10px;align-items:center;padding:14px 0;border-bottom:1px solid #ecece8}.dot{width:24px;height:24px;border:1px solid #bbb;border-radius:50%;display:grid;place-items:center;font-size:12px}.done .dot{background:#151515;color:#fff}.running .dot{border-width:2px}.badge{display:inline-block;border:1px solid #ccc;border-radius:999px;padding:5px 8px;font-size:12px}.finding{display:grid;grid-template-columns:1fr auto;gap:16px;margin:12px 0}.severity{font-weight:700}.ready{font-size:12px}.report-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.platform{cursor:pointer}.platform:hover{border-color:#999}.check{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #eee}
+.hidden{display:none}@media(max-width:800px){.layout{grid-template-columns:1fr}aside{display:none}main{padding:24px}.grid,.report-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+<header>
+  <div class="brand">Security Research OS</div>
+  <div class="mode"><button id="srcMode" class="active">传统 SRC</button><button id="web3Mode">Web3 / Immunefi</button></div>
+</header>
+<div class="layout">
+<aside><div class="nav">
+<button data-page="new" class="active">＋ 新建分析</button>
+<button data-page="run">分析过程</button>
+<button data-page="findings">漏洞结果</button>
+<button data-page="reports">报告中心</button>
+<button data-page="settings">设置与工具</button>
+</div></aside>
+<main>
+<section id="new">
+<div class="hero">
+<div class="eyebrow">ONE TARGET → VERIFIED FINDINGS → SUBMISSION PACKAGE</div>
+<h1 id="heroTitle">输入目标，剩下的交给系统。</h1>
+<p class="muted" id="heroSub">URL、域名、API、Git 仓库都可以。系统先定界，再自动分析和验证。</p>
+<div class="target"><input id="targetInput" placeholder="https://example.com 或 Git 仓库"><button class="primary" onclick="openRun()">开始分析</button></div>
+<div class="card scope"><div><strong>Scope / 授权</strong><div class="muted" id="scopeText">开始前自动检查目标范围与测试规则</div></div><span class="badge">必须</span></div>
+<div class="grid"><div class="card"><strong>自动识别</strong><p class="muted">目标、技术栈、攻击面</p></div><div class="card"><strong>机器验证</strong><p class="muted">候选不会直接当漏洞</p></div><div class="card"><strong>一键报告</strong><p class="muted">H1 / Bugcrowd / Intigriti / Immunefi</p></div></div>
+</div>
+</section>
+
+<section id="run" class="hidden">
+<div class="eyebrow">ANALYSIS RUN</div><h1>正在分析目标</h1>
+<div class="grid"><div class="card"><div class="muted">已建模资产</div><h2>42</h2></div><div class="card"><div class="muted">候选</div><h2>7</h2></div><div class="card"><div class="muted">已验证</div><h2>2</h2></div></div>
+<div class="timeline">
+<div class="step done"><div class="dot">✓</div><div><strong>目标解析</strong><div class="muted">Target fingerprint created</div></div><div>完成</div></div>
+<div class="step done"><div class="dot">✓</div><div><strong>Scope 定界</strong><div class="muted">Policy compiled</div></div><div>完成</div></div>
+<div class="step done"><div class="dot">✓</div><div><strong>攻击面建模</strong><div class="muted">Assets / endpoints / flows</div></div><div>完成</div></div>
+<div class="step running"><div class="dot">•</div><div><strong>自动分析</strong><div class="muted">Tools + targeted agents</div></div><div>进行中</div></div>
+<div class="step"><div class="dot">5</div><div><strong>数据关联</strong></div><div>等待</div></div>
+<div class="step"><div class="dot">6</div><div><strong>漏洞验证</strong></div><div>等待</div></div>
+<div class="step"><div class="dot">7</div><div><strong>影响判断</strong></div><div>等待</div></div>
+<div class="step"><div class="dot">8</div><div><strong>报告生成</strong></div><div>等待</div></div>
+</div>
+</section>
+
+<section id="findings" class="hidden">
+<div class="eyebrow">VERIFIED FINDINGS</div><h1>漏洞结果</h1>
+<div class="card finding"><div><span class="badge">VERIFIED 3/3</span><h3>对象级授权边界可被绕过</h3><p class="muted">跨测试账户复现成功，证据与请求响应已绑定。</p></div><div><div class="severity">High</div><div class="ready">报告 100%</div></div></div>
+<div class="card finding"><div><span class="badge">VERIFIED</span><h3>示例漏洞 Finding</h3><p class="muted">只有完成 Oracle 验证的结果默认出现在这里。</p></div><div><div class="severity">Medium</div><div class="ready">报告 86%</div></div></div>
+<p class="muted">候选 / 待验证：5（默认折叠）</p>
+</section>
+
+<section id="reports" class="hidden">
+<div class="eyebrow">REPORT COMPILER</div><h1>选择提交格式</h1>
+<div class="report-grid">
+<div class="card platform"><strong>通用 SRC</strong><p class="muted">适配一般企业 SRC / 自建漏洞平台</p></div>
+<div class="card platform"><strong>HackerOne</strong><p class="muted">PoC / Steps / Impact + custom fields</p></div>
+<div class="card platform"><strong>Bugcrowd</strong><p class="muted">Target / VRT / Walkthrough / Evidence</p></div>
+<div class="card platform"><strong>Intigriti</strong><p class="muted">Asset / Endpoint / CVSS / Impact</p></div>
+<div class="card platform" id="immunefiCard"><strong>Immunefi</strong><p class="muted">Program Scope / PoC / Impact / Eligibility</p></div>
+<div class="card platform"><strong>结构化导出</strong><p class="muted">JSON / SARIF / Markdown / HTML</p></div>
+</div>
+<h3>材料完整度</h3>
+<div class="card">
+<div class="check"><span>Scope</span><strong>✓</strong></div>
+<div class="check"><span>复现步骤</span><strong>✓</strong></div>
+<div class="check"><span>PoC</span><strong>✓</strong></div>
+<div class="check"><span>影响</span><strong>✓</strong></div>
+<div class="check"><span>Evidence</span><strong>✓</strong></div>
+<div class="check"><span>平台字段</span><strong>✓</strong></div>
+</div>
+</section>
+
+<section id="settings" class="hidden">
+<div class="eyebrow">SYSTEM</div><h1>设置与工具</h1>
+<div class="grid"><div class="card"><strong>模型</strong><p class="muted">自动路由</p></div><div class="card"><strong>预算</strong><p class="muted">标准</p></div><div class="card"><strong>Sandbox</strong><p class="muted">Healthy</p></div></div>
+<div class="card" style="margin-top:14px"><strong>专家模式</strong><p class="muted">Tool Registry / Skills / MCP / Raw logs 默认隐藏。</p></div>
+</section>
+</main>
+</div>
+</div>
+<script>
+let mode="src";
+const pages=[...document.querySelectorAll("main section")];
+const nav=[...document.querySelectorAll(".nav button")];
+function showPage(id){pages.forEach(x=>x.classList.toggle("hidden",x.id!==id));nav.forEach(x=>x.classList.toggle("active",x.dataset.page===id))}
+nav.forEach(b=>b.onclick=()=>showPage(b.dataset.page));
+function setMode(m){mode=m;srcMode.classList.toggle("active",m==="src");web3Mode.classList.toggle("active",m==="web3");
+if(m==="web3"){heroTitle.textContent="输入 Program、合约或仓库，系统自动建立协议安全模型。";heroSub.textContent="Program Scope → Contract/Protocol Model → Invariant/Fuzz → Local Fork → Eligibility → Report";targetInput.placeholder="Immunefi Program / 0x Contract / Git 仓库";scopeText.textContent="自动抓取 Program Scope、Impact、PoC、Known Issues 与规则";immunefiCard.style.opacity="1"}else{heroTitle.textContent="输入目标，剩下的交给系统。";heroSub.textContent="URL、域名、API、Git 仓库都可以。系统先定界，再自动分析和验证。";targetInput.placeholder="https://example.com 或 Git 仓库";scopeText.textContent="开始前自动检查目标范围与测试规则"}}
+srcMode.onclick=()=>setMode("src");web3Mode.onclick=()=>setMode("web3");
+function openRun(){showPage("run")}
+</script>
+</body>
+</html>

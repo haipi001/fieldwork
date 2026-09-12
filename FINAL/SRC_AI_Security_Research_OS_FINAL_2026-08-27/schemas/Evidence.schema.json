@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "Evidence.schema.json",
+  "title": "Evidence",
+  "type": "object",
+  "required": [
+    "id",
+    "run_id",
+    "kind",
+    "artifact_sha256",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "http",
+        "screenshot",
+        "video",
+        "log",
+        "trace",
+        "source",
+        "tool_output",
+        "poc",
+        "state_diff",
+        "transaction_trace",
+        "other"
+      ]
+    },
+    "artifact_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "artifact_sha256": {
+      "type": "string"
+    },
+    "mime_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "redaction_state": {
+      "enum": [
+        "raw",
+        "redacted",
+        "safe_to_export"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

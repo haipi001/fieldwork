@@ -1,0 +1,743 @@
+[
+  {
+    "id": "F001",
+    "stage": "F0",
+    "area": "architecture",
+    "title": "Read current repository, previous P0-P6/W0-W6 artifacts and generate final convergence audit",
+    "dependencies": [],
+    "priority": "P0",
+    "acceptance": "No code rewrite; final gap/migration artifacts produced"
+  },
+  {
+    "id": "F002",
+    "stage": "F0",
+    "area": "frontend",
+    "title": "Map all existing screens to the final 5 workspaces",
+    "dependencies": [
+      "F001"
+    ],
+    "priority": "P0",
+    "acceptance": "No existing capability is lost"
+  },
+  {
+    "id": "F003",
+    "stage": "F0",
+    "area": "backend",
+    "title": "Inventory current Engagement/Finding/Evidence/Run schemas",
+    "dependencies": [
+      "F001"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F004",
+    "stage": "F0",
+    "area": "tools",
+    "title": "Inventory installed tool adapters, versions and licenses",
+    "dependencies": [
+      "F001"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F005",
+    "stage": "F0",
+    "area": "reports",
+    "title": "Inventory current report outputs and platform fields",
+    "dependencies": [
+      "F001"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F006",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Implement TargetSpec + TargetResolver",
+    "dependencies": [
+      "F003"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F007",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Version ScopeSnapshot and bind it to Engagement",
+    "dependencies": [
+      "F003"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F008",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Implement canonical analysis Run state machine",
+    "dependencies": [
+      "F003"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F009",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Implement Observation persistence",
+    "dependencies": [
+      "F003"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F010",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Normalize Evidence object/artifact references",
+    "dependencies": [
+      "F003"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F011",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Implement CanonicalFinding + migration adapters",
+    "dependencies": [
+      "F009",
+      "F010"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F012",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Implement entity/relationship graph for target model",
+    "dependencies": [
+      "F009"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F013",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Implement run event stream API",
+    "dependencies": [
+      "F008"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F014",
+    "stage": "F1",
+    "area": "backend",
+    "title": "Implement DomainRuntime and CapabilityRegistry",
+    "dependencies": [
+      "F003"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F015",
+    "stage": "F1",
+    "area": "security",
+    "title": "Enforce scope/policy before tool execution",
+    "dependencies": [
+      "F007",
+      "F014"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F016",
+    "stage": "F1",
+    "area": "security",
+    "title": "Add transport-level execution guards",
+    "dependencies": [
+      "F015"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F017",
+    "stage": "F2",
+    "area": "frontend",
+    "title": "Build final 5-workspace app shell",
+    "dependencies": [
+      "F002"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F018",
+    "stage": "F2",
+    "area": "frontend",
+    "title": "Implement Traditional SRC / Web3 global mode switch",
+    "dependencies": [
+      "F017",
+      "F014"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F019",
+    "stage": "F2",
+    "area": "frontend",
+    "title": "Build one-field New Analysis workflow",
+    "dependencies": [
+      "F017",
+      "F006",
+      "F007"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F020",
+    "stage": "F2",
+    "area": "frontend",
+    "title": "Build Run Timeline with simple/default/advanced layers",
+    "dependencies": [
+      "F017",
+      "F013"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F021",
+    "stage": "F2",
+    "area": "frontend",
+    "title": "Build Verified Findings-first results UI",
+    "dependencies": [
+      "F017",
+      "F011"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F022",
+    "stage": "F2",
+    "area": "frontend",
+    "title": "Build Report Center and platform picker",
+    "dependencies": [
+      "F017"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F023",
+    "stage": "F2",
+    "area": "frontend",
+    "title": "Build simple Settings + collapsible expert tools",
+    "dependencies": [
+      "F017",
+      "F004"
+    ],
+    "priority": "P2",
+    "acceptance": ""
+  },
+  {
+    "id": "F024",
+    "stage": "F3",
+    "area": "traditional_src",
+    "title": "Implement TraditionalSrcRuntime against CapabilityRegistry",
+    "dependencies": [
+      "F014"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F025",
+    "stage": "F3",
+    "area": "traditional_src",
+    "title": "Normalize recon/inventory adapters into Observations",
+    "dependencies": [
+      "F024",
+      "F009"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F026",
+    "stage": "F3",
+    "area": "traditional_src",
+    "title": "Normalize browser/HTTP evidence",
+    "dependencies": [
+      "F024",
+      "F010"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F027",
+    "stage": "F3",
+    "area": "traditional_src",
+    "title": "Implement account/role/tenant identity model",
+    "dependencies": [
+      "F024",
+      "F012"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F028",
+    "stage": "F3",
+    "area": "traditional_src",
+    "title": "Normalize static/code/security tool results",
+    "dependencies": [
+      "F024",
+      "F009"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F029",
+    "stage": "F3",
+    "area": "core",
+    "title": "Implement cross-observation correlation/hypothesis engine",
+    "dependencies": [
+      "F025",
+      "F028",
+      "F012"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F030",
+    "stage": "F3",
+    "area": "verification",
+    "title": "Implement replayable HTTP/state verification oracles",
+    "dependencies": [
+      "F026",
+      "F029"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F031",
+    "stage": "F3",
+    "area": "verification",
+    "title": "Implement portable Proof Capsule",
+    "dependencies": [
+      "F030",
+      "F010"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F032",
+    "stage": "F3",
+    "area": "verification",
+    "title": "Implement counterevidence checks before VERIFIED",
+    "dependencies": [
+      "F030"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F033",
+    "stage": "F3",
+    "area": "core",
+    "title": "Implement Coverage Ledger + Graveyard/resurrection",
+    "dependencies": [
+      "F008",
+      "F029"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F034",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement universal Report Compiler",
+    "dependencies": [
+      "F011",
+      "F005"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F035",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement completeness + consistency gates",
+    "dependencies": [
+      "F034"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F036",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement Generic SRC adapter",
+    "dependencies": [
+      "F034"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F037",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement HackerOne adapter + custom-field overlay",
+    "dependencies": [
+      "F034"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F038",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement Bugcrowd adapter + VRT mapping hook",
+    "dependencies": [
+      "F034"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F039",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement Intigriti adapter",
+    "dependencies": [
+      "F034"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F040",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement JSON/Markdown/HTML/SARIF exporters",
+    "dependencies": [
+      "F034"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F041",
+    "stage": "F4",
+    "area": "reports",
+    "title": "Implement redacted evidence manifest/export bundle",
+    "dependencies": [
+      "F034",
+      "F031"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F042",
+    "stage": "F4",
+    "area": "frontend",
+    "title": "Wire Report Center preview/completeness/export",
+    "dependencies": [
+      "F022",
+      "F035",
+      "F041"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F043",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement Web3Runtime shell",
+    "dependencies": [
+      "F014"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F044",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement versioned ProgramSnapshot/Immunefi importer",
+    "dependencies": [
+      "F043",
+      "F007"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F045",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement framework detection + compiler normalization",
+    "dependencies": [
+      "F043"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F046",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement contract/proxy/protocol graph",
+    "dependencies": [
+      "F045",
+      "F012"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F047",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Add Slither-first static adapter normalization",
+    "dependencies": [
+      "F045",
+      "F009"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F048",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement Invariant Registry and candidate generation",
+    "dependencies": [
+      "F046"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F049",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement Foundry invariant/fuzz runner adapter",
+    "dependencies": [
+      "F048",
+      "F010"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F050",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Add Echidna/Medusa adapters behind capabilities",
+    "dependencies": [
+      "F048"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F051",
+    "stage": "F5",
+    "area": "security",
+    "title": "Enforce read-only production/public-testnet RPC and local-fork writes",
+    "dependencies": [
+      "F016",
+      "F043"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F052",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement Anvil local fork manager",
+    "dependencies": [
+      "F051"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F053",
+    "stage": "F5",
+    "area": "verification",
+    "title": "Implement invariant/state/balance/trace Web3 oracles",
+    "dependencies": [
+      "F049",
+      "F052"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F054",
+    "stage": "F5",
+    "area": "web3",
+    "title": "Implement program-aware impact/eligibility evaluator",
+    "dependencies": [
+      "F044",
+      "F053"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F055",
+    "stage": "F5",
+    "area": "reports",
+    "title": "Implement Immunefi adapter using ProgramSnapshot overlay",
+    "dependencies": [
+      "F034",
+      "F054"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F056",
+    "stage": "F6",
+    "area": "cost",
+    "title": "Implement model/tool cost router",
+    "dependencies": [
+      "F033",
+      "F014"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  },
+  {
+    "id": "F057",
+    "stage": "F6",
+    "area": "recovery",
+    "title": "Implement resumable checkpoints across long runs",
+    "dependencies": [
+      "F008"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F058",
+    "stage": "F6",
+    "area": "security",
+    "title": "Implement secret/PII redaction for context and exports",
+    "dependencies": [
+      "F010"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F059",
+    "stage": "F6",
+    "area": "tests",
+    "title": "Add SRC regression suite",
+    "dependencies": [
+      "F024",
+      "F030",
+      "F034"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F060",
+    "stage": "F6",
+    "area": "tests",
+    "title": "Add local-only Web3 end-to-end suite",
+    "dependencies": [
+      "F053",
+      "F055"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F061",
+    "stage": "F6",
+    "area": "tests",
+    "title": "Add scope/rate/network policy denial tests",
+    "dependencies": [
+      "F015",
+      "F051"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F062",
+    "stage": "F6",
+    "area": "tests",
+    "title": "Add adapter completeness/schema golden tests",
+    "dependencies": [
+      "F037",
+      "F038",
+      "F039",
+      "F055"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F063",
+    "stage": "F6",
+    "area": "tests",
+    "title": "Run non-technical-user 5-workspace E2E acceptance",
+    "dependencies": [
+      "F042",
+      "F060"
+    ],
+    "priority": "P0",
+    "acceptance": ""
+  },
+  {
+    "id": "F064",
+    "stage": "F6",
+    "area": "docs",
+    "title": "Generate install/run/recovery/operator docs",
+    "dependencies": [
+      "F059",
+      "F060"
+    ],
+    "priority": "P1",
+    "acceptance": ""
+  }
+]

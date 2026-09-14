@@ -1,0 +1,20 @@
+/* Third-domain entry shell; reuse Fieldwork's palette and shared workspaces. */
+body[data-mode="agent_audit"] [data-workspace="new"] > :not(.hero-grid):not(.agent-mode-panel),
+body[data-mode="agent_audit"] [data-workspace]:not([data-workspace="new"]) > :not(.agent-mode-panel) { display:none !important; }
+.agent-mode-panel[hidden] { display:none !important; }
+.agent-mode-card { margin-top:32px; padding:28px; background:var(--white); border:1px solid var(--line); border-radius:14px; }
+.agent-mode-heading { display:flex; justify-content:space-between; gap:20px; align-items:center; }
+.agent-mode-heading h2 { margin:0; font-size:1.55rem; }
+.agent-mode-description { margin-top:18px; max-width:70ch; color:var(--reading); line-height:1.85; }
+.agent-mode-stages { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); list-style:none; padding:24px 0; margin:24px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); gap:20px; }
+.agent-mode-stages li { font-size:14px; font-weight:600; }
+.agent-mode-stages span { display:block; font:12px ui-monospace,monospace; color:var(--muted); margin-bottom:10px; }
+.agent-mode-footer { display:flex; justify-content:space-between; align-items:center; gap:20px; }
+.agent-mode-footer p { margin:0; color:var(--muted); font-size:14px; }
+.agent-mode-footer a { text-decoration:none; flex-shrink:0; }
+.mode-switch { white-space:nowrap; }
+@media(max-width:1200px){.topbar{grid-template-columns:160px 1fr auto;padding-inline:20px}.nav-link{padding:.6rem .5rem}.mode-switch button{padding:.5rem}}
+@media(max-width:950px){.topbar{height:auto;min-height:104px;grid-template-columns:1fr auto;gap:8px;padding-block:10px}.workspace-nav{grid-row:2;grid-column:1/-1}.workspace-context{top:104px}}
+@media(max-width:600px){.agent-mode-card{padding:20px}.agent-mode-stages{grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.agent-mode-footer{align-items:start;flex-direction:column}.agent-mode-heading{align-items:start}.mode-switch button{font-size:12px}.topbar{padding-inline:12px}.brand small{display:none}}
+
+@media(max-width:480px){.topbar{grid-template-columns:minmax(0,1fr);height:auto}.brand{justify-self:start}.mode-switch{grid-row:2;justify-self:start;max-width:100%}.workspace-nav{grid-row:3;grid-column:1;width:100%;justify-content:flex-start;overflow-x:auto}.workspace-context{top:150px}.agent-mode-heading{flex-wrap:wrap}.agent-mode-panel{min-width:0}.agent-mode-card{overflow-wrap:anywhere}}

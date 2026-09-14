@@ -35,6 +35,12 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 
 打开 [本地工作台](http://127.0.0.1:8000/new)。外部工具和模型需按使用场景配置，详见 [运行与维护](OPERATIONS.md)。
 
+## AI Agent Audit（规划中）
+
+顶部现已提供第三工作域 **AI Agent Audit**；当前为模式入口与规划页，审计功能尚未接入。新工作域将对账 Agent 自述与独立遥测，复用现有 Scope、Run、证据、验证和报告底座。
+
+完整模型、验证门、API 计划、Demo、指标与分阶段验收见 [AI Agent Audit 架构](docs/AI_AGENT_AUDIT.md)。
+
 ## 当前阶段
 
 持续开发中的个人研究工作台。候选不等于漏洞，属性失败仍需确认攻击条件与实际影响。桌面安装与不可信项目执行隔离正在完善，当前能力及缺口见 [综合评估](APPLICATION_ASSESSMENT_2026-09-11.md)。

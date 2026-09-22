@@ -242,6 +242,7 @@ def normalize_event(raw, body, identity):
         raise HTTPException(422, 'network_port 必须是 1–65535 的整数')
     value.update(id=core.uid('agent-event'), timestamp=time, source_type=source, action_type=action,
                  network_port=raw.get('network_port'), status=str(raw.get('status', 'unknown')).lower(),
+                 policy_decision='pending',
                  confidence=0.5, created_at=core.utcnow(), provenance=body.provenance,
                  independent=body.provenance == 'operator_telemetry' and source in TELEMETRY,
                  source_name=body.source_name, credential_access=raw.get('credential_access') is True,
@@ -558,7 +559,10 @@ def get_audit(audit_id: str):
     result = core.load(audit['analysis_json'], None)
     if result and digest({'snapshot': snapshot, 'events': events, 'claims': claims, 'complete': complete}) != result['input_digest']:
         raise HTTPException(409, 'Integrity Check Failed: 分析输入改变')
-    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'events': events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
+    presented_events = [{**event, 'policy_decision': result['policy_evaluations'][event['id']]['decision'],
+                         'policy_boundaries': result['policy_evaluations'][event['id']]['boundaries']}
+                        for event in events] if result else events
+    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
 
 
 def metrics(events, claims, analysis, findings):
@@ -693,5 +697,4 @@ def benchmark_metrics(audit, ground_truth):
             'verified_reconstruction_rate': ratio(len(verified & truth), len(truth)),
             'verified_reconstruction_precision': ratio(len(verified & truth), len(verified)),
             'ground_truth': 'external labelled synthetic fixture; not real-world performance'}
-
 

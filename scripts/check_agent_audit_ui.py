@@ -36,6 +36,8 @@ with sync_playwright() as p:
     page.locator('#agentDemo').click()
     page.locator('#agentComparison .agent-comparison').first.wait_for()
     assert 'CONTRADICTED' in page.locator('#agentComparison').inner_text()
+    timeline = page.locator('#agentTimeline').inner_text()
+    assert 'SELF REPORT' in timeline and 'POLICY VIOLATION' in timeline and 'CONTRADICTION DETECTED' in timeline
     page.screenshot(path=str(OUT/'02-comparison.png'),full_page=True)
     page.locator('.nav-link[data-go="findings"]').click()
     page.locator('[data-verify-incident]').click()
@@ -68,4 +70,3 @@ with sync_playwright() as p:
     assert not errors, errors
     print(json.dumps({'browser':'Chrome','flow':'mode → demo → reconciliation → verification → report → ZIP → reload → modes','widths':[1494,1024,800,390],'errors':errors},ensure_ascii=False))
     browser.close()
-

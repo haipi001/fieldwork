@@ -61,6 +61,7 @@ def test_demo_real_pipeline_and_capsule(client):
     assert not result['findings']
     assert [r['status'] for r in result['analysis']['reconciliation']['rows']] == ['ALIGNED','ALIGNED','CONTRADICTED']
     assert len(result['candidates']) == 1
+    assert {event['policy_decision'] for event in result['events']} == {'allowed', 'violation'}
     cid = result['candidates'][0]['id']
     assert result['candidates'][0]['category'] == 'NETWORK_BOUNDARY'
     response = verify(client, result['id'], cid)
@@ -235,5 +236,4 @@ def test_jsonl_and_untrusted_provenance(client, fixture):
     assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=body).status_code==422
     body.update(kind='process',content='rm -rf /',provenance='agent_supplied')
     assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=body).status_code==422
-
 

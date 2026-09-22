@@ -1,0 +1,18 @@
+{
+  "display_name": "HackerOne",
+  "required": [
+    "affected_asset",
+    "weakness",
+    "reproduction.steps",
+    "impact.description"
+  ],
+  "recommended": [
+    "severity",
+    "evidence_ids",
+    "title",
+    "reproduction.poc_artifact_ids"
+  ],
+  "dynamic_custom_fields": true,
+  "notes": "Program report templates and custom fields must be imported when available."
+}
+

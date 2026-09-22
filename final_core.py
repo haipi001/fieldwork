@@ -1286,7 +1286,7 @@ def create_engagement(body: EngagementInput):
 
 
 @router.get("/engagements")
-def list_engagements(mode: Literal["traditional", "web3"] | None = None):
+def list_engagements(mode: Literal["traditional", "web3", "agent_audit"] | None = None):
     sql = """SELECT e.*,t.raw_target,t.target_type,t.normalized_target,t.chain_id,
              s.rules AS scope_rules,s.confirmed_at,p.policy
              FROM engagements_v2 e JOIN target_specs t ON t.id=e.target_spec_id
@@ -1462,6 +1462,8 @@ async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = N
     if body.execution_mode == "demo" and not test_demo_enabled:
         raise HTTPException(422, "生产模式不提供演示执行，请启动真实工具链")
     engagement = get_engagement(engagement_id)
+    if engagement["mode"] == "agent_audit":
+        raise HTTPException(409, "Agent Audit 仅执行离线分析，请使用审计分析入口")
     if engagement["status"] != "ready" or not engagement["confirmed_at"]:
         raise HTTPException(409, "必须先人工确认 ScopeSnapshot")
     if body.execution_mode == "real" and engagement["mode"] == "traditional" and engagement.get("target_type") == "repository":
@@ -1546,7 +1548,7 @@ def hydrate_run(row: sqlite3.Row, events: list[sqlite3.Row]) -> dict[str, Any]:
 
 
 @router.get("/runs")
-def list_runs(mode: Literal["traditional", "web3"] | None = None):
+def list_runs(mode: Literal["traditional", "web3", "agent_audit"] | None = None):
     sql, params = "SELECT * FROM analysis_runs", ()
     if mode:
         sql += " WHERE mode=?"
@@ -1558,7 +1560,7 @@ def list_runs(mode: Literal["traditional", "web3"] | None = None):
 
 
 @router.get("/task-center")
-def task_center(mode: Literal["traditional", "web3"] | None = None):
+def task_center(mode: Literal["traditional", "web3", "agent_audit"] | None = None):
     runs = list_runs(mode)
     with connect() as db:
         hidden_row = db.execute("SELECT value FROM app_metadata WHERE key=?", (f"task_center_hidden:{mode or 'all'}",)).fetchone()
@@ -2145,6 +2147,8 @@ def verify_candidate(candidate_id: str, body: VerificationInput):
             program_snapshot = db.execute("SELECT * FROM program_snapshots WHERE id=? AND engagement_id=?", (body.program_snapshot_id, candidate["engagement_id"])).fetchone()
             if not program_snapshot:
                 raise HTTPException(409, "ProgramSnapshot 不存在或不属于当前 Engagement")
+        if candidate["mode"] == "agent_audit":
+            raise HTTPException(409, "Agent Audit 必须使用独立的记录重建验证门")
         unsafe_oracle = "demo" in body.oracle.lower() or "synthetic" in body.oracle.lower()
         web3_gates = candidate["mode"] != "web3" or all(x is True for x in (
             body.impact_in_scope, body.known_issue_checked, body.previous_audit_checked, body.poc_rule_checked,
@@ -2305,7 +2309,7 @@ def stop_run(run_id: str):
 
 
 @router.get("/findings")
-def list_findings(mode: Literal["traditional", "web3"] | None = None, run_id: str | None = None):
+def list_findings(mode: Literal["traditional", "web3", "agent_audit"] | None = None, run_id: str | None = None):
     with connect() as db:
         clauses, params = ["c.status NOT IN ('archived','graveyard','verified','verified_fixed','duplicate')"], []
         if mode:
@@ -3067,6 +3071,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         source.close()
     backup_path.chmod(0o600)
     tables = (
+        "agent_incidents", "agent_claims", "agent_events", "agent_audits",
         "oast_events", "oast_probes", "state_change_journal", "campaign_candidate_links", "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
         "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
         "graveyard", "coverage_v2", "identity_profiles", "identities", "program_rule_authorizations", "program_snapshots", "submission_packages_v2",
@@ -3084,7 +3089,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         db.execute("DELETE FROM sqlite_sequence")
     removed_files = removed_bytes = 0
     for path in (
-        LOCAL_DATA_ROOT / "agent_workspaces", LOCAL_DATA_ROOT / "repositories",
+        LOCAL_DATA_ROOT / "agent_workspaces", LOCAL_DATA_ROOT / "agent_audit", LOCAL_DATA_ROOT / "repositories",
         LOCAL_DATA_ROOT / "artifacts", LOCAL_DATA_ROOT / "exports",
     ):
         files, size = _directory_usage(path)

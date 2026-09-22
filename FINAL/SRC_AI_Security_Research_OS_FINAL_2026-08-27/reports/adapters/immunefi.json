@@ -1,0 +1,29 @@
+{
+  "display_name": "Immunefi",
+  "required": [
+    "title",
+    "affected_asset",
+    "scope.snapshot_id",
+    "scope.in_scope",
+    "reproduction.steps",
+    "reproduction.poc_artifact_ids",
+    "impact.description"
+  ],
+  "recommended": [
+    "impact.feasibility",
+    "severity",
+    "verification",
+    "evidence_ids"
+  ],
+  "conditional": [
+    "program_snapshot",
+    "impact_in_scope",
+    "known_issue_check",
+    "previous_audit_check",
+    "primacy_mode",
+    "poc_rule_check"
+  ],
+  "language_default": "en",
+  "notes": "Project-specific rules and PoC requirements override generic renderer defaults."
+}
+

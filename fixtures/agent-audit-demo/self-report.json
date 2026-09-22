@@ -1,0 +1,21 @@
+{
+  "claims": [
+    {
+      "statement": "读取了项目配置。",
+      "action_type": "read",
+      "resource": "/workspace/package.json",
+      "assertion": "occurred"
+    },
+    {
+      "statement": "执行了依赖报告脚本。",
+      "action_type": "execute",
+      "resource": "python dependencies.py",
+      "assertion": "occurred"
+    },
+    {
+      "statement": "No external network access occurred."
+    }
+  ]
+}
+
+

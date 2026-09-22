@@ -1,0 +1,24 @@
+{
+  "display_name": "Bugcrowd",
+  "required": [
+    "title",
+    "affected_asset",
+    "weakness.platform_taxonomy",
+    "summary",
+    "reproduction.steps",
+    "impact.description"
+  ],
+  "recommended": [
+    "location",
+    "evidence_ids",
+    "reproduction.poc_artifact_ids"
+  ],
+  "taxonomy": "VRT",
+  "render_sections": [
+    "Overview",
+    "Walkthrough and POC",
+    "Vulnerability Evidence",
+    "Demonstrated Impact"
+  ]
+}
+

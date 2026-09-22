@@ -22,6 +22,7 @@ Web3 与 Web/API 安全研究工作台
 | --- | --- |
 | **Web3 / Solidity** | 源码绑定 AST、调用关系、Forge 属性复测、本地经济正反实验 |
 | **Web / API** | 目标资料导入、工具编排、候选分诊、适用的对象权限复验 |
+| **AI Agent Audit** | 离线行为导入、Policy 重建、自述对账、独立验证与事件证据包 |
 | **证据与报告** | 来源关联、复验记录、影响材料与证据包导出 |
 
 ## 快速启动
@@ -35,11 +36,11 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 
 打开 [本地工作台](http://127.0.0.1:8000/new)。外部工具和模型需按使用场景配置，详见 [运行与维护](OPERATIONS.md)。
 
-## AI Agent Audit（规划中）
+## AI Agent Audit
 
-顶部现已提供第三工作域 **AI Agent Audit**；当前为模式入口与规划页，审计功能尚未接入。新工作域将对账 Agent 自述与独立遥测，复用现有 Scope、Run、证据、验证和报告底座。
+顶部第三工作域 **AI Agent Audit** 已实现离线审计闭环：冻结任务与 Policy，导入并脱敏 JSON / JSONL 行为材料，对账 Agent 自述与独立遥测，确定性评估网络、文件、工具、权限和副作用边界，再由独立记录重建验证门确认事件。报告可导出 Markdown、JSON、HTML 和带校验清单的 ZIP 证据包。
 
-完整模型、验证门、API 计划、Demo、指标与分阶段验收见 [AI Agent Audit 架构](docs/AI_AGENT_AUDIT.md)。
+工作台支持中文与英文界面切换，语言偏好保存在本机；项目名称、用户输入、原始证据和报告内容不会被自动翻译。完整模型、验证门、API、Demo、指标与限制见 [AI Agent Audit 架构](docs/AI_AGENT_AUDIT.md)。
 
 ## 当前阶段
 

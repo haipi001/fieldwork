@@ -28,6 +28,7 @@ from web3_analysis import router as web3_analysis_router
 from web3_practice import router as web3_practice_router
 from traditional_runtime import router as traditional_router
 from traditional_tools import router as traditional_tools_router
+from agent_audit import router as agent_audit_router, init_agent_audit_db
 from lifecycle import finalize_database_version, prepare_database_upgrade
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 
@@ -172,6 +173,7 @@ async def lifespan(_: FastAPI):
     prepare_database_upgrade(DB, DATA / "backups", ROOT)
     init_db()
     init_final_db()
+    init_agent_audit_db()
     finalize_database_version(DB)
     scheduler_task = None
     if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER") != "1":
@@ -202,6 +204,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Security Research OS", version=APP_VERSION, lifespan=lifespan)
 app.include_router(final_router)
+app.include_router(agent_audit_router)
 app.include_router(web3_router)
 app.include_router(web3_analysis_router)
 app.include_router(web3_practice_router)

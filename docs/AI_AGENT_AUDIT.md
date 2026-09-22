@@ -1,8 +1,8 @@
 # AI Agent Audit：第三工作域架构
 
-状态：**架构已确认，入口已加入；功能尚未接入。**
+状态：**首版离线审计闭环已实现并通过回归验证。**
 
-更新时间：2026-09-14。按用户最新要求，本次只交付顶部第三模式按钮、共享工作区的规划入口，以及完整扩展架构。下文数据表、API、验证器、导入、Demo 和报告能力均为后续开发计划，不能作为已实现能力对外展示。
+更新时间：2026-09-22。数据表、API、确定性 Policy 引擎、自述对账、独立验证门、本地 Demo、基准、报告与证据包均已接入。当前能力只审查导入记录；采集器真实性仍由操作者证明，限制见第 16 节。
 
 顶部工作域：`传统 SRC` / `Web3` / `AI Agent Audit`。Web3 按钮去掉 Immunefi；现有 Immunefi 报告适配能力不因此删除。
 
@@ -28,7 +28,7 @@
 | 04 报告中心 | AI Incident Report、证据清单与导出 |
 | 05 设置与工具 | Parsers、来源可信度、可选模型配置 |
 
-入口阶段：第三工作域的五个页面均明确显示“规划中”，隐藏不适用的 URL 表单和传统扫描操作，不调用不存在的 Agent Audit API，不生成任务或假结果。切回其他工作域保留草稿和原功能。
+第三工作域在五个共享页面中提供实际审计流程，隐藏不适用的 URL 表单和传统扫描操作。切回其他工作域保留草稿和原功能；审计模式不进入扫描启动器，也不会执行导入材料中的命令。
 
 首页文案：
 
@@ -81,7 +81,7 @@ flowchart LR
 
 不建第二套证据库。以现有 `engagements_v2` 作为 Audit 主体，以 `analysis_runs` 作为一次冻结输入的重建运行。复用 `target_specs`，新增 `agent_session` 目标类型；不强迫 Agent 会话使用 URL。
 
-计划新增最少的领域表：
+已新增以下最少领域表：
 
 | 领域表 | 主要内容与关联 |
 |---|---|
@@ -245,9 +245,9 @@ report.md
 
 禁止默认携带 API Key、Cookie、Authorization Header、Secret、Password、Token。HTML 转义不可信内容，ZIP 禁止路径穿越、重复成员和无界解压。
 
-## 13. 拟定 API
+## 13. API
 
-以下路由**尚未接入，本次入口不会调用**：
+以下路由已接入，并由 Agent Audit 五个工作区调用：
 
 | 方法与路径（统一 `/api/v1/agent-audit` 前缀） | 职责 |
 |---|---|
@@ -263,7 +263,7 @@ report.md
 | GET /capabilities | Parser / 可选模型的真实可用状态 |
 | GET /demo-fixture、POST /demo | 显式标记的本地模拟材料与流程 |
 
-共享 Engagement / Run / Findings 查询应支持 `agent_audit`，且未指定 mode 时避免跨域错误操作。写路由必须验证实体所属工作域。延续本机 Host/Origin 边界；会话鉴权和采集器签名属于独立安全工作，不能宣称入口提交已完成。
+共享 Engagement / Run / Findings 查询已支持 `agent_audit`；写路由验证实体所属工作域，传统扫描和通用验证入口会拒绝 Agent Audit 实体。系统延续本机 Host/Origin 边界；会话鉴权和采集器签名仍属于后续独立安全工作。
 
 ## 14. Demo 与研究指标
 
@@ -288,14 +288,14 @@ report.md
 
 | 阶段 | 交付 | 验收 |
 |---|---|---|
-| 0（本次） | 三模式按钮、规划页、本文档 | 五工作区切换、刷新持久化、无审计写请求、原表单不受影响 |
-| 1 | Models、迁移、Artifact 与 Policy | 旧库升级/备份、快照不可覆盖、归属与哈希校验 |
-| 2 | Parsers、导入、自述 | JSON/JSONL、边界/条数校验、脱敏、来源独立性不被日志冒充 |
-| 3 | Deterministic reconciliation、Policy Engine | 五种状态、网络/路径/工具/权限/状态边界正反样本 |
-| 4 | Candidate、Counterevidence、Verification | 缺 Policy、自述-only、LLM-only、跨 Audit、篡改均不能确认 |
-| 5 | API 与五工作区实际页面 | 导入 → 时间线 → 对账 → 验证 → 报告，无静态假结果 |
-| 6 | Demo、Benchmark、导出 | 完全本地、标记模拟、可重复真值、ZIP 全文件校验 |
-| 7 | 全量回归与文档 | Traditional/Web3 继续通过、真实浏览器 smoke、已实现与未来工作逐项区分 |
+| 0 | 三模式按钮、共享页面、本文档 | 已完成 |
+| 1 | Models、迁移、Artifact 与 Policy | 已完成 |
+| 2 | Parsers、导入、自述 | 已完成 |
+| 3 | Deterministic reconciliation、Policy Engine | 已完成 |
+| 4 | Candidate、Counterevidence、Verification | 已完成 |
+| 5 | API 与五工作区实际页面 | 已完成 |
+| 6 | Demo、Benchmark、导出 | 已完成 |
+| 7 | 全量回归与文档 | 已完成 |
 
 最少自动化用例：正常无 Incident、ALIGNED、OMITTED、UNSUPPORTED、CONTRADICTED、UNKNOWN；网络越界、文件越界；缺 Policy；仅 Self Report；仅 LLM；独立证据可进入验证；Artifact Hash 改变拒绝；反证冲突拒绝；证据包导出；Traditional/Web3 回归。
 

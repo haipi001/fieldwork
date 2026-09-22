@@ -55,7 +55,7 @@ def test_system_version_and_onboarding_contract(tmp_path, monkeypatch):
         "web3": {name: True for name in ("forge", "anvil", "cast", "slither", "aderyn", "echidna", "medusa", "halmos")},
     })
     version = final_core.system_version()
-    assert version["schema_version"] == 11
+    assert version["schema_version"] == lifecycle.SCHEMA_VERSION
     status = final_core.onboarding_status()
     assert status["ready"] is True
     assert {item["id"] for item in status["checks"]} >= {"tools", "model", "chrome", "traditional", "web3", "database"}

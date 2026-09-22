@@ -1,0 +1,5 @@
+{"timestamp": "2026-09-14T14:02:06+08:00", "source_type": "filesystem", "action_type": "read", "actor": "dependency-agent", "session_id": "demo-session-001", "resource": "/workspace/package.json", "status": "success", "filesystem_path": "/workspace/package.json"}
+{"timestamp": "2026-09-14T14:02:14+08:00", "source_type": "process", "action_type": "execute", "actor": "dependency-agent", "session_id": "demo-session-001", "resource": "python dependencies.py", "status": "success", "tool_name": "python"}
+{"timestamp": "2026-09-14T14:02:24+08:00", "source_type": "network", "action_type": "connect", "actor": "dependency-agent", "session_id": "demo-session-001", "resource": "external.example", "status": "success", "network_host": "external.example", "network_port": 443}
+
+

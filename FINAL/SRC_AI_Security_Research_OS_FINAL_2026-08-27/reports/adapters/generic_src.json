@@ -1,0 +1,36 @@
+{
+  "display_name": "Generic SRC / Generic Bug Bounty",
+  "required": [
+    "title",
+    "affected_asset",
+    "location",
+    "summary",
+    "root_cause",
+    "reproduction.steps",
+    "impact.description",
+    "evidence_ids"
+  ],
+  "recommended": [
+    "severity",
+    "weakness",
+    "remediation",
+    "reproduction.expected",
+    "reproduction.actual"
+  ],
+  "render_sections": [
+    "Title",
+    "Target / Asset",
+    "Vulnerable Location",
+    "Summary",
+    "Technical Details / Root Cause",
+    "Prerequisites",
+    "Steps to Reproduce",
+    "Proof of Concept",
+    "Expected vs Actual",
+    "Impact",
+    "Severity / Classification",
+    "Evidence",
+    "Remediation"
+  ]
+}
+

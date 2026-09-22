@@ -1,0 +1,35 @@
+{
+  "display_name": "中国 SRC 通用格式",
+  "required": [
+    "title",
+    "affected_asset",
+    "location",
+    "summary",
+    "root_cause",
+    "reproduction.steps",
+    "impact.description",
+    "evidence_ids"
+  ],
+  "recommended": [
+    "severity",
+    "weakness",
+    "reproduction.poc_artifact_ids",
+    "remediation"
+  ],
+  "render_sections": [
+    "漏洞标题",
+    "漏洞目标/资产",
+    "漏洞位置",
+    "漏洞概述",
+    "漏洞原理/根因",
+    "复现条件",
+    "复现步骤",
+    "PoC/请求响应",
+    "漏洞影响",
+    "风险等级",
+    "证明材料",
+    "修复建议"
+  ],
+  "notes": "作为国内企业 SRC / 无固定公开模板平台的通用中文适配器；具体项目字段由 ProgramSnapshot/CustomField overlay 覆盖。"
+}
+

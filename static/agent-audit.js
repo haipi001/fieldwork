@@ -1,31 +1,103 @@
-/* AI Agent Audit entry shell. No audit API, telemetry upload or findings yet. */
+/* Domain-specific UI; the existing mode router and five workspaces remain shared. */
 (() => {
-  const names = ['new','run','findings','reports','settings'];
-  const host = name => document.querySelector(`[data-workspace="${name}"]`);
-  const hero = host('new').querySelector('.hero-grid');
-  const originalHero = hero.innerHTML;
-  const architecture = 'https://github.com/haipi001/fieldwork/blob/main/docs/AI_AGENT_AUDIT.md';
-  const stages = ['行为采集','自述对账','Policy 检查','独立验证','事件与报告'];
-  const details = {
-    new: ['AI AGENT AUDIT','第三个工作域，正在构建。','将 Agent 的任务、自述与独立遥测放在一起审查，确认它实际做了什么。'],
-    run: ['AGENT INCIDENT TIMELINE','重建 Agent 行为。','后续将在这里展示行为时间线、Policy 检查，以及 Agent Says / Evidence Shows 对账。'],
-    findings: ['CANONICAL INCIDENTS','事件结果','确认事件必须经过独立验证。自述、模型建议和候选不能直接成为确认结论。'],
-    reports: ['AI INCIDENT REPORT','事件报告','后续支持时间线、Policy 快照、差异、反证与材料清单，并导出 Markdown、JSON、HTML 和证据包。'],
-    settings: ['AUDIT CAPABILITIES','审计设置与工具','优先接入结构化 JSON / JSONL、工具调用、进程与网络日志；确定性审计不依赖模型 API。']
-  };
-  const panels = names.map(name => {
-    const [eyebrow,title,description] = details[name];
-    const panel = document.createElement('section');panel.className='agent-mode-panel';panel.hidden=true;
-    panel.innerHTML=`<div class="agent-mode-card"><p class="eyebrow">${eyebrow}</p><div class="agent-mode-heading"><h2>${title}</h2><span class="state-badge">规划中</span></div><p class="agent-mode-description">${description}</p><ol class="agent-mode-stages">${stages.map((stage,index)=>`<li><span>0${index+1}</span>${stage}</li>`).join('')}</ol><div class="agent-mode-footer"><p>模式入口已就绪，功能尚未接入。当前不会启动审计任务。</p><a class="quiet-button" href="${architecture}" target="_blank" rel="noopener noreferrer">查看完整架构 ↗</a></div></div>`;
-    host(name).append(panel);return panel;
-  });
-  function applyMode() {
-    const active=state.mode==='agent_audit';panels.forEach(panel=>panel.hidden=!active);
-    if(active&&!hero.dataset.agent){hero.dataset.agent='1';hero.innerHTML='<div class="hero-copy"><p class="eyebrow"><span class="live-dot"></span> AI AGENT AUDIT WORKSPACE</p><h1>审查一次 Agent 行为。<br><em>让每个判断，都有独立证据。</em></h1><p class="lede" id="modeLede">导入 Agent 的任务、行为轨迹与独立遥测。比较自述与实际行为，重建越界、遗漏和异常事件。</p></div><aside class="truth-panel"><div class="truth-index">SELF-REPORT ≠ GROUND TRUTH</div><p>Agent 的解释只是证词，不是事实。只有经过独立遥测、Policy 和证据交叉验证的事件，才能成为确认结论。</p><div class="truth-chain"><span>采集行为</span><i></i><span>对账自述</span><i></i><span>独立验证</span></div></aside>';}
-    if(!active&&hero.dataset.agent){hero.innerHTML=originalHero;delete hero.dataset.agent;$('#modeLede').textContent=state.mode==='web3'?'输入已获授权的合约、协议或代码仓库。生产网保持只读，写入只允许 local fork / devnet。':'输入已获授权的网站或代码仓库。系统先冻结 Scope，再安排分析、复验和报告。';}
-    document.querySelector('.nav-link[data-go="findings"]').innerHTML=`<span>03</span>${active?'事件结果':'漏洞结果'}`;
-    if(active){$('#contextMode').textContent='AI Agent Audit';$('#contextTaskFact').textContent='模式规划中';if(host('findings').classList.contains('active'))$('#contextTitle').textContent='事件结果';}
+  const auditState = {items: [], current: null, filter: 'ALL'};
+  const workspace = name => document.querySelector(`[data-workspace="${name}"]`);
+  const originalHero = workspace('new').querySelector('.hero-grid').innerHTML;
+  const panels = {};
+  const field = (label, name, extra = '') => `<label>${label}<input name="${name}" ${extra}></label>`;
+  for (const name of ['new','run','findings','reports','settings']) {
+    const panel = document.createElement('section');
+    panel.className = 'agent-audit-panel'; panel.id = `agent-${name}`; panel.hidden = true;
+    workspace(name).append(panel); panels[name] = panel;
   }
-  function refresh(){applyMode();}
-  window.agentAudit={applyMode,refresh};applyMode();
+  panels.new.innerHTML = `<form id="agentAuditComposer" class="agent-card">
+    <div class="section-heading"><div><p class="eyebrow">AUDIT SESSION</p><h2>审计对象</h2><p>先定义任务与边界，再导入行为材料。</p></div><button type="button" id="agentDemo" class="quiet-button">体验本地示例 ↗</button></div>
+    <div class="agent-form-grid">${field('审计名称','name','required placeholder="例如：依赖报告任务审计"')}${field('Agent 名称 / actor','agent_name','required placeholder="dependency-agent"')}${field('Session ID','session_id','required placeholder="与日志中的 session_id 一致"')}${field('模型','model','placeholder="UNKNOWN"')}${field('开始时间','start_time','type="datetime-local" required')}${field('结束时间','end_time','type="datetime-local" required')}</div>
+    <label>原始任务<textarea name="task_objective" rows="2" required placeholder="Agent 被授权完成什么任务？"></textarea></label>
+    <details><summary>Agent 运行信息</summary><div class="agent-form-grid">${field('Provider','provider','placeholder="UNKNOWN"')}${field('Runtime','runtime','placeholder="UNKNOWN"')}${field('Environment','environment','placeholder="UNKNOWN"')}</div></details>
+    <details open><summary>Policy / 授权边界 <small>创建时冻结并计算 SHA256</small></summary><div class="agent-form-grid">
+      <label>允许工具<input name="allowed_tools" placeholder="python, read_file"></label><label>禁止工具<input name="denied_tools" placeholder="每项以逗号分隔"></label>
+      <label>允许文件路径<textarea name="allowed_filesystem_paths" rows="2" placeholder="/workspace"></textarea></label><label>禁止文件路径<textarea name="denied_filesystem_paths" rows="2" placeholder="/workspace/secrets"></textarea></label>
+      <label>允许网络主机<input name="allowed_network_hosts" placeholder="精确主机名，以逗号分隔"></label><label>禁止网络主机<input name="denied_network_hosts"></label>
+      <label>允许 MCP Server<input name="mcp_servers"></label><label>允许 API 主机<input name="api_hosts"></label>
+      <label>权限上限<select name="max_privilege"><option value="user">普通用户</option><option value="admin">管理员（明确授权）</option></select></label>
+    </div><div class="agent-options">${[['shell_access','允许 Shell'],['browser_access','允许 Browser'],['internet_access','允许网络访问'],['state_change_allowed','允许状态修改'],['external_side_effect_allowed','允许第三方副作用'],['credential_access_allowed','允许凭据访问'],['persistence_allowed','允许持久化']].map(([key,label])=>`<label><input type="checkbox" name="${key}">${label}</label>`).join('')}</div><p class="target-hint">网络、工具与路径还需命中允许列表。未授权能力默认禁止。</p></details>
+    <div class="agent-actions"><button type="submit" class="primary-action">冻结 Policy 并建立审计 ↗</button><span>仅审查导入记录</span></div><p class="inline-error" id="agentCreateError" role="alert"></p>
+  </form><section class="recent-section"><div class="section-heading"><div><p class="eyebrow">RECENT AUDITS</p><h2>最近审计</h2></div><span id="agentAuditCount"></span></div><div id="agentAuditList"></div></section>`;
+  panels.run.innerHTML = `<div class="agent-toolbar"><label>当前审计<select id="agentAuditSelect"></select></label><span id="agentAuditBadge" class="state-badge"></span></div>
+    <div class="page-intro"><div><p class="eyebrow">AGENT INCIDENT TIMELINE</p><h1>重建行为，核对证词。</h1><p id="agentRunHint">选择审计或导入本地示例。</p></div></div>
+    <div id="agentKpis" class="run-metrics"></div>
+    <form id="agentImport" class="agent-card"><div class="section-heading"><div><h2>导入行为与自述</h2><p>JSON / JSONL，不执行日志中的命令。</p></div></div><div class="agent-form-grid">
+      <label>格式<select name="kind"><option value="generic_json">Generic JSON</option><option value="jsonl">JSONL</option><option value="tool_call">Tool Call Log · JSON</option><option value="process">Process / Shell Log · JSON</option><option value="network">Network Log · JSON</option><option value="self_report">Agent Self Report · JSON</option></select></label>
+      <label>来源<select name="provenance"><option value="agent_supplied">Agent 提供的材料</option><option value="operator_telemetry">独立采集器遥测</option></select></label>${field('来源名称','source_name','required placeholder="例如：OS collector / Agent trace"')}
+    </div><label>选择文件<input id="agentImportFile" type="file" accept=".json,.jsonl,.txt"></label><label>或者粘贴 JSON / JSONL<textarea name="content" rows="5" spellcheck="false" placeholder='{"events":[{"timestamp":"2026-09-14T14:02:24+08:00","actor":"dependency-agent","session_id":"session-1","source_type":"network","action_type":"connect","network_host":"external.example","status":"success"}]}'></textarea></label>
+    <div class="agent-options"><label><input name="independent_attested" type="checkbox">我确认遥测来源独立于被审计 Agent</label><label><input name="self_report_complete" type="checkbox">此材料包含本次任务的完整自述</label></div>
+    <div class="agent-actions"><button type="submit" class="quiet-button">导入材料</button><button type="button" id="agentGenerateReport" class="text-action">用已配置模型生成自述</button><button type="button" id="agentAnalyze" class="primary-action">开始确定性分析 ↗</button></div><p class="target-hint">生成自述会将脱敏 Agent 轨迹发送到已配置的模型；生成内容仅为机器建议。</p><p id="agentImportError" class="inline-error" role="alert"></p></form>
+    <div id="agentInputSummary" class="agent-card" hidden></div>
+    <section class="agent-card"><div class="section-heading"><div><h2>Agent Says / Evidence Shows</h2><p>自述与独立证据逐条对账。</p></div></div><div id="agentComparison"></div></section>
+    <section class="agent-card"><div class="section-heading"><h2>行为时间线</h2><select id="agentEventFilter" aria-label="筛选事件">${['ALL','AGENT','TOOLS','PROCESS','FILES','NETWORK','SELF REPORT','VIOLATIONS'].map(x=>`<option>${x}</option>`).join('')}</select></div><div id="agentTimeline"></div></section>`;
+  panels.findings.innerHTML = `<div class="page-intro"><div><p class="eyebrow">CANONICAL INCIDENTS</p><h1>事件结果</h1><p>候选与确认事件分开保留；独立验证只确认记录所支持的事实。</p></div></div><section class="agent-card"><div class="section-heading"><h2>待验证事件</h2><span id="agentCandidateCount"></span></div><div id="agentCandidates"></div></section><section class="agent-card"><div class="section-heading"><h2>已确认事件</h2><span id="agentFindingCount"></span></div><div id="agentFindings"></div></section><p class="inline-error" id="agentVerifyError" role="alert"></p>`;
+  panels.reports.innerHTML = `<div class="page-intro"><div><p class="eyebrow">AI INCIDENT REPORT</p><h1>报告中心</h1><p>保留未知项、反证与材料哈希。模拟数据始终标记为模拟。</p></div></div><div class="agent-actions agent-card"><button id="agentPreview" class="primary-action">生成预览</button><div id="agentDownloads"></div></div><pre id="agentReportPreview" class="agent-report">选择审计后生成报告。</pre><section class="agent-card"><h2>研究指标</h2><div id="agentMetrics"></div></section>`;
+  panels.settings.innerHTML = `<div class="page-intro"><div><p class="eyebrow">AUDIT CAPABILITIES</p><h1>设置与工具</h1><p>确定性审计可独立运行，无需模型 API。</p></div></div><div id="agentParsers" class="agent-card"></div><section class="agent-card"><h2>记录与信任边界</h2><p>SHA256 用于检测导入后的修改。独立来源由操作者确认，当前未校验采集器签名。Agent 自述和模型建议不能单独确认事件。</p><p>本模式不启动 Agent、不执行导入命令、不联网复现，也不修改第三方系统。</p><p>模型配置沿用 Fieldwork 的「传统 SRC → 设置与工具」。</p></section>`;
+  const empty = message => `<div class="empty-state">${esc(message)}</div>`;
+  const call = (path, body) => api('/api/v1/agent-audit' + path, body === undefined ? {} : {method:'POST',body:JSON.stringify(body)});
+  async function action(button, errorId, fn) {
+    if(button.disabled)return;button.disabled=true;const error=document.getElementById(errorId);if(error)error.textContent='';
+    try { await fn(); } catch(e) { if(error)error.textContent=e.message;else toast(e.message); } finally {button.disabled=false;}
+  }
+  async function select(id) {auditState.current=await call(`/audits/${id}`);render();}
+  function applyMode() {
+    const active=state.mode==='agent_audit';
+    for(const panel of Object.values(panels))panel.hidden=!active;
+    const hero=workspace('new').querySelector('.hero-grid');
+    if(active&&!hero.dataset.agent){hero.dataset.agent='1';hero.innerHTML='<div class="hero-copy"><p class="eyebrow"><span class="live-dot"></span> AI AGENT AUDIT WORKSPACE</p><h1>审查一次 Agent 行为。<br><em>让每个判断，都有独立证据。</em></h1><p class="lede" id="modeLede">导入 Agent 的任务、行为轨迹与独立遥测。比较自述与实际行为，重建越界、遗漏和异常事件。</p></div><aside class="truth-panel"><div class="truth-index">SELF-REPORT ≠ GROUND TRUTH</div><p>Agent 的解释只是证词，不是事实。只有经过独立遥测、Policy 和证据交叉验证的事件，才能成为确认结论。</p><div class="truth-chain"><span>采集行为</span><i></i><span>对账自述</span><i></i><span>独立验证</span></div></aside>'}
+    if(!active&&hero.dataset.agent){hero.innerHTML=originalHero;delete hero.dataset.agent;$('#modeLede').textContent=state.mode==='web3'?'输入已获授权的合约、协议或代码仓库。生产网保持只读，写入只允许 local fork / devnet。':'输入已获授权的网站或代码仓库。系统先冻结 Scope，再安排分析、复验和报告。'}
+    const nav=document.querySelector('.nav-link[data-go="findings"]');nav.innerHTML=`<span>03</span>${active?'事件结果':'漏洞结果'}`;
+    if(active){$('#contextMode').textContent='AI Agent Audit';$('#contextTaskFact').textContent=`${auditState.items.length} 个审计`;if(workspace('findings').classList.contains('active'))$('#contextTitle').textContent='事件结果';}
+  }
+  async function refreshAudit() {
+    const items=await call('/audits');if(state.mode!=='agent_audit')return;auditState.items=items;
+    const id=auditState.current?.id||items[0]?.id;
+    if(id)await select(id);else render();
+    const caps=await call('/capabilities');
+    $('#agentParsers').innerHTML=caps.parsers.map(x=>`<div class="agent-list-row"><b>${esc(x)}</b><span class="state-badge">READY</span></div>`).join('')+`<div class="agent-list-row"><b>自述生成模型</b><span>${esc(caps.self_report_generator)}</span></div><div class="agent-list-row"><b>LLM Semantic Matcher</b><span>${esc(caps.llm_semantic_matcher)}</span></div>`;
+    applyMode();
+  }
+  function render() {
+    const a=auditState.current;$('#agentAuditCount').textContent=`${auditState.items.length} 个审计`;
+    $('#agentAuditList').innerHTML=auditState.items.map(x=>`<article class="agent-list-row"><div><b>${esc(x.name)}</b><small>${new Date(x.created_at).toLocaleString()}${x.demo?' · SIMULATED':''}</small></div><button class="quiet-button" data-open-audit="${esc(x.id)}">打开审计 →</button></article>`).join('')||empty('还没有审计。建立审计或体验本地示例。');
+    $('#agentAuditSelect').innerHTML='<option value="">选择审计</option>'+auditState.items.map(x=>`<option value="${esc(x.id)}" ${a?.id===x.id?'selected':''}>${esc(x.name)}</option>`).join('');
+    $('#agentImport').hidden=!a||!!a.analysis;$('#agentInputSummary').hidden=!a||!a.analysis;
+    if(!a){$('#agentKpis').innerHTML='';$('#agentComparison').innerHTML=empty('等待导入与对账。');$('#agentTimeline').innerHTML=empty('暂无行为记录。');$('#agentCandidates').innerHTML=empty('暂无候选。');$('#agentFindings').innerHTML=empty('暂无确认事件。');return;}
+    $('#agentAuditBadge').textContent=a.demo?'SIMULATED · LOCAL FIXTURE':a.analysis?'INPUTS FROZEN':'INTAKE';
+    $('#agentRunHint').textContent=`${a.identity.name} · ${a.identity.agent_name} · ${a.identity.session_id}`;
+    const evaluations=Object.values(a.analysis?.policy_evaluations||{}), rows=a.analysis?.reconciliation.rows||[];
+    $('#agentKpis').innerHTML=[['Events',a.events.length],['Policy Violations',evaluations.filter(x=>x.decision==='violation').length],['Self-report Mismatches',rows.filter(x=>['OMITTED','CONTRADICTED'].includes(x.status)).length],['Verified Incidents',a.findings.length]].map(([label,n])=>`<div class="metric"><small>${label}</small><strong>${n}</strong></div>`).join('');
+    $('#agentInputSummary').innerHTML=`<b>输入与 Policy 已冻结</b><p>${a.events.length} 个行为 · ${a.claims.length} 条自述 · ${a.imports.length} 次导入</p><small class="agent-hash">Policy SHA256 · ${esc(a.policy_sha256||'UNKNOWN')}</small><div class="agent-actions"><button class="primary-action" data-agent-go="findings">审阅事件结果 →</button><button class="quiet-button" data-agent-go="reports">查看报告</button></div>`;
+    $('#agentComparison').innerHTML=rows.map(row=>`<article class="agent-comparison"><div><small>AGENT SAYS</small><p>${esc(row.statement)}</p><span class="state-badge ${row.status==='CONTRADICTED'?'agent-alert':''}">${esc(row.status)}</span></div><div><small>EVIDENCE SHOWS</small>${row.event_ids.map(id=>{const e=a.events.find(x=>x.id===id);return `<p><time>${esc(e.timestamp)}</time><br>${esc(e.source_type)} · ${esc(e.action_type)} → ${esc(e.resource)}</p>`}).join('')||'<p>没有匹配的独立证据；不等于陈述为假。</p>'}<small>Policy · 网络访问 ${a.policy?.internet_access?'允许列表':'DENIED'}</small></div></article>`).join('')||empty(a.analysis?'当前没有可对账的自述。':'导入后点击「开始确定性分析」。');
+    renderTimeline();
+    const pending=a.candidates.filter(c=>c.status!=='verified');$('#agentCandidateCount').textContent=pending.length;$('#agentFindingCount').textContent=a.findings.length;
+    $('#agentCandidates').innerHTML=pending.map(c=>{const e=a.events.find(x=>x.id===c.event_id),status=a.analysis?.reconciliation.event_status[c.event_id]||'UNKNOWN';return `<article class="agent-incident"><div><small>${esc(c.id)} · ${esc(c.boundary)}</small><h3>${esc(c.title)}</h3><p>${esc(e?.resource)} · ${esc(e?.timestamp)}</p><span class="state-badge">${esc(status)}</span><span class="agent-note">独立证据 ${e?.independent?1:0} · ${esc(c.status)} · 反证待检查</span></div><button class="quiet-button" data-verify-incident="${esc(c.id)}">执行独立验证 →</button></article>`}).join('')||empty('当前无待验证事件。');
+    $('#agentFindings').innerHTML=a.findings.map(f=>`<article class="agent-incident"><div><small>${esc(f.id)} · ${esc(f.category)} · INFO</small><h3>${esc(f.title)}</h3><p>${esc(f.impact.summary)}</p><span class="state-badge">VERIFIED ${a.demo?'· SIMULATED':''}</span><p class="agent-note">自述 ${esc(f.verification.self_report_status)} · 独立证据 ${f.verification.independent_evidence_count} · 反证已检查<br>${esc(f.verification.timestamp)} · ${esc(f.verification.verification_basis)}</p></div><a class="quiet-button" href="/api/v1/agent-audit/audits/${a.id}/capsule" download>证据包 ↓</a></article>`).join('')||empty('尚无确认事件；自述和候选不能代替独立验证。');
+    $('#agentDownloads').innerHTML=['markdown','json','html'].map(format=>`<a class="quiet-button" href="/api/v1/agent-audit/audits/${a.id}/report?format=${format}" download="${a.id}.${format==='markdown'?'md':format}">${format.toUpperCase()} ↓</a>`).join('')+`<a class="quiet-button" href="/api/v1/agent-audit/audits/${a.id}/capsule" download>ZIP Evidence Capsule ↓</a>`;
+    $('#agentReportPreview').textContent='点击「生成预览」，查看当前审计报告。';
+    $('#agentMetrics').innerHTML=Object.entries(a.metrics).filter(([key])=>key!=='ground_truth').map(([key,value])=>`<div class="agent-list-row"><span>${esc(key.replaceAll('_',' '))}</span><b>${value?.value!=null?`${(value.value*100).toFixed(1)}% (${value.numerator}/${value.denominator})`:'UNKNOWN'}</b></div>`).join('')+`<p class="target-hint">需要独立真值才能计算召回率和精确率；候选数量不代表效果。</p>`;
+    applyMode();
+  }
+  function renderTimeline(){const a=auditState.current;if(!a)return;const mapping={AGENT:['agent_trace'],TOOLS:['tool_call','mcp','api'],PROCESS:['process'],FILES:['filesystem'],NETWORK:['network','browser'], 'SELF REPORT':['self_report']};
+    let events=a.events.filter(e=>auditState.filter==='ALL'||(mapping[auditState.filter]||[]).includes(e.source_type)||auditState.filter==='VIOLATIONS'&&a.analysis?.policy_evaluations[e.id]?.decision==='violation');
+    if(auditState.filter==='SELF REPORT'){ $('#agentTimeline').innerHTML=a.claims.map(c=>`<article class="agent-list-row"><time>${esc(c.time_start)}</time><div><b>SELF REPORT</b><p>${esc(c.statement)}</p></div></article>`).join('')||empty('暂无自述。');return; }
+    $('#agentTimeline').innerHTML=events.map(e=>`<article class="agent-list-row"><time>${esc(e.timestamp||'UNKNOWN')}</time><div><b>${esc(e.source_type)} · ${esc(e.action_type)}</b><p>${esc(e.resource)}</p><small>${esc(e.source_name)} · ${e.independent?'操作者确认独立来源':'Agent 材料'} · ${esc(e.status)}</small></div><span class="state-badge">${esc(a.analysis?.policy_evaluations[e.id]?.decision||'待分析')}</span></article>`).join('')||empty('没有匹配的事件。');
+  }
+  $('#agentAuditComposer').onsubmit=event=>{event.preventDefault();action(event.submitter,'agentCreateError',async()=>{const form=new FormData(event.target),body={},policy={};for(const key of ['name','agent_name','session_id','model','provider','runtime','environment','task_objective'])body[key]=String(form.get(key)||'').trim()||'UNKNOWN';for(const key of ['start_time','end_time'])body[key]=new Date(form.get(key)).toISOString();for(const key of ['allowed_tools','denied_tools','allowed_filesystem_paths','denied_filesystem_paths','allowed_network_hosts','denied_network_hosts','mcp_servers','api_hosts'])policy[key]=String(form.get(key)||'').split(/[,\n]/).map(x=>x.trim()).filter(Boolean);for(const key of ['shell_access','browser_access','internet_access','state_change_allowed','external_side_effect_allowed','credential_access_allowed','persistence_allowed'])policy[key]=form.has(key);policy.max_privilege=form.get('max_privilege');body.policy=policy;auditState.current=await call('/audits',body);await refreshAudit();go('run');});};
+  $('#agentDemo').onclick=event=>action(event.currentTarget,'agentCreateError',async()=>{auditState.current=await call('/demo',{});await refreshAudit();go('run');});
+  $('#agentAuditSelect').onchange=event=>{if(event.target.value)select(event.target.value).catch(e=>toast(e.message));};
+  $('#agentImportFile').onchange=async event=>{const file=event.target.files[0];if(file){if(file.size>2_000_000){$('#agentImportError').textContent='文件超过 2 MB';return;}$('#agentImport [name="content"]').value=await file.text();if(file.name.endsWith('.jsonl'))$('#agentImport [name="kind"]').value='jsonl';}};
+  $('#agentImport').onsubmit=event=>{event.preventDefault();action(event.submitter,'agentImportError',async()=>{const form=new FormData(event.target);auditState.current=await call(`/audits/${auditState.current.id}/imports`,{kind:form.get('kind'),content:form.get('content'),provenance:form.get('provenance'),source_name:form.get('source_name'),independent_attested:form.has('independent_attested'),self_report_complete:form.has('self_report_complete')});render();$('#agentImport [name="content"]').value='';$('#agentImportFile').value='';toast('已导入并脱敏保存');});};
+  $('#agentAnalyze').onclick=event=>action(event.currentTarget,'agentImportError',async()=>{auditState.current=await call(`/audits/${auditState.current.id}/analyze`,{});render();});
+  $('#agentGenerateReport').onclick=event=>action(event.currentTarget,'agentImportError',async()=>{auditState.current=await call(`/audits/${auditState.current.id}/self-report/generate`,{});render();toast('已保存机器生成的自述建议');});
+  $('#agentEventFilter').onchange=event=>{auditState.filter=event.target.value;renderTimeline();};
+  $('#agentPreview').onclick=event=>action(event.currentTarget,'',async()=>{if(!auditState.current)throw Error('请先选择审计');const r=await fetch(`/api/v1/agent-audit/audits/${auditState.current.id}/report`);if(!r.ok)throw Error('报告读取失败，请检查审计证据完整性');$('#agentReportPreview').textContent=await r.text();});
+  document.addEventListener('click',event=>{const open=event.target.closest('[data-open-audit]');if(open)action(open,'agentCreateError',async()=>{await select(open.dataset.openAudit);go('run');});const nav=event.target.closest('[data-agent-go]');if(nav)go(nav.dataset.agentGo);const verify=event.target.closest('[data-verify-incident]');if(verify)action(verify,'agentVerifyError',async()=>{const result=await call(`/audits/${auditState.current.id}/incidents/${verify.dataset.verifyIncident}/verify`,{});await select(auditState.current.id);toast(result.status==='verified'?'记录重建验证通过':'发现冲突遥测，需要人工审阅');});});
+  window.agentAudit={applyMode,refresh:refreshAudit};applyMode();if(state.mode==='agent_audit')refreshAudit().catch(e=>toast(e.message));
 })();

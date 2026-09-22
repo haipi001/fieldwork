@@ -1,0 +1,19 @@
+{
+  "display_name": "Intigriti",
+  "required": [
+    "title",
+    "affected_asset",
+    "weakness",
+    "reproduction.steps",
+    "impact.description"
+  ],
+  "recommended": [
+    "location",
+    "severity",
+    "remediation",
+    "platform_custom.testing_ip",
+    "evidence_ids"
+  ],
+  "notes": "Endpoint recommended; CVSS or manual severity supported; program may add questions."
+}
+

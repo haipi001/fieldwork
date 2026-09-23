@@ -5,7 +5,7 @@
   "applications": ["commerce", "fintech", "marketplace", "saas"],
   "fixture_tests": {
     "commerce": ["test_campaign_iteration_executes_guarded_cross_identity_and_duplicate_replay"],
-    "fintech": ["test_numeric_and_collection_invariants_detect_accounting_drift_without_promoting_finding"],
+    "fintech": ["test_numeric_and_collection_invariants_create_candidate_without_promoting_finding"],
     "marketplace": ["test_nested_collection_projection_detects_filtered_accounting_drift", "test_rollback_probe_detects_orphan_resource_and_blocks_future_mutations"],
     "saas": ["test_cross_workflow_dependencies_import_transient_values_and_fail_closed"]
   },

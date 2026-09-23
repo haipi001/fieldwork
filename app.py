@@ -25,8 +25,12 @@ from pydantic import BaseModel
 from final_core import init_final_db, mark_campaign_scheduler, router as final_router, run_due_campaign_schedules
 from web3_lab import router as web3_router, shutdown_labs
 from web3_analysis import router as web3_analysis_router
+from web3_practice import router as web3_practice_router
 from traditional_runtime import router as traditional_router
 from traditional_tools import router as traditional_tools_router
+from guided_research import router as guided_router, init_guided_db, start_completed_followups
+from local_boundary import LocalBoundaryMiddleware
+from agent_audit import router as agent_audit_router, init_agent_audit_db
 from lifecycle import finalize_database_version, prepare_database_upgrade
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 
@@ -171,7 +175,20 @@ async def lifespan(_: FastAPI):
     prepare_database_upgrade(DB, DATA / "backups", ROOT)
     init_db()
     init_final_db()
+    init_guided_db()
+    init_agent_audit_db()
     finalize_database_version(DB)
+    followup_task = None
+    if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_GUIDED_SCHEDULER") != "1":
+        async def followup_loop():
+            while True:
+                try:
+                    await asyncio.to_thread(start_completed_followups)
+                except Exception:
+                    # Keep persisted launch intent available after transient database errors.
+                    pass
+                await asyncio.sleep(3)
+        followup_task = asyncio.create_task(followup_loop())
     scheduler_task = None
     if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER") != "1":
         async def scheduler_loop():
@@ -189,6 +206,12 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        if followup_task:
+            followup_task.cancel()
+            try:
+                await followup_task
+            except asyncio.CancelledError:
+                pass
         if scheduler_task:
             scheduler_task.cancel()
             try:
@@ -200,13 +223,22 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Security Research OS", version=APP_VERSION, lifespan=lifespan)
+app.add_middleware(LocalBoundaryMiddleware, port=os.environ.get("FIELDWORK_PORT", "8000"))
 app.include_router(final_router)
+app.include_router(agent_audit_router)
+app.include_router(guided_router)
 app.include_router(web3_router)
 app.include_router(web3_analysis_router)
+app.include_router(web3_practice_router)
 app.include_router(traditional_router)
 app.include_router(traditional_tools_router)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 templates = Jinja2Templates(directory=ROOT / "templates")
+
+
+@app.get("/health", include_in_schema=False)
+async def local_health():
+    return {"status": "ready"}
 
 
 class ManifestInput(BaseModel):

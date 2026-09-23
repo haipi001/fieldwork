@@ -16,6 +16,11 @@ swiftc "$PROJECT_ROOT/macos/FieldworkApp.swift" \
   -framework Cocoa -framework WebKit \
   -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
+swiftc "$PROJECT_ROOT/macos/FieldworkKeychain.swift" \
+  -target arm64-apple-macos13.0 \
+  -framework Foundation -framework Security \
+  -o "$APP_BUNDLE/Contents/MacOS/FieldworkKeychain"
+
 for size in 16 32 128 256 512; do
   sips -z "$size" "$size" "$ICON_SOURCE" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
   double=$((size * 2))

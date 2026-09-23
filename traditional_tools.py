@@ -524,7 +524,9 @@ async def execute_toolchain(run_id: str, body: TraditionalToolchainInput, finali
     run, _ = _load_run(run_id)
     engagement = final_core.get_engagement(run["engagement_id"])
     is_repository = engagement.get("target_type") == "repository"
-    capabilities = list(NETWORK_CAPABILITIES if body.include_recon and not is_repository else ())
+    is_cidr = engagement.get("target_type") == "cidr"
+    capabilities = (["httpx"] if body.include_recon and is_cidr else
+                    list(NETWORK_CAPABILITIES if body.include_recon and not is_repository else ()))
     if body.include_code:
         capabilities.extend(CODE_CAPABILITIES)
     if body.include_strix:

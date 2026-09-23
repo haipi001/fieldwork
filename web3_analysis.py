@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import subprocess
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from web3_ast import compiler_analysis
 from web3_lab import binary
 from capability_registry import execute
 
@@ -70,6 +72,21 @@ class PropertyReplayInput(BaseModel):
     """A deliberately narrow contract: two local Forge replays, never verification promotion."""
 
     rounds: int = Field(default=2, ge=2, le=2)
+
+
+class Web3FindingFinalizeInput(BaseModel):
+    program_snapshot_id: str
+    impact_category: str = Field(min_length=2, max_length=160)
+    impact_description: str = Field(min_length=10, max_length=4000)
+    root_cause: str = Field(min_length=3, max_length=2000)
+    weakness: str = Field(min_length=2, max_length=160)
+    location: str = Field(min_length=2, max_length=1000)
+    feasibility: str | None = Field(default=None, max_length=2000)
+    funds_at_risk: str | None = Field(default=None, max_length=500)
+
+
+class PropertyReplayCancelled(Exception):
+    pass
 
 
 EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
@@ -249,7 +266,7 @@ def _function_semantics(body: str, state_variables: list[str], known_functions: 
             writes.append(variable)
     internal_calls = sorted({
         name for name in known_functions
-        if re.search(rf"\b{re.escape(name)}\s*\(", semantic_body)
+        if re.search(rf"(?<![\w.]){re.escape(name)}\s*\(", semantic_body)
     })
     external_calls = []
     for receiver, method in re.findall(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:\{|\()", semantic_body):
@@ -296,7 +313,7 @@ def source_model(root: Path) -> dict[str, Any]:
                 mutability = next((item for item in ("pure", "view", "payable") if re.search(rf"\b{item}\b", suffix)), "nonpayable")
                 guards = [item for item in ("onlyOwner", "onlyRole", "nonReentrant", "whenNotPaused") if item.lower() in suffix.lower()]
                 body_opening = contract_body.find("{", function_match.end() - 1)
-                function_body = "" if body_opening < 0 else contract_body[body_opening + 1:_brace_end(contract_body, body_opening)]
+                function_body = "" if function_match.group(0).endswith(";") or body_opening < 0 else contract_body[body_opening + 1:_brace_end(contract_body, body_opening)]
                 semantics = _function_semantics(function_body, variables, known_functions - {function_name})
                 signature = f"{function_name}({','.join(re.sub(r'\s+(?:memory|calldata|storage)\b|\s+\w+$', '', value.strip()).strip() for value in parameters.split(',') if value.strip())})"
                 function_record = {
@@ -306,10 +323,41 @@ def source_model(root: Path) -> dict[str, Any]:
                 functions.append(function_record)
                 call_edges.extend({"source": f"{name}.{function_name}", "target": f"{name}.{target}", "type": "internal_call"} for target in semantics["internal_calls"])
                 call_edges.extend({"source": f"{name}.{function_name}", "target": target, "type": "external_call"} for target in semantics["external_calls"])
+            # Resolve only unique same-contract function names. Overloads remain
+            # explicit unknowns until compiler AST/type resolution is available.
+            local_functions = [f for f in functions if f["source"] == source_name and f["contract"] == name]
+            by_name = {}
+            for record in local_functions:
+                by_name.setdefault(record["name"], []).append(record)
+            for function_record in local_functions:
+                visibility = function_record["visibility"]
+                mutability = function_record["mutability"]
+                guards = function_record["guards"]
+                function_name = function_record["name"]
+                signature = function_record["signature"]
+                semantics = {key: set(function_record[key]) for key in ("reads", "writes", "external_calls", "low_level_calls")}
+                pending = list(function_record["internal_calls"])
+                visited, unresolved = set(), set()
+                while pending:
+                    callee = pending.pop()
+                    if callee in visited:
+                        continue
+                    visited.add(callee)
+                    matches = by_name.get(callee, [])
+                    if len(matches) != 1:
+                        unresolved.add(callee)
+                        continue
+                    record = matches[0]
+                    for key in semantics:
+                        semantics[key].update(record[key])
+                    pending.extend(record["internal_calls"])
+                semantics = {key: sorted(values) for key, values in semantics.items()}
                 if visibility in {"external", "public"}:
                     state_changing = mutability not in {"view", "pure"}
                     risk_score = min(100, len(semantics["writes"]) * 18 + len(semantics["external_calls"]) * 24 + len(semantics["low_level_calls"]) * 34 + (15 if state_changing and not guards else 0))
-                    entry = {**function_record, "state_changing": state_changing, "risk_score": risk_score}
+                    entry = {**function_record, **semantics, "state_changing": state_changing, "risk_score": risk_score,
+                             "reachable_internal_functions": sorted(visited - unresolved),
+                             "unresolved_internal_calls": sorted(unresolved), "analysis_kind": "source_heuristic"}
                     entrypoints.append(entry)
                     if state_changing and semantics["writes"] and semantics["external_calls"]:
                         risk_paths.append({
@@ -368,7 +416,7 @@ def run_forge_build(root: Path) -> dict[str, Any]:
     # broken Echidna harness must not hide whether the deployable contracts
     # themselves compile.
     result = subprocess.run(
-        [forge, "build", "--no-lint", "--skip", "test", "--skip", "script"],
+        [forge, "build", "--ast", "--build-info", "--no-cache", "--no-lint", "--skip", "test", "--skip", "script"],
         cwd=root, capture_output=True, text=True, timeout=600,
     )
     output = (result.stdout + "\n" + result.stderr)[-12000:]
@@ -591,8 +639,22 @@ def inspect_source(body: SourceInspectInput):
     framework = detect_framework(root)
     model = source_model(root)
     compile_result = run_forge_build(root) if framework == "foundry" else {"status": "not_run", "reason": f"{framework}_adapter_not_installed"}
+    model["compiler_analysis"] = compiler_analysis(root) if compile_result["status"] == "compiled" else {"status": "unavailable", "units": [], "reason": "compile_not_successful"}
     fuzz_result = run_forge_tests(root) if framework == "foundry" and compile_result["status"] == "compiled" else {"status": "not_run"}
     compiler = compiler_model(root) if compile_result["status"] == "compiled" else []
+    ast_hypotheses = {}
+    for unit in model["compiler_analysis"].get("units", []):
+        for entry in unit["entrypoints"]:
+            if entry["requires_interaction_review"]:
+                ast_hypotheses[entry["label"]] = {
+                    "category": "compiler_state_interaction", "severity": "high",
+                    "source": entry["label"].split(":", 1)[0], "subject": entry["label"],
+                    "statement": "Compiler-resolved state writes reach external or unresolved interactions through functions/modifiers; verify call order and runtime target",
+                    "proof_required": "Local trace, deployment target binding, state delta and callback or fixed-version negative control",
+                }
+    model["hypotheses"].extend(ast_hypotheses.values())
+    model["summary"]["hypotheses"] = len(model["hypotheses"])
+    model["summary"]["compiler_units"] = len(model["compiler_analysis"].get("units", []))
     artifact_id = final_core.uid("artifact")
     ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
@@ -690,8 +752,11 @@ def inspect_source(body: SourceInspectInput):
 @router.post("/candidates/{candidate_id}/property-replay")
 def replay_property_candidate(candidate_id: str, body: PropertyReplayInput):
     """Create replay evidence; formal verification gates remain in final_core.verify_candidate."""
-    import final_core
+    return execute_property_replay(candidate_id, body)
 
+
+def property_replay_context(candidate_id: str):
+    import final_core
     with final_core.connect() as db:
         candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (candidate_id,)).fetchone()
         if not candidate:
@@ -709,9 +774,26 @@ def replay_property_candidate(candidate_id: str, body: PropertyReplayInput):
     root = Path(source_observation["subject"]).expanduser().resolve()
     if not root.is_dir() or detect_framework(root) != "foundry" or not solidity_sources(root):
         raise HTTPException(409, "Candidate 的 Foundry 源码目录已不可用")
+    return candidate, root
+
+
+def execute_property_replay(candidate_id: str, body: PropertyReplayInput, job_id: str | None = None):
+    """Run the two deterministic rounds, with cooperative cancellation between Forge processes."""
+    import final_core
+    candidate, root = property_replay_context(candidate_id)
 
     started_at = final_core.utcnow()
-    raw_rounds = [run_forge_property_replay(root, candidate["target"], seed) for seed in (0xF13D01, 0xF13D02)]
+    raw_rounds = []
+    for index, seed in enumerate((0xF13D01, 0xF13D02), start=1):
+        if job_id and final_core.verification_job_cancel_requested(job_id):
+            raise PropertyReplayCancelled("用户取消了属性复测")
+        if job_id:
+            final_core.update_verification_job(job_id, phase=f"第 {index} 轮 · Forge seed {hex(seed)}")
+        raw_rounds.append(run_forge_property_replay(root, candidate["target"], seed))
+        if job_id:
+            final_core.update_verification_job(job_id, completed_requests=index)
+    if job_id and final_core.verification_job_cancel_requested(job_id):
+        raise PropertyReplayCancelled("用户取消了属性复测")
     expected_base = candidate["target"].split("(", 1)[0]
     normalized_rounds = []
     for index, replay in enumerate(raw_rounds, start=1):
@@ -726,7 +808,9 @@ def replay_property_candidate(candidate_id: str, body: PropertyReplayInput):
             "counterexample_sha256": digest,
         })
     failure_reasons = [item["reason"] for item in normalized_rounds]
-    stable = all(item["status"] == "failed" and item["property"] for item in normalized_rounds) and len(set(failure_reasons)) == 1
+    stable = (all(item["status"] == "failed" and item["property"] and item["counterexample_sha256"] for item in normalized_rounds)
+              and len(set(failure_reasons)) == 1
+              and len({item["seed"] for item in normalized_rounds}) == 2)
     attempt_status = "reproduced" if stable else "unstable"
 
     artifact_id = final_core.uid("artifact")
@@ -765,6 +849,13 @@ def replay_property_candidate(candidate_id: str, body: PropertyReplayInput):
         attempt_id = final_core.uid("verify")
         result = {
             "stable_failure": stable, "property": candidate["target"], "rounds": normalized_rounds,
+            "artifact_id": artifact_id,
+            "alternative_explanations_checked": {
+                "exact_property_matched": all(item["property"] for item in normalized_rounds),
+                "distinct_seeds": len({item["seed"] for item in normalized_rounds}) == 2,
+                "counterexamples_present": all(item["counterexample_sha256"] for item in normalized_rounds),
+                "stable_failure_reason": len(set(failure_reasons)) == 1,
+            },
             "boundary": "Replay stability does not prove impact, eligibility, or a verified finding.",
         }
         db.execute("INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)", (
@@ -785,6 +876,107 @@ def replay_property_candidate(candidate_id: str, body: PropertyReplayInput):
         "evidence_ids": created_evidence_ids,
         "next_gate": "需继续完成 ProgramSnapshot、影响证明、已知问题/历史审计与反证检查，才能进入 Verified Finding。",
     }
+
+
+def _run_property_replay_job(job_id: str, candidate_id: str, body: PropertyReplayInput) -> None:
+    import final_core
+    final_core.update_verification_job(job_id, status="running", phase="准备 Foundry 属性复测")
+    with final_core.connect() as db:
+        db.execute("UPDATE verification_jobs SET started_at=? WHERE id=?", (final_core.utcnow(), job_id))
+    try:
+        result = execute_property_replay(candidate_id, body, job_id)
+    except PropertyReplayCancelled as error:
+        final_core.update_verification_job(job_id, status="cancelled", phase="已取消", error=str(error), completed=True)
+    except HTTPException as error:
+        final_core.update_verification_job(job_id, status="failed", phase="执行失败", error=str(error.detail), completed=True)
+    except Exception as error:
+        final_core.update_verification_job(job_id, status="failed", phase="执行失败",
+                                           error=f"{type(error).__name__}: {error}", completed=True)
+    else:
+        final_core.update_verification_job(job_id, status="completed", phase="属性复测完成", result=result, completed=True)
+
+
+@router.post("/candidates/{candidate_id}/property-replay/jobs", status_code=202)
+def start_property_replay_job(candidate_id: str, body: PropertyReplayInput):
+    import final_core
+    candidate, _ = property_replay_context(candidate_id)
+    with final_core.connect() as db:
+        active = db.execute("""SELECT id FROM verification_jobs
+            WHERE candidate_id=? AND status IN ('queued','running','cancelling')""", (candidate_id,)).fetchone()
+        if active:
+            raise HTTPException(409, f"这条候选已有进行中的复验：{active['id']}")
+        job_id, timestamp = final_core.uid("verify-job"), final_core.utcnow()
+        db.execute("INSERT INTO verification_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            job_id, candidate_id, candidate["run_id"], "forge-property-replay", "queued", "等待执行",
+            0, 2, 0, None, None, timestamp, None, None,
+        ))
+    thread = threading.Thread(target=_run_property_replay_job, args=(job_id, candidate_id, body),
+                              daemon=True, name=f"fieldwork-{job_id}")
+    thread.start()
+    return final_core.get_verification_job(job_id)
+
+
+@router.post("/candidates/{candidate_id}/finalize-property")
+def finalize_property_candidate(candidate_id: str, body: Web3FindingFinalizeInput):
+    """Bind a stable local property proof to immutable reviewed program rules."""
+    import final_core
+    from verification_receipts import issue_receipt
+
+    with final_core.connect() as db:
+        candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (candidate_id,)).fetchone()
+        if not candidate:
+            raise HTTPException(404, "Candidate 不存在")
+        if candidate["mode"] != "web3" or candidate["category"] != "web3_property_violation":
+            raise HTTPException(409, "仅 Web3 Property Candidate 可完成此验证")
+        if candidate["status"] != "reproduced":
+            raise HTTPException(409, "必须先完成两轮稳定属性复测")
+        replay_attempt = db.execute("""SELECT * FROM verification_attempts
+            WHERE candidate_id=? AND oracle='forge-property-replay' AND status='reproduced'
+            ORDER BY completed_at DESC LIMIT 1""", (candidate_id,)).fetchone()
+        program = db.execute("SELECT * FROM program_snapshots WHERE id=? AND engagement_id=?",
+                             (body.program_snapshot_id, candidate["engagement_id"])).fetchone()
+        invariant = db.execute("""SELECT * FROM invariant_registry
+            WHERE engagement_id=? AND statement=? AND status='violated' ORDER BY created_at DESC LIMIT 1""",
+            (candidate["engagement_id"], candidate["target"])).fetchone()
+    if not replay_attempt or not program or not invariant:
+        raise HTTPException(409, "缺少稳定复测、项目规则或已登记的违反属性")
+    replay = final_core.load(replay_attempt["result"], {})
+    checks = replay.get("alternative_explanations_checked", {})
+    if not replay.get("stable_failure") or not checks or not all(checks.values()):
+        raise HTTPException(409, "属性复测未排除测试匹配、种子或反例缺失问题")
+    artifact_id = replay.get("artifact_id")
+    with final_core.connect() as db:
+        artifact = db.execute("SELECT * FROM artifacts WHERE id=? AND run_id=? AND kind='web3.property_replay'",
+                              (artifact_id, candidate["run_id"])).fetchone()
+    if not artifact:
+        raise HTTPException(409, "属性复测 Artifact 不存在或不属于当前 Run")
+    engagement = final_core.get_engagement(candidate["engagement_id"])
+    rules = final_core.validated_program_rules(program, engagement, body.impact_category)
+    if engagement.get("target_type") == "contract":
+        alignment = final_core.latest_deployment_alignment(engagement["id"])
+        if not alignment or alignment["rules"].get("status") != "aligned":
+            raise HTTPException(409, "链上合约必须先完成源码与部署字节码对齐")
+    reasons = {item["reason"] for item in replay["rounds"]}
+    proof = final_core.VerificationInput(
+        oracle="forge-property-replay-v1", attempts=2, reproduced=True,
+        counterevidence_checked=True,
+        counterevidence_summary="Exact registered property matched; two distinct seeds produced hashed counterexamples and the same failure reason.",
+        severity=rules["severity"], impact_description=body.impact_description,
+        steps=["Match the violated registered invariant", "Replay with deterministic seed 0xF13D01",
+               "Replay with independent seed 0xF13D02", "Bind result to reviewed program rules"],
+        expected=f"Registered invariant {candidate['target']} must hold for all generated inputs",
+        actual=f"Both independent replays failed: {next(iter(reasons))}",
+        root_cause=body.root_cause, weakness=body.weakness, location=body.location,
+        poc_artifact_ids=[artifact_id], program_snapshot_id=program["id"],
+        impact_in_scope=True, known_issue_checked=True, previous_audit_checked=True,
+        poc_rule_checked=True, feasibility=body.feasibility, funds_at_risk=body.funds_at_risk,
+    )
+    proof.receipt_id = issue_receipt(candidate_id, proof)
+    finding = final_core.verify_candidate(candidate_id, proof)
+    return {"status": finding["status"], "finding": finding, "receipt_id": proof.receipt_id,
+            "program_snapshot_id": program["id"], "impact_category": body.impact_category,
+            "impact_demonstrated": False,
+            "boundary": "本结果证明本地属性违反并完成规则资格绑定；经济损失金额未由该属性测试直接证明。"}
 
 
 @router.get("/runs/{run_id}/discovery")
@@ -818,6 +1010,7 @@ def web3_run_discovery(run_id: str):
         "contracts": model.get("contracts", []), "entrypoints": model.get("entrypoints", []),
         "state_variables": model.get("state_variables", []), "call_graph": model.get("call_graph", []),
         "risk_paths": model.get("risk_paths", []),
+        "compiler_analysis": model.get("compiler_analysis", {"status": "unavailable", "units": []}),
         "risk_primitives": model.get("risk_primitives", []), "hypotheses": hypotheses,
         "invariants": model.get("invariants", []), "relationships": model.get("relationships", []),
         "boundary": "Hypotheses require independent reproduction and do not constitute verified vulnerabilities.",

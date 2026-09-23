@@ -112,14 +112,26 @@
     $$('[data-tool-condition]').forEach(button => button.onclick = () => openConditions(button.dataset.toolCondition));
   }
 
+  function renderOracles(oracles) {
+    let section = $('#oracleCatalog');
+    if (!section) {
+      section = document.createElement('section');
+      section.id = 'oracleCatalog';
+      section.className = 'oracle-catalog';
+      $('.tool-section').after(section);
+    }
+    const level = {automatic_proof:'自动证明', bounded_adapter:'受限适配器', human_review_only:'仅人工复核'};
+    section.innerHTML = `<div class="section-heading"><div><p class="eyebrow">PROOF BOUNDARY</p><h2>验证方法目录</h2><p>每种方法公开适用范围、成立条件与反例；目录外类型不会由按钮或文字升级为漏洞。</p></div><strong>${oracles.filter(item=>item.promotes_finding).length} MACHINE ORACLES</strong></div><div class="oracle-grid">${oracles.map(item=>`<article class="${item.promotes_finding?'supported':'review-only'}"><header><span>${esc(level[item.level]||item.level)}</span><b>${esc(item.mode)}</b></header><h3>${esc(item.id)}</h3><p>${esc(item.supports.join(' · ')||'尚无机器支持类别')}</p><dl><dt>成立条件</dt><dd>${esc(item.requires.join('；'))}</dd><dt>正样本</dt><dd>${esc(item.positive)}</dd><dt>负样本 / 失败关闭</dt><dd>${esc(item.negative)}</dd></dl><footer>${esc(item.portable)}</footer></article>`).join('')}</div>`;
+  }
+
   async function refreshSettings() {
     try {
-      const [capabilities, provider, readiness, status] = await Promise.all([
-        api('/api/v1/capabilities'), api('/api/v1/traditional/provider'), api('/api/v1/runtime/readiness'), api('/api/v1/runtime/status')
+      const [capabilities, provider, readiness, status, oracles] = await Promise.all([
+        api('/api/v1/capabilities'), api('/api/v1/traditional/provider'), api('/api/v1/runtime/readiness'), api('/api/v1/runtime/status'), api('/api/v1/verification-oracles')
       ]);
       const agent = {...readiness.native_agent, domain:'agent', detail:'Scope 与预算约束的 Chrome 只读研究 Agent', version:readiness.native_agent.browser};
       snapshot = {tools:[agent, ...capabilities], provider, readiness, status};
-      renderStatus(status, readiness); renderTools(snapshot.tools);
+      renderStatus(status, readiness); renderTools(snapshot.tools); renderOracles(oracles);
       if (provider.base_url && !$('#providerBase').value) $('#providerBase').value = provider.base_url;
       if (provider.model && !$('#providerModel').value) $('#providerModel').value = provider.model.replace(/^openai\//, '');
       $('#providerBadge').textContent = status.provider.connected ? 'CONNECTED' : provider.configured ? 'CHECK CONNECTION' : 'OPTIONAL';

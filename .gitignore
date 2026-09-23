@@ -4,6 +4,7 @@
 *.swo
 .idea/
 .vscode/
+website/.git/
 
 # Python / test / coverage caches
 .venv/

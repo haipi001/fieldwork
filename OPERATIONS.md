@@ -10,6 +10,21 @@
 6. Findings 默认先显示 Verified；Candidate 始终在独立分区。
 7. Reports 选择平台，先看完整度，再由用户主动导出材料包。
 
+## 本地环境
+
+首次安装或依赖更新：
+
+```bash
+./scripts/bootstrap_local.sh
+```
+
+需要验证干净重建时：
+
+```bash
+./scripts/bootstrap_local.sh --recreate --dev
+.venv/bin/python -m pytest -q
+```
+
 ## 服务恢复
 
 重新启动服务：

@@ -6,6 +6,7 @@ import json
 import subprocess
 import socket
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,11 +17,21 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from reporting import redact
+from reporting import redact, redact_structure
 
 
 router = APIRouter(prefix="/api/v1/traditional", tags=["Traditional SRC runtime"])
 ARTIFACT_ROOT = Path(__file__).resolve().parent / "data" / "artifacts"
+
+
+class VerificationCancelled(Exception):
+    pass
+
+
+class IdentitySessionUnavailable(HTTPException):
+    def __init__(self, identity_id):
+        super().__init__(409, "测试账号会话不可用，请重新登录后继续。")
+        self.identity_id = identity_id
 
 
 class ReplayRequest(BaseModel):
@@ -30,8 +41,16 @@ class ReplayRequest(BaseModel):
     body: str | None = None
 
 
+class AuthorizationAssertion(BaseModel):
+    baseline_identity: ReplayRequest
+    attack_identity: ReplayRequest
+    principal_field: str = Field(min_length=1, max_length=160)
+    owner_field: str = Field(min_length=1, max_length=160)
+
+
 class HttpReplayInput(BaseModel):
     candidate_id: str
+    authorization: AuthorizationAssertion | None = None
     baseline: ReplayRequest
     attack: ReplayRequest
     negative_control: ReplayRequest
@@ -167,22 +186,30 @@ def resolve_identity_headers(identity_id: str) -> dict[str, str]:
     if len(parts) != 2 or not all(parts):
         raise HTTPException(422, "Keychain 引用格式应为 keychain://service/account")
     service, account = parts
+    if service == 'fieldwork-session':
+        import session_capture
+        try:
+            stored_payload = session_capture.read_keychain(account)
+        except RuntimeError as error:
+            raise IdentitySessionUnavailable(identity_id) from error
+    else:
+        try:
+            result = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise HTTPException(409, "Keychain 会话暂不可用") from error
+        if result.returncode != 0:
+            raise HTTPException(409, "Keychain 中找不到该测试会话，请重新采集登录态")
+        stored_payload = result.stdout
     try:
-        result = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise HTTPException(409, f"keychain_session_unavailable: {type(error).__name__}") from error
-    if result.returncode != 0:
-        raise HTTPException(409, "Keychain 中找不到该测试会话，请重新采集登录态")
-    try:
-        secret = json.loads(result.stdout)
+        secret = json.loads(stored_payload)
     except json.JSONDecodeError as error:
-        raise HTTPException(409, "Keychain 会话必须是包含 headers 对象的 JSON") from error
+        raise IdentitySessionUnavailable(identity_id) from error
     headers = secret.get("headers") if isinstance(secret, dict) else None
     if not isinstance(headers, dict) or not headers:
-        raise HTTPException(409, "Keychain 会话缺少 headers 对象")
+        raise IdentitySessionUnavailable(identity_id)
     clean = {}
     for key, value in headers.items():
         if not isinstance(key, str) or not isinstance(value, str) or len(key) > 120 or len(value) > 16384:
@@ -387,13 +414,13 @@ def ptai_replay(run_id: str, body: PtaiReplayInput):
         ))
     if not reproduced:
         return {"status": "human_review", "artifact_id": artifact_id, "observation_id": observation_id, "replay": replay}
-    replay_text = str(replay.get("replay") or "2/2")
+    replay_text = str(replay.get("replay") or "")
     try:
         successful, total = [int(value) for value in replay_text.split("/", 1)]
     except (ValueError, AttributeError):
-        successful = total = max(2, attempts)
+        raise HTTPException(409, "ptai 未提供可验证的逐轮成功计数")
     diff = str((receipt.get("evidence") or {}).get("diff") or "ptai oracle control diverged as required")
-    verification = final_core.verify_candidate(body.candidate_id, final_core.VerificationInput(
+    proof = final_core.VerificationInput(
         oracle=f"ptai:{replay.get('oracle') or receipt.get('oracle_kind') or 'machine-oracle'}",
         attempts=max(2, total), reproduced=successful == total and total >= 2,
         counterevidence_checked=True, counterevidence_summary=diff,
@@ -402,12 +429,54 @@ def ptai_replay(run_id: str, body: PtaiReplayInput):
         expected="The named oracle's negative control must diverge from the exploit condition",
         actual=json.dumps(replay, ensure_ascii=False), root_cause=body.root_cause,
         weakness=body.weakness, location=body.location, poc_artifact_ids=[artifact_id],
-    ))
+    )
+    from verification_receipts import issue_receipt
+    proof.receipt_id = issue_receipt(body.candidate_id, proof)
+    verification = final_core.verify_candidate(body.candidate_id, proof)
     return {"status": verification.get("status"), "artifact_id": artifact_id, "observation_id": observation_id, "replay": replay, "verification": verification}
 
 
-@router.post("/runs/{run_id}/http-replay")
-def http_replay(run_id: str, body: HttpReplayInput):
+def json_scalar(response: dict, path: str):
+    try:
+        value = json.loads(response.get("_transient_body", ""))
+        for part in path.split("."):
+            value = value[part]
+        return str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value) else None
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def authorization_round(results: dict, assertion: AuthorizationAssertion) -> dict:
+    owner = json_scalar(results["baseline_identity"], assertion.principal_field)
+    other = json_scalar(results["attack_identity"], assertion.principal_field)
+    baseline_owner = json_scalar(results["baseline"], assertion.owner_field)
+    attack_owner = json_scalar(results["attack"], assertion.owner_field)
+    checks = {
+        "identities_authenticated": all(results[name]["status"] == 200 for name in ("baseline_identity", "attack_identity")),
+        "distinct_principals": owner is not None and other is not None and owner != other,
+        "owner_binding": owner is not None and baseline_owner == owner and attack_owner == owner,
+        "object_read": results["baseline"]["status"] == 200 and results["attack"]["status"] == 200,
+        "same_object_response": signature(results["baseline"]) == signature(results["attack"]),
+        "unauthenticated_denied": results["negative_control"]["status"] in {401, 403},
+    }
+    return {"passed": all(checks.values()), "checks": checks}
+
+
+def authorization_repair_round(results: dict, assertion: AuthorizationAssertion) -> dict:
+    owner = json_scalar(results["baseline_identity"], assertion.principal_field)
+    other = json_scalar(results["attack_identity"], assertion.principal_field)
+    baseline_owner = json_scalar(results["baseline"], assertion.owner_field)
+    checks = {
+        "identities_authenticated": all(results[name]["status"] == 200 for name in ("baseline_identity", "attack_identity")),
+        "distinct_principals": owner is not None and other is not None and owner != other,
+        "baseline_owner_binding": owner is not None and baseline_owner == owner and results["baseline"]["status"] == 200,
+        "non_owner_denied": results["attack"]["status"] in {401, 403},
+        "unauthenticated_denied": results["negative_control"]["status"] in {401, 403},
+    }
+    return {"passed": all(checks.values()), "checks": checks}
+
+
+def prepare_http_replay(run_id: str, body: HttpReplayInput):
     import final_core
     with final_core.connect() as db:
         run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
@@ -418,29 +487,126 @@ def http_replay(run_id: str, body: HttpReplayInput):
         raise HTTPException(409, "Candidate 不存在或不属于当前 Run")
     engagement = final_core.get_engagement(run["engagement_id"])
     specs = [body.baseline, body.attack, body.negative_control]
+    names = ["baseline", "attack", "negative_control"]
+    if body.authorization:
+        assertion = body.authorization
+        if any(spec.method.upper() != "GET" or spec.body is not None for spec in [*specs, assertion.baseline_identity, assertion.attack_identity]):
+            raise HTTPException(422, "对象读取 Oracle 仅支持无请求体的 GET")
+        if body.baseline.url != body.attack.url or body.attack.url != candidate["target"] or body.negative_control.url != body.attack.url:
+            raise HTTPException(422, "基线、测试、未登录负对照必须访问候选的同一对象 URL")
+        if body.baseline.headers == body.attack.headers or not body.baseline.headers or not body.attack.headers:
+            raise HTTPException(422, "必须使用两个不同的已登录身份")
+        if body.negative_control.headers:
+            raise HTTPException(422, "负对照必须不携带身份请求头")
+        if assertion.baseline_identity.headers != body.baseline.headers or assertion.attack_identity.headers != body.attack.headers:
+            raise HTTPException(422, "身份检查必须与对应对象请求使用相同凭据")
+        if assertion.baseline_identity.url != assertion.attack_identity.url:
+            raise HTTPException(422, "两个身份必须使用同一个身份检查端点")
+        specs.extend([assertion.baseline_identity, assertion.attack_identity])
+        names.extend(["baseline_identity", "attack_identity"])
     for spec in specs:
         network_guard(engagement, spec)
+    return run, engagement, specs, names
+
+
+@router.post("/runs/{run_id}/http-replay/plan")
+def preview_http_replay(run_id: str, body: HttpReplayInput):
+    _, engagement, specs, names = prepare_http_replay(run_id, body)
+    return {"oracle": "http-authorization-read-v2" if body.authorization else "http-state-replay-v1",
+            "rounds": 2, "request_count": len(specs) * 2,
+            "requests": [{"role": name, "method": spec.method, "url": redact(spec.url)} for name, spec in zip(names, specs)],
+            "max_requests_per_second": engagement["policy"].get("max_requests_per_second", 1),
+            "can_prove": bool(body.authorization), "sends_requests": False,
+            "checks": ["两个已登录且不同的主体", "基线对象归属与主体一致", "另一主体读取同一对象", "未登录访问被拒绝", "两轮结果稳定"],
+            "limitation": "适用于 JSON 对象读取与身份归属检查；不支持写入、非 JSON 响应或通用业务授权推断。"}
+
+
+@router.post("/runs/{run_id}/http-replay")
+def http_replay(run_id: str, body: HttpReplayInput):
+    return execute_http_replay(run_id, body)
+
+
+def _job_update(job_id: str, *, status: str | None = None, phase: str | None = None,
+                completed_requests: int | None = None, result: dict | None = None,
+                error: str | None = None, completed: bool = False) -> None:
+    import final_core
+    assignments, values = [], []
+    for column, value in (("status", status), ("phase", phase),
+                          ("completed_requests", completed_requests),
+                          ("result", final_core.dump(result) if result is not None else None),
+                          ("error", redact(error) if error is not None else None)):
+        if value is not None:
+            assignments.append(f"{column}=?")
+            values.append(value)
+    if completed:
+        assignments.append("completed_at=?")
+        values.append(final_core.utcnow())
+    if not assignments:
+        return
+    values.append(job_id)
+    with final_core.connect() as db:
+        db.execute(f"UPDATE verification_jobs SET {','.join(assignments)} WHERE id=?", values)
+
+
+def _job_cancel_requested(job_id: str) -> bool:
+    import final_core
+    with final_core.connect() as db:
+        row = db.execute("SELECT cancel_requested FROM verification_jobs WHERE id=?", (job_id,)).fetchone()
+    return bool(row and row["cancel_requested"])
+
+
+def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None):
+    import final_core
+    run, engagement, specs, names = prepare_http_replay(run_id, body)
     rate = max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
     interval = 1 / rate
     rounds = []
+    completed_requests = 0
     for replay_index in range(2):
         results = {}
-        for index, (name, spec) in enumerate(zip(("baseline", "attack", "negative_control"), specs)):
+        for index, (name, spec) in enumerate(zip(names, specs)):
+            if job_id and _job_cancel_requested(job_id):
+                raise VerificationCancelled("用户取消了复验")
+            if job_id:
+                _job_update(job_id, phase=f"第 {replay_index + 1} 轮 · {name}")
+            if before_request:
+                before_request(replay_index, name)
+            network_guard(engagement, spec)
             consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
             if not consumed:
                 raise HTTPException(409, reason)
             results[name] = request_once(spec)
-            if index < 2:
+            if after_response:
+                after_response()
+            completed_requests += 1
+            if job_id:
+                _job_update(job_id, completed_requests=completed_requests)
+            if index < len(specs) - 1:
                 time.sleep(interval)
         rounds.append(results)
         if replay_index == 0:
             time.sleep(interval)
-    reproduced = all(signature(r["attack"]) == signature(r["baseline"]) and signature(r["negative_control"]) != signature(r["attack"]) for r in rounds)
+    differential_match = all(signature(r["attack"]) == signature(r["baseline"]) and signature(r["negative_control"]) != signature(r["attack"]) for r in rounds)
+    if job_id and _job_cancel_requested(job_id):
+        raise VerificationCancelled("用户取消了复验")
     stable = len({signature(r["attack"]) for r in rounds}) == 1
     artifact_id = final_core.uid("artifact")
     ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
-    artifact = {"oracle": "http-state-replay-v1", "rounds": rounds, "reproduced": reproduced, "stable": stable}
+    semantic_checks = [authorization_round(r, body.authorization) for r in rounds] if body.authorization else []
+    repair_checks = [authorization_repair_round(r, body.authorization) for r in rounds] if body.authorization else []
+    reproduced = bool(semantic_checks) and all(check["passed"] for check in semantic_checks)
+    repaired = bool(repair_checks) and all(check["passed"] for check in repair_checks)
+    repaired = repaired and len({signature(r["attack"]) for r in rounds}) == 1
+    oracle = "http-authorization-read-v2" if body.authorization else "http-state-replay-v1"
+    for results in rounds:
+        for response in results.values():
+            response.pop("_transient_body", None)
+    artifact = {"oracle": oracle, "rounds": rounds, "reproduced": reproduced, "repaired": repaired, "stable": stable,
+                "differential_match": differential_match, "semantic_checks": semantic_checks,
+                "repair_checks": repair_checks,
+                "assertion": {"principal_field": body.authorization.principal_field, "owner_field": body.authorization.owner_field} if body.authorization else None,
+                "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
     artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
     with final_core.connect() as db:
         db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
@@ -452,14 +618,116 @@ def http_replay(run_id: str, body: HttpReplayInput):
             body.attack.url, f"Two-round HTTP replay reproduced={reproduced} stable={stable}",
             1.0 if reproduced and stable else .3, "http-state-replay", artifact_id, final_core.utcnow(),
         ))
-    result = final_core.verify_candidate(body.candidate_id, final_core.VerificationInput(
-        oracle="http-state-replay-v1", attempts=2, reproduced=reproduced and stable,
-        counterevidence_checked=True, counterevidence_summary="Negative control diverged from the attack response" if reproduced else "Negative control did not establish the claimed boundary",
+    if not finalize:
+        if before_request:
+            before_request(2, "save_result")
+        with final_core.connect() as db:
+            current = db.execute("SELECT status,evidence_ids FROM candidate_findings WHERE id=? AND run_id=?", (body.candidate_id,run_id)).fetchone()
+            if not current or current['status'] in ('verified','archived','graveyard'):
+                raise HTTPException(409, "候选状态已变化，停止自动更新")
+            evidence_id=final_core.uid('evidence')
+            db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)',
+                       (evidence_id,observation_id,run_id,'http.replay',
+                        '自动执行两轮对象读取正反对照',artifact_id,'supporting' if reproduced and stable else 'counterevidence',final_core.utcnow()))
+            status='reproduced' if reproduced and stable else current['status']
+            ids=final_core.load(current['evidence_ids'],[])+[evidence_id]
+            db.execute('UPDATE candidate_findings SET status=?,evidence_ids=?,updated_at=? WHERE id=?',
+                       (status,final_core.dump(ids),final_core.utcnow(),body.candidate_id))
+        return {'artifact_id':artifact_id,'observation_id':observation_id,'replay':artifact,
+                'verification':{'status':'reproduced' if reproduced and stable else 'not_established',
+                                'formal_finding_created':False}}
+    proof = final_core.VerificationInput(
+        oracle=oracle, attempts=2, reproduced=reproduced and stable,
+        counterevidence_checked=True, counterevidence_summary="Unauthenticated access denied; authenticated distinct principal read owner-bound object in both rounds" if reproduced else "Identity/object ownership assertions missing or not established; response differences alone are not proof",
         severity=body.severity, impact_description=body.impact_description,
         steps=["Replay authorized baseline", "Replay candidate attack", "Replay negative control", "Repeat the sequence"],
-        expected=f"Negative control differs; baseline establishes intended state",
+        expected="Authenticated non-owner cannot read owner-bound object; unauthenticated control is denied",
         actual=f"attack={rounds[-1]['attack']['status']} baseline={rounds[-1]['baseline']['status']}",
         root_cause=body.root_cause, weakness=body.weakness, location=body.location,
         poc_artifact_ids=[artifact_id],
-    ))
+    )
+    if proof.reproduced:
+        from verification_receipts import issue_receipt
+        proof.receipt_id = issue_receipt(body.candidate_id, proof)
+        result = final_core.verify_candidate(body.candidate_id, proof)
+    elif repaired:
+        from verification_receipts import issue_fixed_receipt
+        result = issue_fixed_receipt(body.candidate_id, oracle, artifact_id, repair_checks)
+        final_core.add_event(run_id, "verification", "finding.verified_fixed",
+                             "两轮身份边界负向复测均拒绝旧攻击，Finding 已确认修复",
+                             {"finding_id": result["id"], "candidate_id": body.candidate_id,
+                              "receipt_id": result["receipt_id"]})
+    else:
+        result = final_core.verify_candidate(body.candidate_id, proof)
     return {"artifact_id": artifact_id, "observation_id": observation_id, "replay": artifact, "verification": result}
+
+
+def _run_http_replay_job(job_id: str, run_id: str, body: HttpReplayInput) -> None:
+    import final_core
+    _job_update(job_id, status="running", phase="准备身份与范围检查")
+    with final_core.connect() as db:
+        db.execute("UPDATE verification_jobs SET started_at=? WHERE id=?", (final_core.utcnow(), job_id))
+    try:
+        result = execute_http_replay(run_id, body, job_id)
+    except VerificationCancelled as error:
+        _job_update(job_id, status="cancelled", phase="已取消", error=str(error), completed=True)
+    except HTTPException as error:
+        _job_update(job_id, status="failed", phase="执行失败", error=str(error.detail), completed=True)
+    except Exception as error:
+        _job_update(job_id, status="failed", phase="执行失败", error=f"{type(error).__name__}: {error}", completed=True)
+    else:
+        _job_update(job_id, status="completed", phase="复验完成", result=result, completed=True)
+
+
+def _hydrate_verification_job(row) -> dict:
+    import final_core
+    value = dict(row)
+    value["cancel_requested"] = bool(value["cancel_requested"])
+    value["result"] = final_core.load(value["result"], None)
+    value["progress"] = round(value["completed_requests"] / value["total_requests"], 3) if value["total_requests"] else 0
+    return redact_structure(value)
+
+
+@router.post("/runs/{run_id}/http-replay/jobs", status_code=202)
+def start_http_replay_job(run_id: str, body: HttpReplayInput):
+    import final_core
+    _, _, specs, _ = prepare_http_replay(run_id, body)
+    if not body.authorization:
+        raise HTTPException(422, "后台机器复验必须配置身份与对象归属断言")
+    with final_core.connect() as db:
+        active = db.execute("""SELECT id FROM verification_jobs
+            WHERE candidate_id=? AND status IN ('queued','running','cancelling')""", (body.candidate_id,)).fetchone()
+        if active:
+            raise HTTPException(409, f"这条候选已有进行中的复验：{active['id']}")
+        job_id, timestamp = final_core.uid("verify-job"), final_core.utcnow()
+        db.execute("INSERT INTO verification_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            job_id, body.candidate_id, run_id, "http-authorization-read-v2", "queued", "等待执行",
+            0, len(specs) * 2, 0, None, None, timestamp, None, None,
+        ))
+    thread = threading.Thread(target=_run_http_replay_job, args=(job_id, run_id, body), daemon=True,
+                              name=f"fieldwork-{job_id}")
+    thread.start()
+    return get_http_replay_job(job_id)
+
+
+@router.get("/http-replay/jobs/{job_id}")
+def get_http_replay_job(job_id: str):
+    import final_core
+    with final_core.connect() as db:
+        row = db.execute("SELECT * FROM verification_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "复验任务不存在")
+    return _hydrate_verification_job(row)
+
+
+@router.post("/http-replay/jobs/{job_id}/cancel")
+def cancel_http_replay_job(job_id: str):
+    import final_core
+    with final_core.connect() as db:
+        row = db.execute("SELECT * FROM verification_jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "复验任务不存在")
+        if row["status"] not in {"queued", "running", "cancelling"}:
+            raise HTTPException(409, "复验任务已经结束")
+        db.execute("UPDATE verification_jobs SET cancel_requested=1,status='cancelling',phase='等待当前请求结束' WHERE id=?", (job_id,))
+    return get_http_replay_job(job_id)

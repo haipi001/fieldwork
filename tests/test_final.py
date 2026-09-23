@@ -1,7 +1,11 @@
 import asyncio
+import base64
+import io
 import json
 import sqlite3
 import threading
+import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -27,11 +31,12 @@ def client(tmp_path, monkeypatch):
     database = tmp_path / "final-test.db"
     monkeypatch.setattr(app, "DB", database)
     monkeypatch.setattr(final_core, "DB", database)
+    monkeypatch.setattr(final_core, "LOCAL_DATA_ROOT", tmp_path)
     monkeypatch.setattr(reporting, "EXPORTS", tmp_path / "exports")
     monkeypatch.setattr(web3_analysis, "ARTIFACT_ROOT", tmp_path / "artifacts")
     monkeypatch.setattr(traditional_tools, "ARTIFACT_ROOT", tmp_path / "artifacts")
     monkeypatch.setattr(traditional_runtime, "ARTIFACT_ROOT", tmp_path / "artifacts")
-    with TestClient(app.app) as test_client:
+    with TestClient(app.app, base_url="http://127.0.0.1:8000") as test_client:
         yield test_client
 
 
@@ -57,6 +62,102 @@ def test_target_resolution_and_immutable_scope(client):
     assert scope[0] == 1 and scope[1]
 
 
+@pytest.mark.parametrize("kind,document", [
+    ("openapi", {"openapi": "3.1.0", "servers": [{"url": "https://api.example.test/v1"}],
+                 "paths": {"/orders": {"get": {}, "post": {}}, "/me": {"get": {}}}}),
+    ("postman", {"info": {"name": "API"}, "item": [{"name": "Orders", "request": {
+        "method": "GET", "header": [{"key": "Authorization", "value": "Bearer SECRET"}],
+        "url": {"raw": "https://api.example.test/orders?token=SECRET"}}}]}),
+    ("har", {"log": {"entries": [{"request": {"method": "GET",
+        "url": "https://api.example.test/orders?api_key=SECRET", "headers": [{"name": "Cookie", "value": "SECRET"}]}},
+        {"request": {"method": "GET", "url": "https://cdn.third.test/app.js"}}]}}),
+])
+def test_target_package_preview_and_apply_only_persists_safe_surface(client, kind, document):
+    content = json.dumps(document)
+    preview = client.post("/api/v1/target-packages/preview", json={"kind": "auto", "content": content})
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["kind"] == kind and data["root_target"] == "https://api.example.test"
+    assert "SECRET" not in json.dumps(data) and all("?" not in item["url"] for item in data["endpoints"])
+    applied = client.post("/api/v1/target-packages/apply", json={
+        "kind": kind, "content": content, "name": f"Imported {kind}",
+        "root_target": "https://api.example.test",
+    })
+    assert applied.status_code == 201, applied.text
+    engagement = applied.json()["engagement"]
+    assert engagement["status"] == "draft" and engagement["confirmed_at"] is None
+    assert engagement["scope"]["import_kind"] == kind
+    assert engagement["scope"]["import_source_sha256"] == data["source_sha256"]
+    assert all(item["origin"] == "https://api.example.test" for item in engagement["scope"]["imported_surface"])
+    assert "SECRET" not in json.dumps(engagement)
+
+
+def test_source_zip_preview_and_apply_extracts_only_safe_source(client):
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+        package.writestr("project/src/Vault.sol", "contract Vault { function value() external pure returns(uint){return 1;} }")
+        package.writestr("project/foundry.toml", "[profile.default]\nsrc = 'src'\n")
+        package.writestr("project/image.png", b"not-source")
+    payload = {
+        "kind": "source_zip", "encoding": "base64", "mode": "web3", "filename": "vault.zip",
+        "content": base64.b64encode(archive.getvalue()).decode(),
+    }
+    preview = client.post("/api/v1/target-packages/preview", json=payload)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["counts"] == {"files": 2, "bytes": 104, "ignored": 1}
+    assert {item["path"] for item in preview.json()["files"]} == {"project/src/Vault.sol", "project/foundry.toml"}
+    applied = client.post("/api/v1/target-packages/apply", json={**payload, "name": "Imported Vault"})
+    assert applied.status_code == 201, applied.text
+    engagement = applied.json()["engagement"]
+    repository = Path(engagement["normalized_target"])
+    assert engagement["mode"] == "web3" and engagement["target_type"] == "repository"
+    assert engagement["status"] == "draft" and engagement["confirmed_at"] is None
+    assert (repository / "project/src/Vault.sol").is_file()
+    assert not (repository / "project/image.png").exists()
+    assert engagement["scope"]["import_source_sha256"] == preview.json()["source_sha256"]
+
+
+def test_source_zip_rejects_path_traversal(client):
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr("../escape.py", "print('unsafe')")
+    response = client.post("/api/v1/target-packages/preview", json={
+        "kind": "source_zip", "encoding": "base64", "mode": "traditional", "filename": "unsafe.zip",
+        "content": base64.b64encode(archive.getvalue()).decode(),
+    })
+    assert response.status_code == 422 and "不安全路径" in response.text
+
+
+def test_cidr_import_collapses_ranges_and_authorizes_only_member_ips(client):
+    payload = {"kind": "cidr", "content": "192.0.2.0/25\n192.0.2.128/25\n2001:db8::/126", "mode": "traditional"}
+    preview = client.post("/api/v1/target-packages/preview", json=payload)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["counts"] == {"ranges": 2, "addresses": 260}
+    assert [item["cidr"] for item in preview.json()["ranges"]] == ["192.0.2.0/24", "2001:db8::/126"]
+    applied = client.post("/api/v1/target-packages/apply", json={**payload, "name": "Authorized lab network"})
+    assert applied.status_code == 201
+    engagement = applied.json()["engagement"]
+    assert engagement["target_type"] == "cidr" and engagement["status"] == "draft"
+    client.post(f"/api/v1/engagements/{engagement['id']}/confirm")
+    inside = client.post("/api/v1/policy/check", json={
+        "engagement_id": engagement["id"], "target": "https://192.0.2.42/status", "action": "read"})
+    outside = client.post("/api/v1/policy/check", json={
+        "engagement_id": engagement["id"], "target": "https://198.51.100.42/status", "action": "read"})
+    assert inside.json()["allowed"] is True
+    assert outside.json() == {"allowed": False, "reason": "out_of_scope", "target": "https://198.51.100.42"}
+
+
+def test_target_package_rejects_unknown_or_changed_root(client):
+    unknown = client.post("/api/v1/target-packages/preview", json={"kind": "auto", "content": '{"hello":"world"}'})
+    assert unknown.status_code == 422
+    content = json.dumps({"openapi": "3.0.0", "servers": [{"url": "https://api.example.test"}],
+                          "paths": {"/health": {"get": {}}}})
+    changed = client.post("/api/v1/target-packages/apply", json={
+        "kind": "openapi", "content": content, "name": "Changed root", "root_target": "https://evil.test",
+    })
+    assert changed.status_code == 422 and "来源列表" in changed.json()["detail"]
+
+
 def test_bulk_archive_recent_projects_preserves_records(client):
     first = create_ready(client, target="https://one.example.test")
     second = create_ready(client, target="https://two.example.test")
@@ -75,6 +176,59 @@ def test_traditional_local_and_git_repository_targets_keep_repository_identity(c
     remote = client.post("/api/v1/targets/resolve", json={"target": "https://github.com/acme/project.git", "mode": "traditional"})
     assert remote.status_code == 200 and remote.json()["target_type"] == "repository"
     assert remote.json()["normalized_target"].endswith("/acme/project.git")
+
+
+def test_project_asset_graph_links_root_target_to_observed_assets(client):
+    engagement = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+    first = client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type": "surface.route", "subject": "https://example.test/api/orders/42",
+        "summary": "Observed authorized API route", "source_capability": "katana", "confidence": .8,
+    })
+    second = client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type": "surface.route", "subject": "https://example.test/api/orders/42",
+        "summary": "Route confirmed by browser", "source_capability": "native-agent", "confidence": .9,
+    })
+    outside = client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type": "surface.route", "subject": "https://cdn.example.test/app.js",
+        "summary": "Observed a subdomain that was not authorized", "source_capability": "katana", "confidence": .7,
+    })
+    assert first.status_code == 201 and second.status_code == 201 and outside.status_code == 201
+    graph = client.get(f"/api/v1/engagements/{engagement['id']}/asset-graph")
+    assert graph.status_code == 200
+    payload = graph.json()
+    assert payload["counts"]["nodes"] == 3 and payload["counts"]["edges"] == 2
+    assert payload["counts"]["by_type"] == {"target": 1, "surface.route": 2}
+    root = next(node for node in payload["nodes"] if node["id"] == payload["root_id"])
+    route = next(node for node in payload["nodes"] if node["label"].endswith("/api/orders/42"))
+    outside_route = next(node for node in payload["nodes"] if node["label"].startswith("https://cdn."))
+    assert root["attributes"]["root"] is True and root["label"] == engagement["normalized_target"]
+    assert route["attributes"]["source"] == "native-agent" and route["attributes"]["confidence"] == .9
+    assert route["attributes"]["scope_status"] == "in_scope"
+    assert outside_route["attributes"]["scope_status"] == "outside_root"
+    edge = next(item for item in payload["edges"] if item["target_id"] == route["id"])
+    assert edge["source_id"] == root["id"]
+    assert edge["evidence_ids"] == [first.json()["id"], second.json()["id"]]
+    assert "未观察到" in payload["boundary"]
+    with final_core.connect() as db:
+        db.execute("DELETE FROM relationships WHERE engagement_id=?", (engagement["id"],))
+        db.execute("DELETE FROM entities WHERE engagement_id=? AND entity_type!='target'", (engagement["id"],))
+    legacy_graph = client.get(f"/api/v1/engagements/{engagement['id']}/asset-graph").json()
+    assert legacy_graph["counts"]["nodes"] == 3 and legacy_graph["counts"]["edges"] == 2
+    assert any(node["attributes"].get("derived_from_observation") for node in legacy_graph["nodes"])
+    assert next(node for node in legacy_graph["nodes"] if node["label"].startswith("https://cdn."))["attributes"]["scope_status"] == "outside_root"
+
+
+def test_oracle_catalog_discloses_supported_and_human_review_boundaries(client):
+    response = client.get("/api/v1/verification-oracles")
+    assert response.status_code == 200
+    items = {item["id"]: item for item in response.json()}
+    assert items["http-authorization-read-v2"]["promotes_finding"] is True
+    assert items["http-authorization-read-v2"]["portable"] == "recorded_assertion"
+    assert items["forge-property-replay-v1"]["portable"] == "isolated_local_execution"
+    assert items["unregistered"]["level"] == "human_review_only"
+    assert items["unregistered"]["promotes_finding"] is False
+    assert all(item["positive"] and item["negative"] and item["requires"] for item in items.values())
 
 
 def test_identity_workspace_crud_and_role_matrix_never_echoes_credentials(client):
@@ -137,7 +291,7 @@ def test_visible_session_capture_is_scope_gated_and_keychain_only(client, monkey
     assert outside.status_code == 409 and "auth_allowed_hosts" in outside.json()["detail"]
 
     started_args = {}
-    monkeypatch.setattr(session_capture, "start", lambda identity_id, login_url, allowed_hosts, max_requests: (
+    monkeypatch.setattr(session_capture, "start", lambda identity_id, login_url, allowed_hosts, max_requests, **kwargs: (
         started_args.update({"identity_id": identity_id, "login_url": login_url, "allowed_hosts": allowed_hosts, "max_requests": max_requests})
         or {"id": "capture-test", "identity_id": identity_id, "status": "browser_open", "login_url": login_url}
     ))
@@ -942,7 +1096,7 @@ def test_declarative_branch_and_bounded_read_loop_execute_without_scripts(client
         server.server_close()
 
 
-def test_numeric_and_collection_invariants_detect_accounting_drift_without_promoting_finding(client):
+def test_numeric_and_collection_invariants_create_candidate_without_promoting_finding(client):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             payload = {
@@ -1009,15 +1163,55 @@ def test_numeric_and_collection_invariants_detect_accounting_drift_without_promo
             db.execute("UPDATE analysis_runs SET status='completed',completed_at=? WHERE id=?", (final_core.utcnow(), run_id))
         response = client.post(f"/api/v1/campaigns/{campaign['id']}/iterations/{iteration['id']}/execute", json={"run_id": run_id, "max_tests": 10})
         assert response.status_code == 200, response.text
-        by_workflow = {item["workflow_id"]: item for item in response.json()["results"] if item["kind"] == "workflow_sequence"}
+        payload = response.json()
+        by_workflow = {item["workflow_id"]: item for item in payload["results"] if item["kind"] == "workflow_sequence"}
         broken_result, healthy_result = by_workflow[broken.json()["id"]], by_workflow[healthy.json()["id"]]
         assert broken_result["invariant_failures"] == 1
         assert broken_result["failed_invariant_kinds"] == ["json_sum_equals"] and broken_result["hypothesis_id"]
+        assert len(payload["candidate_ids"]) == 1
+        assert broken_result["candidate_id"] == payload["candidate_ids"][0]
         assert healthy_result["invariant_failures"] == 0 and "hypothesis_id" not in healthy_result
+        findings = client.get(f"/api/v1/findings?run_id={run_id}").json()
+        assert findings["verified"] == []
+        assert [item["id"] for item in findings["candidates"]] == payload["candidate_ids"]
+        campaign_state = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
+        assert campaign_state["candidate_links"][0]["candidate_id"] == payload["candidate_ids"][0]
+        assert campaign_state["candidate_links"][0]["hypothesis_id"] == broken_result["hypothesis_id"]
         with sqlite3.connect(final_core.DB) as db:
             assert db.execute("SELECT COUNT(*) FROM canonical_findings").fetchone()[0] == 0
     finally:
         server.shutdown(); server.server_close()
+
+
+def test_business_workflow_templates_apply_through_scope_validation(client):
+    engagement = create_ready(client, target="https://templates.test")
+    campaign = client.post(f"/api/v1/engagements/{engagement['id']}/campaigns", json={
+        "name": "Template campaign", "objective": "Build a bounded workflow from a reviewed template",
+    }).json()
+    catalog = client.get("/api/v1/business-workflow-templates")
+    assert catalog.status_code == 200
+    assert {item["id"] for item in catalog.json()} == {
+        "object_ownership", "sequence_enforcement", "ledger_consistency", "entitlement_boundary",
+    }
+    applied = client.post(
+        f"/api/v1/campaigns/{campaign['id']}/workflow-templates/sequence_enforcement/apply",
+        json={"variables": {
+            "prerequisite_url": "https://templates.test/checkout/prepare",
+            "dependent_url": "https://templates.test/checkout/confirm",
+            "actor_role": "buyer",
+        }},
+    )
+    assert applied.status_code == 201, applied.text
+    assert applied.json()["template_id"] == "sequence_enforcement"
+    assert applied.json()["steps"][1]["requires_steps"] == [1]
+    out_of_scope = client.post(
+        f"/api/v1/campaigns/{campaign['id']}/workflow-templates/object_ownership/apply",
+        json={"variables": {"resource_url": "https://outside.test/orders/42", "owner_role": "owner"}},
+    )
+    assert out_of_scope.status_code == 409
+    assert client.post(
+        f"/api/v1/campaigns/{campaign['id']}/workflow-templates/unknown/apply", json={"variables": {}},
+    ).status_code == 404
 
 
 def test_complex_invariant_declarations_fail_closed(client):
@@ -1602,6 +1796,83 @@ def test_web3_network_guard_and_program_versions(client):
     assert key["allowed"] is False
 
 
+def test_program_rules_import_is_versioned_scoped_and_expiring(client):
+    engagement = create_ready(client, "web3", "0x1111111111111111111111111111111111111111")
+    base = {
+        "engagement_id": engagement["id"], "platform": "immunefi",
+        "source_uri": "https://program.example/rules",
+        "rules_text": "Authorized program rules revision September 2026.",
+        "valid_until": "2030-01-01T00:00:00Z",
+        "scope_assets": [engagement["normalized_target"]],
+        "impact_categories": {"loss_of_funds": "critical"},
+        "known_issue_sources": ["https://program.example/known-issues"],
+        "previous_audit_sources": ["https://program.example/audits"],
+        "poc_policy": "allowed",
+    }
+    first = client.post("/api/v1/program-rules/import", json=base)
+    second = client.post("/api/v1/program-rules/import", json={**base, "rules_text": base["rules_text"] + " Updated."})
+    assert first.status_code == 201 and second.status_code == 201
+    assert (first.json()["version"], second.json()["version"]) == (1, 2)
+    assert first.json()["authorization_status"] == "confirmed"
+    assert second.json()["authorization_status"] == "pending_reauthorization"
+    assert second.json()["diff"]["rules_text_changed"] is True
+    snapshots = client.get(f"/api/v1/engagements/{engagement['id']}/program-snapshots").json()
+    assert [item["version"] for item in snapshots] == [2, 1]
+    assert snapshots[0]["rules"]["rules_sha256"] != snapshots[1]["rules"]["rules_sha256"]
+    assert snapshots[0]["authorization_status"] == "pending_reauthorization"
+    assert snapshots[0]["is_latest_program_rules"] is True
+    assert snapshots[1]["is_latest_program_rules"] is False
+    with sqlite3.connect(final_core.DB) as db:
+        db.row_factory = sqlite3.Row
+        latest_row = db.execute("SELECT * FROM program_snapshots WHERE id=?", (second.json()["id"],)).fetchone()
+        old_row = db.execute("SELECT * FROM program_snapshots WHERE id=?", (first.json()["id"],)).fetchone()
+        original_rules = latest_row["rules"]
+    with pytest.raises(Exception, match="重新授权"):
+        final_core.validated_program_rules(latest_row, engagement, "loss_of_funds")
+    bad_confirmation = client.post(
+        f"/api/v1/program-snapshots/{second.json()['id']}/confirm-authorization",
+        json={"confirmation": "YES", "note": "reviewed"},
+    )
+    assert bad_confirmation.status_code == 422
+    confirmed = client.post(
+        f"/api/v1/program-snapshots/{second.json()['id']}/confirm-authorization",
+        json={"confirmation": "CONFIRM_RULE_CHANGE", "note": "范围与影响映射已重新核对"},
+    )
+    assert confirmed.status_code == 200
+    with sqlite3.connect(final_core.DB) as db:
+        db.row_factory = sqlite3.Row
+        latest_row = db.execute("SELECT * FROM program_snapshots WHERE id=?", (second.json()["id"],)).fetchone()
+        assert latest_row["rules"] == original_rules
+    assert final_core.validated_program_rules(latest_row, engagement, "loss_of_funds")["severity"] == "critical"
+    with pytest.raises(Exception, match="更新的项目规则"):
+        final_core.validated_program_rules(old_row, engagement, "loss_of_funds")
+    wrong_scope = client.post("/api/v1/program-rules/import", json={
+        **base, "scope_assets": ["0x2222222222222222222222222222222222222222"]})
+    expired = client.post("/api/v1/program-rules/import", json={
+        **base, "valid_until": "2000-01-01T00:00:00Z"})
+    assert wrong_scope.status_code == 422 and expired.status_code == 422
+
+
+def test_identical_program_rule_version_remains_authorized(client):
+    engagement = create_ready(client, "web3", "0x1111111111111111111111111111111111111111")
+    payload = {
+        "engagement_id": engagement["id"], "platform": "immunefi",
+        "source_uri": "https://program.example/rules",
+        "rules_text": "Authorized program rules revision September 2026.",
+        "valid_until": "2030-01-01T00:00:00Z",
+        "scope_assets": [engagement["normalized_target"]],
+        "impact_categories": {"loss_of_funds": "critical"},
+        "known_issue_sources": ["https://program.example/known-issues"],
+        "previous_audit_sources": ["https://program.example/audits"],
+        "poc_policy": "allowed",
+    }
+    assert client.post("/api/v1/program-rules/import", json=payload).json()["authorization_status"] == "confirmed"
+    repeated = client.post("/api/v1/program-rules/import", json=payload)
+    assert repeated.status_code == 201
+    assert repeated.json()["authorization_status"] == "confirmed"
+    assert repeated.json()["diff"]["has_changes"] is False
+
+
 def test_web3_source_discovery_catalogs_entrypoints_and_review_hypotheses(client, tmp_path, monkeypatch):
     source = tmp_path / "src"
     source.mkdir()
@@ -1710,10 +1981,17 @@ def test_web3_buggy_fixture_produces_normalized_property_counterexample(client):
     assert final_core.load(candidate["evidence_ids"], [])
 
     replay = client.post(
-        f"/api/v1/web3/candidates/{candidate['id']}/property-replay", json={"rounds": 2},
+        f"/api/v1/web3/candidates/{candidate['id']}/property-replay/jobs", json={"rounds": 2},
     )
-    assert replay.status_code == 200, replay.text
-    replay_payload = replay.json()
+    assert replay.status_code == 202, replay.text
+    for _ in range(300):
+        job = client.get(f"/api/v1/verification-jobs/{replay.json()['id']}").json()
+        if job["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+            break
+        time.sleep(.02)
+    assert job["status"] == "completed", job
+    assert job["completed_requests"] == 2 and job["progress"] == 1
+    replay_payload = job["result"]
     assert replay_payload["status"] == "reproduced"
     assert replay_payload["stable_failure"] is True
     assert len(replay_payload["rounds"]) == 2
@@ -1734,6 +2012,55 @@ def test_web3_buggy_fixture_produces_normalized_property_counterexample(client):
     assert final_core.load(attempt["result"], {})["stable_failure"] is True
     assert len(replay_observations) == 2
     assert canonical is None  # Replay stability never bypasses impact and counterevidence gates.
+
+    rules = client.post("/api/v1/program-rules/import", json={
+        "engagement_id": engagement["id"], "platform": "immunefi",
+        "source_uri": "https://program.example/rules",
+        "rules_text": "Bug bounty rules explicitly covering accounting invariant failures and local proof of concept.",
+        "valid_until": "2030-01-01T00:00:00Z",
+        "scope_assets": [engagement["normalized_target"]],
+        "impact_categories": {"accounting_invariant_break": "high"},
+        "known_issue_sources": ["https://program.example/known"],
+        "previous_audit_sources": ["https://program.example/audits"],
+        "poc_policy": "allowed",
+    })
+    assert rules.status_code == 201, rules.text
+    finalized = client.post(f"/api/v1/web3/candidates/{candidate['id']}/finalize-property", json={
+        "program_snapshot_id": rules.json()["id"],
+        "impact_category": "accounting_invariant_break",
+        "impact_description": "A full withdrawal leaves totalAssets inconsistent with user balances.",
+        "root_cause": "withdraw omits a decrement of totalAssets", "weakness": "CWE-682",
+        "location": "src/BuggyVault.sol:withdraw",
+        "feasibility": "Reproduced with arbitrary positive deposits",
+    })
+    assert finalized.status_code == 200, finalized.text
+    finalized_payload = finalized.json()
+    assert finalized_payload["status"] == "verified" and finalized_payload["receipt_id"].startswith("receipt-")
+    assert finalized_payload["impact_demonstrated"] is False
+    canonical = client.get(f"/api/v1/findings/{finalized_payload['finding']['id']}").json()
+    assert canonical["verification"]["oracle"] == "forge-property-replay-v1"
+    assert canonical["verification"]["receipt_id"] == finalized_payload["receipt_id"]
+    assert canonical["impact"]["demonstrated"] is False
+    exported = client.post(f"/api/v1/findings/{canonical['id']}/reports/immunefi/export")
+    assert exported.status_code == 202, exported.text
+    with final_core.connect() as db:
+        bundle_path = db.execute(
+            "SELECT export_path FROM submission_packages_v2 WHERE id=?", (exported.json()["id"],),
+        ).fetchone()[0]
+    portable = reporting.replay_bundle(Path(bundle_path), execute=True)
+    assert portable["integrity_ok"] is True and portable["recorded_replay_verified"] is True
+    assert portable["replay_kind"] == "forge_property_replay_v1"
+    assert portable["replay_performed"] is True and len(portable["execution"]["rounds"]) == 2
+    import subprocess
+    import sys
+    second_process = subprocess.run(
+        [sys.executable, str(app.ROOT / "scripts" / "verify_proof_bundle.py"), bundle_path, "--replay"],
+        cwd=app.ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert second_process.returncode == 0, second_process.stderr
+    separate_result = json.loads(second_process.stdout)
+    assert separate_result["replay_performed"] is True
+    assert separate_result["recorded_replay_verified"] is True
 
 
 def test_report_renderer_never_invents_missing_fields():
@@ -1756,7 +2083,7 @@ def test_redaction_covers_context_and_export():
     value = "Authorization: Bearer super-secret Cookie: sid=abc password=hunter2 private_key=0xdead"
     clean = reporting.redact(value)
     assert "super-secret" not in clean and "hunter2" not in clean and "0xdead" not in clean
-    assert clean.count("[REDACTED]") == 4
+    assert "sid=abc" not in clean and "[REDACTED]" in clean
 
 
 def test_all_report_adapters_and_structured_export_consistency():
@@ -1814,18 +2141,9 @@ def test_candidate_requires_real_oracle_then_compiles_report(client):
     assert blocked.json()["status"] == "human_review"
     proof["oracle"] = "http-state-replay-v1"
     verified = client.post(f"/api/v1/candidates/{candidate['id']}/verify", json=proof)
-    assert verified.status_code == 200 and verified.json()["status"] == "verified"
-    finding_id = verified.json()["id"]
-    preview = client.post(f"/api/v1/findings/{finding_id}/reports/hackerone/preview")
-    assert preview.status_code == 200
-    assert preview.json()["completeness"]["ready"] is True
-    package = client.post(f"/api/v1/findings/{finding_id}/reports/hackerone/export")
-    assert package.status_code == 202
-    download = client.get(package.json()["download_url"])
-    assert download.status_code == 200 and download.headers["content-type"] == "application/zip"
-    capsule = client.get(f"/api/v1/findings/{finding_id}/proof-capsule")
-    assert capsule.status_code == 200
-    assert capsule.json()["portable"] is True and len(capsule.json()["sha256"]) == 64
+    assert verified.status_code == 409
+    assert "服务端真实复验收据" in verified.json()["detail"]
+    assert client.get(f"/api/v1/findings?run_id={run_id}").json()["verified"] == []
 
 
 def test_policy_denies_out_of_scope_destructive_and_third_party(client):
@@ -2091,6 +2409,12 @@ def test_native_agent_hypotheses_remain_candidates(client):
     ids = native_agent._record_hypotheses(run, [{
         "title": "Possible authorization boundary", "category": "authorization",
         "target": "https://example.test/account", "summary": "Requires independent replay with a negative control",
+        "security_boundary": "Only the account owner may read private profile fields",
+        "expected_behavior": "Other identities must receive an access denial",
+        "observed_behavior": "Account page appears reachable; protection requires validation",
+        "impact_hypothesis": "Potential private profile access by a different identity",
+        "verification_method": "Compare owner and non-owner requests and a negative control",
+        "observation_ids": [observation_id],
     }], [observation_id])
     assert len(ids) == 1
     with final_core.connect() as db:
@@ -2405,16 +2729,25 @@ def test_web3_verified_finding_requires_program_gates_and_immunefi_ready(client)
         "poc_rule_checked": True, "feasibility": "Reproduced on local fork", "funds_at_risk": "fixture only",
     }
     verified = client.post(f"/api/v1/candidates/{candidate['id']}/verify", json=proof)
-    assert verified.status_code == 200
-    preview = client.post(f"/api/v1/findings/{verified.json()['id']}/reports/immunefi/preview")
-    assert preview.status_code == 200
-    assert preview.json()["completeness"]["ready"] is True
+    assert verified.status_code == 409
+    assert "服务端真实复验收据" in verified.json()["detail"]
+    assert client.get(f"/api/v1/findings?run_id={run_id}").json()["verified"] == []
 
 
 def test_real_http_replay_oracle_with_negative_control(client):
     class Handler(BaseHTTPRequestHandler):
+        fixed = False
         def do_GET(self):
-            if self.path == "/api/object/42":
+            role = self.headers.get("X-Role")
+            if not role:
+                self.send_response(401); self.end_headers(); self.wfile.write(b'{"error":"unauthenticated"}')
+            elif self.path == "/me":
+                self.send_response(200); self.end_headers()
+                self.wfile.write(json.dumps({"id": "tenant-a" if role == "owner" else "tenant-b"}).encode())
+            elif self.path == "/api/object/42":
+                if role == "other" and Handler.fixed:
+                    self.send_response(403); self.end_headers(); self.wfile.write(b'{"error":"forbidden"}')
+                    return
                 self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
                 self.wfile.write(b'{"owner":"tenant-a","id":42}')
             else:
@@ -2441,18 +2774,136 @@ def test_real_http_replay_oracle_with_negative_control(client):
             "observation_ids": [obs["id"]],
         }).json()
         endpoint = f"/api/v1/traditional/runs/{run_id}/http-replay"
-        replay = client.post(endpoint, json={
+        payload = {
             "candidate_id": candidate["id"],
             "baseline": {"url": f"http://127.0.0.1:{port}/api/object/42", "headers": {"X-Role": "owner"}},
             "attack": {"url": f"http://127.0.0.1:{port}/api/object/42", "headers": {"X-Role": "other"}},
-            "negative_control": {"url": f"http://127.0.0.1:{port}/api/object/999", "headers": {"X-Role": "other"}},
+            "negative_control": {"url": f"http://127.0.0.1:{port}/api/object/42"},
+            "authorization": {
+                "baseline_identity": {"url": f"http://127.0.0.1:{port}/me", "headers": {"X-Role": "owner"}},
+                "attack_identity": {"url": f"http://127.0.0.1:{port}/me", "headers": {"X-Role": "other"}},
+                "principal_field": "id", "owner_field": "owner"},
             "severity": "high", "impact_description": "Cross-role object disclosure",
             "root_cause": "Missing ownership check", "weakness": "CWE-639", "location": "GET /api/object/{id}",
-        })
-        assert replay.status_code == 200, replay.text
-        data = replay.json()
+        }
+        preview = client.post(endpoint + '/plan', json=payload)
+        assert preview.status_code == 200 and preview.json()['request_count'] == 10
+        assert preview.json()['sends_requests'] is False
+        assert 'headers' not in json.dumps(preview.json())
+        # Old response-difference recipe remains review-only, never machine proof.
+        legacy = client.post(endpoint, json={k:v for k,v in payload.items() if k != 'authorization'})
+        assert legacy.status_code == 200
+        assert legacy.json()['replay']['differential_match'] is True
+        assert legacy.json()['verification']['status'] == 'human_review'
+        queued = client.post(endpoint + '/jobs', json=payload)
+        assert queued.status_code == 202, queued.text
+        assert queued.json()['total_requests'] == 10
+        for _ in range(200):
+            job = client.get(f"/api/v1/traditional/http-replay/jobs/{queued.json()['id']}").json()
+            if job['status'] not in {'queued','running','cancelling'}:
+                break
+            time.sleep(.01)
+        assert job['status'] == 'completed', job
+        assert job['progress'] == 1
+        data = job['result']
         assert data["replay"]["reproduced"] is True and data["replay"]["stable"] is True
         assert data["verification"]["status"] == "verified"
+        assert all(check['passed'] for check in data['replay']['semantic_checks'])
+        assert '_transient_body' not in json.dumps(data)
+        finding_id = data['verification']['id']
+        finding = client.get(f'/api/v1/findings/{finding_id}').json()
+        receipt_id = finding['verification']['receipt_id']
+        assert receipt_id.startswith('receipt-')
+        positive_id = next(item['id'] for item in finding['evidence'] if item['polarity'] != 'counter')
+        counter_id = next(item['id'] for item in finding['evidence'] if item['polarity'] == 'counter')
+        report_fields = {
+            'summary': 'A second authorized identity can read the owner object through the same endpoint.',
+            'prerequisites': ['Two authorized test identities', 'An object owned by the baseline identity'],
+            'impact_description': 'A user can disclose another user object when its identifier is known.',
+            'affected_users': 'Users whose object identifiers are known to another authenticated user.',
+            'impact_conditions': 'The attacker must be authenticated and know or obtain an object identifier.',
+            'impact_evidence_ids': [positive_id],
+            'counterevidence_summary': 'The unauthenticated request was rejected while the second authenticated identity succeeded.',
+            'counterevidence_ids': [counter_id],
+            'remediation': 'Enforce owner identity in the object query and retain this cross-identity regression test.',
+            'platform_custom': {'testing_ip': 'Provided separately to the program'},
+        }
+        invalid_report = client.put(f'/api/v1/findings/{finding_id}/report-fields', json={
+            **report_fields, 'counterevidence_ids': [positive_id],
+        })
+        assert invalid_report.status_code == 409
+        saved_report = client.put(f'/api/v1/findings/{finding_id}/report-fields', json=report_fields)
+        assert saved_report.status_code == 200, saved_report.text
+        assert saved_report.json()['receipt_preserved'] is True
+        assert saved_report.json()['report_fields']['impact']['evidence_ids'] == [positive_id]
+        finding = client.get(f'/api/v1/findings/{finding_id}').json()
+        assert finding['verification']['receipt_id'] == receipt_id
+        preview = client.post(f'/api/v1/findings/{finding_id}/reports/hackerone/preview')
+        assert preview.status_code == 200 and preview.json()['completeness']['ready']
+        assert not ({'prerequisites', 'impact.affected_users', 'impact.conditions', 'impact.evidence_ids',
+                     'counterevidence.summary', 'counterevidence.evidence_ids', 'remediation'}
+                    & set(preview.json()['completeness']['missing_recommended']))
+        assert '## Counterevidence / Negative Control' in preview.json()['content']
+        assert '## Remediation' in preview.json()['content']
+        assert counter_id in preview.json()['content'] and positive_id in preview.json()['content']
+        package = client.post(f'/api/v1/findings/{finding_id}/reports/hackerone/export')
+        assert package.status_code == 202
+        assert package.json()['manifest']['proof_replay'] == {
+            'schema': 'fieldwork-replay-contract/1', 'mode': 'recorded_assertion',
+            'kind': 'http_authorization_read_v2', 'active_execution_supported': False,
+        }
+        assert client.get(package.json()['download_url']).status_code == 200
+        import io
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(client.get(package.json()['download_url']).content)) as bundle:
+            proof_path = f"proof/evidence/{data['artifact_id']}.json"
+            assert proof_path in bundle.namelist()
+            actual_proof = json.loads(bundle.read(proof_path))
+            assert len(actual_proof['rounds']) == 2
+            assert actual_proof['stable'] is True
+            assert 'proof/environment.json' in bundle.namelist()
+            assert 'proof/steps.md' in bundle.namelist()
+            assert 'proof/expected.json' in bundle.namelist()
+            assert 'proof/replay-contract.json' in bundle.namelist()
+        with final_core.connect() as db:
+            bundle_path = db.execute(
+                "SELECT export_path FROM submission_packages_v2 WHERE id=?", (package.json()['id'],),
+            ).fetchone()[0]
+        replayed = reporting.replay_bundle(Path(bundle_path))
+        assert replayed['recorded_replay_verified'] is True
+        assert replayed['replay_kind'] == 'http_authorization_read_v2'
+        capsule = client.get(f'/api/v1/findings/{finding_id}/proof-capsule').json()
+        assert capsule['portable'] is True
+        assert capsule['portability_status'] == 'recorded_assertion_ready'
+        assert capsule['replay']['active_execution_supported'] is False
+        claimed = client.patch(f'/api/v1/findings/{finding_id}/lifecycle', json={
+            'status': 'fix_claimed', 'remediation': 'commit fixed123 enforces owner identity',
+            'note': 'Deployed to the local regression fixture',
+        })
+        assert claimed.status_code == 200 and claimed.json()['status'] == 'fix_claimed'
+        retest_run = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+        planned = client.post(f'/api/v1/findings/{finding_id}/retest-plans', json={
+            'run_id': retest_run, 'note': 'Repeat the original object boundary against fixed123',
+        })
+        assert planned.status_code == 201 and planned.json()['candidate_id'].startswith('candidate-')
+        Handler.fixed = True
+        fixed_payload = {**payload, 'candidate_id': planned.json()['candidate_id']}
+        fixed = client.post(f'/api/v1/traditional/runs/{retest_run}/http-replay', json=fixed_payload)
+        assert fixed.status_code == 200, fixed.text
+        assert fixed.json()['verification']['status'] == 'verified_fixed'
+        fixed_lifecycle = client.get(f'/api/v1/findings/{finding_id}/lifecycle').json()
+        assert fixed_lifecycle['status'] == 'verified_fixed'
+        assert fixed_lifecycle['retests'][0]['status'] == 'fixed'
+        assert fixed_lifecycle['retests'][0]['result']['receipt_id'].startswith('receipt-fixed-')
+        with final_core.connect() as db:
+            negative = db.execute(
+                "SELECT * FROM verification_attempts WHERE candidate_id=? AND status='machine_negative_receipt'",
+                (planned.json()['candidate_id'],),
+            ).fetchone()
+        assert negative is not None and final_core.load(negative['result'], {})['schema'] == 'fix-verification-receipt/1'
+        (traditional_runtime.ARTIFACT_ROOT/f"{data['artifact_id']}.json").write_text('tampered')
+        rejected = client.post(f'/api/v1/findings/{finding_id}/reports/hackerone/export')
+        assert rejected.status_code == 409 and '哈希' in rejected.json()['detail']
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
@@ -2550,3 +3001,406 @@ def test_ptai_capsule_replay_requires_integrity_scope_and_live_oracle(client, mo
         "impact_description": "impact", "root_cause": "cause", "weakness": "CWE-79", "location": "route",
     })
     assert rejected.status_code == 422
+
+
+def test_observation_is_not_test_coverage_and_success_reason_is_normalized(client):
+    engagement = create_ready(client)
+    run = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()['id']
+    obs = client.post(f'/api/v1/runs/{run}/observations', json={
+        'observation_type':'page.inventory', 'subject':'https://example.test/catalog',
+        'summary':'Public catalog', 'source_capability':'native-agent', 'confidence':1,
+    }).json()
+    traditional_tools.record_coverage(run, 'capability:native-agent', 'tested', 'read_only_completed', [obs['id']])
+    assert client.post(f'/api/v1/runs/{run}/stop').status_code == 200
+    details = client.get(f'/api/v1/runs/{run}/details').json()
+    assert next(x for x in details['test_items'] if x['id']=='native-agent')['status'] == 'completed'
+    assert next(x for x in details['coverage'] if x['surface_key']=='https://example.test/catalog')['state'] == 'observed'
+    stages = {x['id']:x for x in details['stages']}
+    assert stages['verification']['status'] == 'not_tested'
+    assert stages['impact']['status'] == 'not_applicable'
+    client.post(f'/api/v1/runs/{run}/candidates', json={
+        'title':'Boundary hypothesis', 'category':'authorization', 'target':'https://example.test/catalog',
+        'hypothesis':'Requires evidence of a protected boundary', 'observation_ids':[obs['id']],
+    })
+    details = client.get(f'/api/v1/runs/{run}/details').json()
+    assert next(x for x in details['stages'] if x['id']=='verification')['status'] == 'human_review'
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'unknown', 'changed_proof', 'changed_candidate', 'tampered_artifact', 'missing_artifact', 'expired', 'other_candidate'])
+def test_verification_receipt_rejects_untrusted_or_stale_proof(client, tmp_path, mutation):
+    import hashlib
+    import verification_receipts
+    engagement = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()['id']
+    obs = client.post(f'/api/v1/runs/{run_id}/observations', json={
+        'observation_type':'http.authorization', 'subject':'https://example.test/item',
+        'summary':'Receipt binding fixture', 'source_capability':'http',
+    }).json()
+    payload = {'title':'Bound proof', 'category':'CWE-639', 'target':'https://example.test/item',
+               'hypothesis':'Authorization boundary requires proof', 'observation_ids':[obs['id']]}
+    candidate = client.post(f'/api/v1/runs/{run_id}/candidates', json=payload).json()
+    artifact_path = tmp_path/'receipt-fixture.json'
+    artifact_path.write_text('{"fixture":"receipt binding only"}')
+    with final_core.connect() as db:
+        db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)', (
+            'artifact-receipt-test',run_id,'http.replay',str(artifact_path),hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+            'application/json',1,final_core.utcnow()))
+    proof = final_core.VerificationInput(
+        oracle='http-state-replay-v1',attempts=2,reproduced=True,counterevidence_checked=True,
+        counterevidence_summary='Control rejected',severity='high',impact_description='Protected object read',
+        steps=['Owner baseline','Other identity','Control','Repeat'],expected='403',actual='200',
+        root_cause='Ownership check missing',weakness='CWE-639',location='GET /item',poc_artifact_ids=['artifact-receipt-test'])
+    # Internal issuer is used only to isolate binding checks; real execution is tested above.
+    proof.receipt_id = verification_receipts.issue_receipt(candidate['id'], proof)
+    if mutation == 'missing': proof.receipt_id = None
+    elif mutation == 'unknown': proof.receipt_id = 'receipt-forged'
+    elif mutation == 'changed_proof': proof.severity = 'critical'
+    elif mutation == 'changed_candidate':
+        client.patch(f"/api/v1/findings/{candidate['id']}",json={'hypothesis':'A different claim'})
+    elif mutation == 'tampered_artifact': artifact_path.write_text('modified')
+    elif mutation == 'missing_artifact': artifact_path.unlink()
+    elif mutation == 'expired':
+        with final_core.connect() as db:
+            row = db.execute('SELECT result FROM verification_attempts WHERE id=?',(proof.receipt_id,)).fetchone()
+            value = json.loads(row['result']);value['expires_at']='2000-01-01T00:00:00+00:00'
+            db.execute('UPDATE verification_attempts SET result=? WHERE id=?',(json.dumps(value),proof.receipt_id))
+    elif mutation == 'other_candidate':
+        candidate = client.post(f'/api/v1/runs/{run_id}/candidates',json={**payload,'title':'Other candidate'}).json()
+    response = client.post(f"/api/v1/candidates/{candidate['id']}/verify",json=proof.model_dump())
+    assert response.status_code == 409, response.text
+    assert client.get(f'/api/v1/findings?run_id={run_id}').json()['verified'] == []
+
+
+def test_web3_receipt_rejects_modified_program_rules(client, tmp_path):
+    import hashlib
+    import verification_receipts
+    engagement = create_ready(client, "web3", "0x1111111111111111111111111111111111111111")
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+    obs = client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type":"web3.property.counterexample", "subject":"testInvariant(uint256)",
+        "summary":"Property failed", "source_capability":"forge-test"}).json()
+    candidate = client.post(f"/api/v1/runs/{run_id}/candidates", json={
+        "title":"Invariant failure", "category":"web3_property_violation", "target":"testInvariant(uint256)",
+        "hypothesis":"Registered invariant fails", "observation_ids":[obs["id"]]}).json()
+    artifact_path = tmp_path / "web3-replay.json"
+    artifact_path.write_text('{"stable_failure":true}')
+    with final_core.connect() as db:
+        db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
+            "artifact-web3-receipt", run_id, "web3.property_replay", str(artifact_path),
+            hashlib.sha256(artifact_path.read_bytes()).hexdigest(), "application/json", 1, final_core.utcnow()))
+    program = client.post("/api/v1/program-rules/import", json={
+        "engagement_id":engagement["id"], "platform":"immunefi", "source_uri":"https://program.example/rules",
+        "rules_text":"Reviewed scope and impact policy for this verification test.",
+        "valid_until":"2030-01-01T00:00:00Z", "scope_assets":[engagement["normalized_target"]],
+        "impact_categories":{"invariant_break":"high"}, "known_issue_sources":["known-ref"],
+        "previous_audit_sources":["audit-ref"], "poc_policy":"allowed"}).json()
+    proof = final_core.VerificationInput(
+        oracle="forge-property-replay-v1", attempts=2, reproduced=True,
+        counterevidence_checked=True, counterevidence_summary="Distinct seeds and hashed counterexamples",
+        severity="high", impact_description="Accounting invariant breaks after withdrawal",
+        steps=["Replay twice"], expected="Invariant holds", actual="Invariant failed twice",
+        root_cause="Accounting update missing", weakness="CWE-682", location="Vault.withdraw",
+        poc_artifact_ids=["artifact-web3-receipt"], program_snapshot_id=program["id"],
+        impact_in_scope=True, known_issue_checked=True, previous_audit_checked=True, poc_rule_checked=True)
+    proof.receipt_id = verification_receipts.issue_receipt(candidate["id"], proof)
+    with final_core.connect() as db:
+        row = db.execute("SELECT rules FROM program_snapshots WHERE id=?", (program["id"],)).fetchone()
+        changed = json.loads(row["rules"]); changed["impact_categories"]["invariant_break"] = "critical"
+        db.execute("UPDATE program_snapshots SET rules=? WHERE id=?", (json.dumps(changed), program["id"]))
+    rejected = client.post(f"/api/v1/candidates/{candidate['id']}/verify", json=proof.model_dump())
+    assert rejected.status_code == 409 and "规则快照" in rejected.json()["detail"]
+
+
+def test_same_root_cause_across_runs_merges_lifecycle_and_reopens_failed_fix(client, tmp_path):
+    import hashlib
+    import verification_receipts
+    engagement = create_ready(client, target="https://lifecycle.example.test")
+
+    def verified_occurrence(run_id, suffix):
+        observation = client.post(f"/api/v1/runs/{run_id}/observations", json={
+            "observation_type": "http.authorization", "subject": "GET /orders/42",
+            "summary": f"Cross-tenant read reproduced {suffix}", "source_capability": "http-oracle",
+        }).json()
+        candidate = client.post(f"/api/v1/runs/{run_id}/candidates", json={
+            "title": f"Cross-tenant order read {suffix}", "category": "authorization",
+            "target": "https://lifecycle.example.test/orders/42",
+            "hypothesis": "A different tenant can read the owner order",
+            "observation_ids": [observation["id"]],
+        }).json()
+        artifact_id = f"artifact-lifecycle-{suffix}"
+        artifact_path = tmp_path / f"{artifact_id}.json"
+        artifact_path.write_text('{"rounds":2,"stable":true}')
+        with final_core.connect() as db:
+            db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
+                artifact_id, run_id, "http.replay", str(artifact_path),
+                hashlib.sha256(artifact_path.read_bytes()).hexdigest(), "application/json", 1, final_core.utcnow(),
+            ))
+        proof = final_core.VerificationInput(
+            oracle="http-state-replay-v1", attempts=2, reproduced=True,
+            counterevidence_checked=True, counterevidence_summary="Unauthenticated control rejected twice",
+            severity="high", impact_description="Another tenant can read a private order",
+            steps=["Owner baseline", "Other tenant replay", "Unauthenticated control", "Repeat"],
+            expected="403", actual="200", root_cause="Order lookup omits tenant ownership check",
+            weakness="CWE-639", location="routes/orders.py:show", poc_artifact_ids=[artifact_id],
+        )
+        proof.receipt_id = verification_receipts.issue_receipt(candidate["id"], proof)
+        response = client.post(f"/api/v1/candidates/{candidate['id']}/verify", json=proof.model_dump())
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    first_run = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+    first = verified_occurrence(first_run, "first")
+    same_run_plan = client.post(f"/api/v1/findings/{first['id']}/retest-plans", json={
+        "run_id": first_run, "note": "This must not reuse the original evidence run",
+    })
+    assert same_run_plan.status_code == 422 and "新的 Run" in same_run_plan.json()["detail"]
+    lifecycle = client.patch(f"/api/v1/findings/{first['id']}/lifecycle", json={
+        "status": "fix_claimed", "remediation": "commit abc123 adds tenant_id to the order lookup",
+        "note": "Developer supplied a repair build",
+    })
+    assert lifecycle.status_code == 200 and lifecycle.json()["status"] == "fix_claimed"
+    second_run = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]
+    plan = client.post(f"/api/v1/findings/{first['id']}/retest-plans", json={
+        "run_id": second_run, "note": "Retest commit abc123 against the original tenant boundary",
+    })
+    assert plan.status_code == 201
+    planned_candidate_id = plan.json()["candidate_id"]
+    second = verified_occurrence(second_run, "second")
+    assert second["id"] == first["id"] and second["deduplicated"] is True
+    assert second["occurrence_kind"] == "reopened" and second["lifecycle_status"] == "reopened"
+    detail = client.get(f"/api/v1/findings/{first['id']}/lifecycle").json()
+    assert detail["occurrence_count"] == 2 and len(detail["occurrences"]) == 2
+    assert detail["retests"][0]["status"] == "reproduced"
+    assert detail["retests"][0]["result"]["candidate_id"] == second["candidate_id"]
+    with final_core.connect() as db:
+        planned_candidate = db.execute(
+            "SELECT status FROM candidate_findings WHERE id=?", (planned_candidate_id,),
+        ).fetchone()
+    assert planned_candidate["status"] == "duplicate"
+    run_two_findings = client.get(f"/api/v1/findings?run_id={second_run}").json()["verified"]
+    assert len(run_two_findings) == 1 and run_two_findings[0]["id"] == first["id"]
+    assert run_two_findings[0]["lifecycle_status"] == "reopened"
+    all_findings = client.get("/api/v1/findings").json()["verified"]
+    assert len(all_findings) == 1 and all_findings[0]["occurrence_count"] == 2
+
+
+def test_discovery_correlation_does_not_create_vulnerability_candidates(client):
+    ready = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{ready['id']}/start").json()['id']
+    for kind, source in [('http.service','httpx'),('surface.route','katana'),('browser.page_observation','native-agent')]:
+        client.post(f'/api/v1/runs/{run_id}/observations',json={
+            'observation_type':kind,'subject':'https://example.test/products',
+            'summary':'Public catalog and brand names','source_capability':source,'confidence':1})
+    result = client.post(f'/api/v1/runs/{run_id}/correlate').json()
+    assert result['created'] == [] and result['discovery_observations'] == 3
+    assert client.get(f'/api/v1/findings?run_id={run_id}').json()['candidates'] == []
+
+
+def test_single_security_detector_signal_is_not_lost(client):
+    ready = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{ready['id']}/start").json()['id']
+    client.post(f'/api/v1/runs/{run_id}/observations',json={
+        'observation_type':'code.static_finding','subject':'app.py:32',
+        'summary':'User input reaches an unsafe query sink','source_capability':'semgrep','confidence':.8})
+    first = client.post(f'/api/v1/runs/{run_id}/correlate').json()
+    assert first['count'] == 1 and first['created'][0]['category'] == 'code_review'
+    assert client.post(f'/api/v1/runs/{run_id}/correlate').json()['count'] == 0
+    assert client.get(f'/api/v1/findings?run_id={run_id}').json()['verified'] == []
+
+
+def test_agent_inventory_and_unbound_claims_are_not_admitted(client):
+    ready = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{ready['id']}/start").json()['id']
+    obs = client.post(f'/api/v1/runs/{run_id}/observations',json={
+        'observation_type':'browser.page_observation','subject':'https://example.test/products',
+        'summary':'Public catalog','source_capability':'native-agent'}).json()
+    with final_core.connect() as db:
+        run = dict(db.execute('SELECT * FROM analysis_runs WHERE id=?',(run_id,)).fetchone())
+    item = {'title':'Brand names','category':'inventory','target':'https://example.test/products','summary':'Visible brands'}
+    assert native_agent._record_hypotheses(run,[item],[obs['id']]) == []
+    from candidate_quality import REQUIRED_CLAIM_FIELDS
+    claim = {**item, 'category':'authorization', **{key:'A bounded security claim' for key in REQUIRED_CLAIM_FIELDS}, 'observation_ids':['obs-unknown']}
+    assert native_agent._record_hypotheses(run,[claim],[obs['id']]) == []
+    claim['observation_ids']=[obs['id']];claim['target']='https://outside.test/'
+    assert native_agent._record_hypotheses(run,[claim],[obs['id']]) == []
+    events = client.get(f'/api/v1/runs/{run_id}').json()['events']
+    assert sum(e['kind']=='hypothesis.not_admitted' for e in events) == 3
+
+
+def test_candidate_detail_explains_evidence_without_changing_status(client):
+    ready = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{ready['id']}/start").json()['id']
+    obs = client.post(f'/api/v1/runs/{run_id}/observations', json={
+        'observation_type': 'browser.page_observation', 'subject': 'https://example.test/products',
+        'summary': 'Public product catalog', 'source_capability': 'native-agent'}).json()
+    candidate = client.post(f'/api/v1/runs/{run_id}/candidates', json={
+        'title': 'Legacy catalog hypothesis', 'category': 'correlated_observation',
+        'target': 'https://example.test/products', 'hypothesis': 'Requires security triage',
+        'observation_ids': [obs['id']]}).json()
+    response = client.get(f"/api/v1/candidates/{candidate['id']}")
+    assert response.status_code == 200
+    detail = response.json()
+    assert detail['needs_triage'] is True
+    assert detail['next_action']['stage'] == 'triage'
+    listed = client.get(f'/api/v1/findings?run_id={run_id}').json()['candidates']
+    assert next(item for item in listed if item['id'] == candidate['id'])['next_action'] == detail['next_action']
+    assert detail['available_method'] == 'manual_review'
+    assert detail['verification_level'] == 'V0 / 缺少安全语义'
+    assert detail['evidence'][0]['observation_id'] == obs['id']
+    assert detail['evidence'][0]['subject'] == 'https://example.test/products'
+    assert detail['attempts'] == []
+    assert detail['candidate']['status'] == candidate['status']
+    assert '不执行复验' in detail['save_behavior']
+    assert client.get('/api/v1/candidates/missing-candidate').status_code == 404
+    client.post(f'/api/v1/runs/{run_id}/stop')
+
+
+def test_candidate_triage_separates_active_work_from_preserved_history(client):
+    ready = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{ready['id']}/start").json()['id']
+    obs = client.post(f'/api/v1/runs/{run_id}/observations', json={
+        'observation_type':'http.authorization','subject':'GET /objects/42',
+        'summary':'Candidate triage evidence','source_capability':'http'}).json()
+    def create(title):
+        return client.post(f'/api/v1/runs/{run_id}/candidates', json={
+            'title':title,'category':'authorization','target':'https://example.test/objects/42',
+            'hypothesis':'Object ownership needs validation','observation_ids':[obs['id']]}).json()
+    original, duplicate, pending = create('Original access claim'), create('Repeated access claim'), create('Needs more evidence')
+    evidence = client.post(f"/api/v1/candidates/{pending['id']}/triage", json={
+        'disposition':'needs_evidence','reason':'Second authenticated identity is missing'})
+    assert evidence.status_code == 200 and evidence.json()['status'] == 'needs_evidence'
+    invalid = client.post(f"/api/v1/candidates/{duplicate['id']}/triage", json={
+        'disposition':'duplicate','reason':'Same object and boundary'})
+    assert invalid.status_code == 422
+    merged = client.post(f"/api/v1/candidates/{duplicate['id']}/triage", json={
+        'disposition':'duplicate','reason':'Same object and boundary','duplicate_of':original['id']})
+    assert merged.status_code == 200 and merged.json()['history_preserved'] is True
+    visible = client.get(f'/api/v1/findings?run_id={run_id}').json()['candidates']
+    assert {item['id'] for item in visible} == {original['id'], pending['id']}
+    ledger = client.get(f'/api/v1/runs/{run_id}/coverage').json()['graveyard']
+    assert any(item['id'] == merged.json()['graveyard_id'] and 'duplicate_of' in item['reason'] for item in ledger)
+    detail = client.get(f"/api/v1/candidates/{original['id']}").json()
+    assert detail['available_method'] == 'http_workbench'
+    assert duplicate['id'] not in {item['id'] for item in detail['peer_candidates']}
+    client.post(f'/api/v1/runs/{run_id}/stop')
+
+
+def test_authorization_oracle_rejects_normal_and_ambiguous_responses():
+    def response(status, body):
+        import hashlib
+        text = json.dumps(body)
+        return {'status': status, '_transient_body': text, 'body_sha256': hashlib.sha256(text.encode()).hexdigest()}
+    assertion = traditional_runtime.AuthorizationAssertion(
+        baseline_identity={'url':'https://example.test/me'}, attack_identity={'url':'https://example.test/me'},
+        principal_field='id', owner_field='owner')
+    valid = {'baseline': response(200, {'owner':'a'}), 'attack': response(200, {'owner':'a'}),
+             'negative_control': response(401, {}), 'baseline_identity': response(200, {'id':'a'}),
+             'attack_identity': response(200, {'id':'b'})}
+    assert traditional_runtime.authorization_round(valid, assertion)['passed']
+    for name, replacement in [
+        ('negative_control',response(200, {'owner':'a'})),  # public object
+        ('attack',response(403, {})),  # authorization enforced
+        ('attack_identity',response(200, {'id':'a'})),  # same principal
+        ('baseline_identity',response(401, {'id':'a'})),  # expired session
+        ('baseline',response(200, {'owner':'c'})),  # unbound ownership
+        ('attack',response(200, {'owner':'b'})),  # legitimate own object
+        ('attack_identity',response(200, {})),  # absent identity
+    ]:
+        assert not traditional_runtime.authorization_round({**valid,name:replacement}, assertion)['passed']
+
+
+def test_http_verification_job_can_be_cancelled_without_persisting_credentials(client, monkeypatch):
+    created = client.post("/api/v1/engagements", json={
+        "name": "Cancelable verification", "target": "http://127.0.0.1:8123", "mode": "traditional",
+        "scope": {"allow_private_ips": True}, "policy": {"max_requests_per_second": 200},
+    }).json()
+    ready = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
+    run_id = client.post(f"/api/v1/engagements/{ready['id']}/start").json()['id']
+    obs = client.post(f'/api/v1/runs/{run_id}/observations', json={
+        'observation_type':'http.authorization','subject':'GET /object/42',
+        'summary':'Authorization signal','source_capability':'http'}).json()
+    candidate = client.post(f'/api/v1/runs/{run_id}/candidates', json={
+        'title':'Cancelable boundary test','category':'authorization',
+        'target':'http://127.0.0.1:8123/object/42','hypothesis':'Different principal may read the object',
+        'observation_ids':[obs['id']]}).json()
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed_request(_):
+        entered.set(); release.wait(2)
+        return {'status': 200, 'body_sha256':'fixture', 'body_bytes':2,
+                'headers':{}, 'body_preview':'{}', '_transient_body':'{}'}
+
+    monkeypatch.setattr(traditional_runtime, 'request_once', delayed_request)
+    payload = {
+        'candidate_id':candidate['id'],
+        'baseline':{'url':candidate['target'],'headers':{'Authorization':'Bearer owner-secret'}},
+        'attack':{'url':candidate['target'],'headers':{'Authorization':'Bearer other-secret'}},
+        'negative_control':{'url':candidate['target']},
+        'authorization':{
+            'baseline_identity':{'url':'http://127.0.0.1:8123/me','headers':{'Authorization':'Bearer owner-secret'}},
+            'attack_identity':{'url':'http://127.0.0.1:8123/me','headers':{'Authorization':'Bearer other-secret'}},
+            'principal_field':'id','owner_field':'owner'},
+        'severity':'medium','impact_description':'Object disclosure','root_cause':'Missing ownership check',
+        'weakness':'CWE-639','location':'GET /object/42'}
+    started = client.post(f'/api/v1/traditional/runs/{run_id}/http-replay/jobs', json=payload)
+    assert started.status_code == 202 and entered.wait(1)
+    cancelled = client.post(f"/api/v1/verification-jobs/{started.json()['id']}/cancel")
+    assert cancelled.status_code == 200 and cancelled.json()['cancel_requested'] is True
+    release.set()
+    for _ in range(100):
+        job = client.get(f"/api/v1/verification-jobs/{started.json()['id']}").json()
+        if job['status'] == 'cancelled':
+            break
+        time.sleep(.01)
+    assert job['status'] == 'cancelled' and job['result'] is None
+    assert 'owner-secret' not in json.dumps(job) and 'other-secret' not in json.dumps(job)
+    with final_core.connect() as db:
+        stored = json.dumps(dict(db.execute('SELECT * FROM verification_jobs WHERE id=?',(job['id'],)).fetchone()))
+        assert 'owner-secret' not in stored and 'other-secret' not in stored
+
+
+def test_web3_property_job_can_be_cancelled_between_forge_rounds(client, monkeypatch, tmp_path):
+    root = tmp_path / "foundry-project"
+    (root / "src").mkdir(parents=True)
+    (root / "foundry.toml").write_text("[profile.default]\nsrc = 'src'\n")
+    (root / "src" / "Vault.sol").write_text("pragma solidity ^0.8.24; contract Vault {}")
+    engagement = create_ready(client, "web3", str(root))
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start", json={"execution_mode": "demo"}).json()["id"]
+    client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type": "web3.compiler_result", "subject": str(root),
+        "summary": "Foundry source root", "source_capability": "forge",
+    })
+    evidence = client.post(f"/api/v1/runs/{run_id}/observations", json={
+        "observation_type": "web3.property.counterexample", "subject": "testInvariant(uint256)",
+        "summary": "Invariant failed with a concrete counterexample", "source_capability": "forge",
+    }).json()
+    candidate = client.post(f"/api/v1/runs/{run_id}/candidates", json={
+        "title": "Cancelable invariant replay", "category": "web3_property_violation",
+        "target": "testInvariant(uint256)", "hypothesis": "Registered invariant fails",
+        "observation_ids": [evidence["id"]],
+    }).json()
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed_replay(_root, target, seed):
+        entered.set()
+        release.wait(2)
+        return {"status": "failed", "seed": seed, "tests": [{
+            "name": target, "status": "failed", "reason": "invariant drift",
+            "fuzz_runs": 256, "counterexample": {"amount": 1},
+        }]}
+
+    monkeypatch.setattr(web3_analysis, "run_forge_property_replay", delayed_replay)
+    started = client.post(f"/api/v1/web3/candidates/{candidate['id']}/property-replay/jobs", json={"rounds": 2})
+    assert started.status_code == 202 and entered.wait(1)
+    cancelled = client.post(f"/api/v1/verification-jobs/{started.json()['id']}/cancel")
+    assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelling"
+    release.set()
+    for _ in range(100):
+        job = client.get(f"/api/v1/verification-jobs/{started.json()['id']}").json()
+        if job["status"] == "cancelled":
+            break
+        time.sleep(.01)
+    assert job["status"] == "cancelled" and job["completed_requests"] == 1
+    with final_core.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM verification_attempts WHERE candidate_id=?", (candidate["id"],)).fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM artifacts WHERE run_id=? AND kind='web3.property_replay'", (run_id,)).fetchone()[0] == 0

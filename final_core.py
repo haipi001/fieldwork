@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import concurrent.futures
 import hashlib
+import io
+import ipaddress
 import json
 import os
 import re
@@ -14,16 +18,18 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import yaml
+import zipfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, StreamingResponse
-from reporting import export_bundle, redact, render, universal_model
+from reporting import export_bundle, redact, redact_structure, render, universal_model
 from capability_registry import inventory as capability_inventory
 from lifecycle import database_integrity, list_backups
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
@@ -66,6 +72,61 @@ def connect() -> sqlite3.Connection:
 
 def uid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def update_verification_job(job_id: str, *, status: str | None = None, phase: str | None = None,
+                            completed_requests: int | None = None, result: dict | None = None,
+                            error: str | None = None, completed: bool = False) -> None:
+    assignments, values = [], []
+    for column, value in (("status", status), ("phase", phase),
+                          ("completed_requests", completed_requests),
+                          ("result", dump(result) if result is not None else None),
+                          ("error", redact(error) if error is not None else None)):
+        if value is not None:
+            assignments.append(f"{column}=?")
+            values.append(value)
+    if completed:
+        assignments.append("completed_at=?")
+        values.append(utcnow())
+    if assignments:
+        values.append(job_id)
+        with connect() as db:
+            db.execute(f"UPDATE verification_jobs SET {','.join(assignments)} WHERE id=?", values)
+
+
+def verification_job_cancel_requested(job_id: str) -> bool:
+    with connect() as db:
+        row = db.execute("SELECT cancel_requested FROM verification_jobs WHERE id=?", (job_id,)).fetchone()
+    return bool(row and row["cancel_requested"])
+
+
+def hydrate_verification_job(row: sqlite3.Row) -> dict[str, Any]:
+    value = dict(row)
+    value["cancel_requested"] = bool(value["cancel_requested"])
+    value["result"] = load(value["result"], None)
+    value["progress"] = round(value["completed_requests"] / value["total_requests"], 3) if value["total_requests"] else 0
+    return redact_structure(value)
+
+
+@router.get("/verification-jobs/{job_id}")
+def get_verification_job(job_id: str):
+    with connect() as db:
+        row = db.execute("SELECT * FROM verification_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "复验任务不存在")
+    return hydrate_verification_job(row)
+
+
+@router.post("/verification-jobs/{job_id}/cancel")
+def cancel_verification_job(job_id: str):
+    with connect() as db:
+        row = db.execute("SELECT * FROM verification_jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "复验任务不存在")
+        if row["status"] not in {"queued", "running", "cancelling"}:
+            raise HTTPException(409, "复验任务已经结束")
+        db.execute("UPDATE verification_jobs SET cancel_requested=1,status='cancelling',phase='等待当前步骤安全停止' WHERE id=?", (job_id,))
+    return get_verification_job(job_id)
 
 
 def dump(value: Any) -> str:
@@ -163,6 +224,16 @@ def init_final_db() -> None:
               status TEXT NOT NULL, attempts INTEGER NOT NULL, result TEXT NOT NULL,
               started_at TEXT NOT NULL, completed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS verification_jobs (
+              id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, run_id TEXT NOT NULL,
+              oracle TEXT NOT NULL, status TEXT NOT NULL, phase TEXT NOT NULL,
+              completed_requests INTEGER NOT NULL DEFAULT 0,
+              total_requests INTEGER NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0,
+              result TEXT, error TEXT, created_at TEXT NOT NULL,
+              started_at TEXT, completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS verification_jobs_candidate_idx
+              ON verification_jobs(candidate_id,created_at);
             CREATE TABLE IF NOT EXISTS canonical_findings (
               id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL UNIQUE,
               engagement_id TEXT NOT NULL, mode TEXT NOT NULL, title TEXT NOT NULL,
@@ -170,6 +241,25 @@ def init_final_db() -> None:
               impact TEXT NOT NULL, eligibility TEXT NOT NULL, verification TEXT NOT NULL,
               evidence_ids TEXT NOT NULL, status TEXT NOT NULL,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS finding_lifecycle (
+              finding_id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL,
+              fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+              first_seen_run_id TEXT NOT NULL, last_seen_run_id TEXT NOT NULL,
+              occurrence_count INTEGER NOT NULL DEFAULT 1,
+              remediation TEXT NOT NULL, history TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(engagement_id,fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS finding_occurrences (
+              id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, candidate_id TEXT NOT NULL UNIQUE,
+              run_id TEXT NOT NULL, occurrence_kind TEXT NOT NULL, receipt_id TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS finding_occurrences_run_idx ON finding_occurrences(run_id,created_at);
+            CREATE TABLE IF NOT EXISTS finding_retests (
+              id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, run_id TEXT NOT NULL,
+              status TEXT NOT NULL, note TEXT NOT NULL, result TEXT,
+              created_at TEXT NOT NULL, completed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS report_previews (
               id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, platform TEXT NOT NULL,
@@ -185,6 +275,12 @@ def init_final_db() -> None:
               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, version INTEGER NOT NULL,
               platform TEXT NOT NULL, rules TEXT NOT NULL, source_uri TEXT,
               created_at TEXT NOT NULL, UNIQUE(engagement_id,version)
+            );
+            CREATE TABLE IF NOT EXISTS program_rule_authorizations (
+              snapshot_id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL,
+              status TEXT NOT NULL, previous_snapshot_id TEXT,
+              diff TEXT NOT NULL, confirmed_at TEXT, note TEXT NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS identities (
               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, label TEXT NOT NULL,
@@ -252,6 +348,12 @@ def init_final_db() -> None:
               executable_invariants TEXT NOT NULL DEFAULT '[]',
               depends_on_workflow_ids TEXT NOT NULL DEFAULT '[]',
               import_variables TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS campaign_candidate_links (
+              id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, iteration_id TEXT NOT NULL,
+              workflow_id TEXT NOT NULL, hypothesis_id TEXT NOT NULL,
+              candidate_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+              UNIQUE(iteration_id,hypothesis_id)
             );
             CREATE TABLE IF NOT EXISTS research_hypotheses (
               id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, workflow_id TEXT,
@@ -322,6 +424,11 @@ def init_final_db() -> None:
             CREATE INDEX IF NOT EXISTS campaign_metrics_sequence_idx ON campaign_iteration_metrics(campaign_id,sequence);
             """
         )
+        # Request credentials are intentionally kept only in the worker process.
+        # A restart therefore closes unfinished jobs instead of pretending they can resume.
+        db.execute("""UPDATE verification_jobs
+            SET status='interrupted',phase='进程重启，需重新配置身份后执行',completed_at=?
+            WHERE status IN ('queued','running','cancelling')""", (utcnow(),))
         workflow_columns = {row["name"] for row in db.execute("PRAGMA table_info(business_workflows)")}
         if "executable_invariants" not in workflow_columns:
             db.execute("ALTER TABLE business_workflows ADD COLUMN executable_invariants TEXT NOT NULL DEFAULT '[]'")
@@ -332,6 +439,20 @@ def init_final_db() -> None:
         journal_columns = {row["name"] for row in db.execute("PRAGMA table_info(state_change_journal)")}
         if "rollback_probe_baselines" not in journal_columns:
             db.execute("ALTER TABLE state_change_journal ADD COLUMN rollback_probe_baselines TEXT NOT NULL DEFAULT '[]'")
+        # Existing reviewed rule snapshots predate explicit change authorization.
+        # Preserve their prior validity while requiring every new changed version
+        # to pass through the authorization workflow below.
+        for snapshot in db.execute("SELECT * FROM program_snapshots ORDER BY engagement_id,version").fetchall():
+            rules = load(snapshot["rules"], {})
+            if rules.get("kind") != "program_rules":
+                continue
+            db.execute("""INSERT OR IGNORE INTO program_rule_authorizations
+                VALUES(?,?,?,?,?,?,?,?,?)""", (
+                snapshot["id"], snapshot["engagement_id"], "confirmed", None,
+                dump({"has_changes": False, "legacy_backfill": True}),
+                snapshot["created_at"], "迁移：保留原有已审阅状态",
+                snapshot["created_at"], snapshot["created_at"],
+            ))
         migrate_legacy_findings(db)
         # A process restart never leaves a v1 run looking live. Checkpoints stay
         # intact and an explicit Resume continues from the first missing stage.
@@ -359,6 +480,19 @@ class ResolveTargetInput(BaseModel):
     chain_id: int | None = None
 
 
+class TargetPackageInput(BaseModel):
+    kind: Literal["auto", "openapi", "postman", "har", "source_zip", "cidr"] = "auto"
+    content: str = Field(min_length=2, max_length=30_000_000)
+    encoding: Literal["text", "base64"] = "text"
+    mode: Literal["traditional", "web3"] = "traditional"
+    filename: str | None = Field(default=None, max_length=255)
+
+
+class TargetPackageApplyInput(TargetPackageInput):
+    name: str = Field(min_length=2, max_length=160)
+    root_target: str | None = Field(default=None, max_length=2048)
+
+
 class EngagementInput(ResolveTargetInput):
     name: str = Field(default="New security analysis", min_length=2, max_length=160)
     scope: dict[str, Any] = Field(default_factory=dict)
@@ -374,6 +508,37 @@ class FindingUpdateInput(BaseModel):
     title: str | None = Field(default=None, min_length=2, max_length=240)
     hypothesis: str | None = Field(default=None, min_length=2, max_length=4000)
     severity: str | None = Field(default=None, min_length=2, max_length=32)
+
+
+class FindingReportFieldsInput(BaseModel):
+    summary: str = Field(min_length=10, max_length=4000)
+    prerequisites: list[str] = Field(min_length=1, max_length=20)
+    impact_description: str = Field(min_length=10, max_length=4000)
+    affected_users: str = Field(min_length=3, max_length=2000)
+    impact_conditions: str = Field(min_length=3, max_length=2000)
+    impact_evidence_ids: list[str] = Field(min_length=1, max_length=100)
+    counterevidence_summary: str = Field(min_length=3, max_length=4000)
+    counterevidence_ids: list[str] = Field(min_length=1, max_length=100)
+    remediation: str = Field(min_length=3, max_length=4000)
+    platform_custom: dict[str, str] = Field(default_factory=dict, max_length=30)
+
+
+class CandidateTriageInput(BaseModel):
+    disposition: Literal["security_hypothesis", "needs_evidence", "not_security", "duplicate"]
+    reason: str = Field(min_length=3, max_length=2000)
+    duplicate_of: str | None = None
+    resurrect_when: str | None = Field(default=None, max_length=1000)
+
+
+class FindingLifecycleInput(BaseModel):
+    status: Literal["open", "fix_claimed"]
+    remediation: str = Field(default="", max_length=4000)
+    note: str = Field(default="", max_length=2000)
+
+
+class FindingRetestPlanInput(BaseModel):
+    run_id: str
+    note: str = Field(default="验证修复版本是否仍可复现同一根因", min_length=3, max_length=2000)
 
 
 class ReportRequest(BaseModel):
@@ -394,6 +559,24 @@ class ProgramSnapshotInput(BaseModel):
     platform: str = "immunefi"
     rules: dict[str, Any]
     source_uri: str | None = None
+
+
+class ProgramRulesImportInput(BaseModel):
+    engagement_id: str
+    platform: str = Field(min_length=2, max_length=80)
+    source_uri: str = Field(min_length=3, max_length=2048)
+    rules_text: str = Field(min_length=20, max_length=100_000)
+    valid_until: str
+    scope_assets: list[str] = Field(min_length=1, max_length=500)
+    impact_categories: dict[str, Literal["low", "medium", "high", "critical"]] = Field(min_length=1, max_length=100)
+    known_issue_sources: list[str] = Field(min_length=1, max_length=100)
+    previous_audit_sources: list[str] = Field(min_length=1, max_length=100)
+    poc_policy: Literal["allowed", "restricted", "forbidden"]
+
+
+class ProgramRuleAuthorizationInput(BaseModel):
+    confirmation: Literal["CONFIRM_RULE_CHANGE"]
+    note: str = Field(min_length=3, max_length=2000)
 
 
 class Web3ExecutionCheck(BaseModel):
@@ -434,6 +617,7 @@ class CandidateInput(BaseModel):
 
 
 class VerificationInput(BaseModel):
+    receipt_id: str | None = None
     oracle: str
     attempts: int = Field(ge=1, le=20)
     reproduced: bool
@@ -478,6 +662,7 @@ class RoutingPlanInput(BaseModel):
 
 
 class StartAnalysisInput(BaseModel):
+    guided_followup: bool = False
     execution_mode: Literal["demo", "real"] = "real"
     include_recon: bool = True
     include_code: bool = False
@@ -579,6 +764,10 @@ class BusinessWorkflowInput(BaseModel):
     risk_class: Literal["read_only", "reversible", "state_changing"] = "read_only"
 
 
+class BusinessWorkflowTemplateApplyInput(BaseModel):
+    variables: dict[str, str] = Field(default_factory=dict, max_length=20)
+
+
 class ResearchHypothesisInput(BaseModel):
     workflow_id: str | None = None
     category: str = Field(min_length=2, max_length=120)
@@ -612,6 +801,7 @@ class OastProbeInput(BaseModel):
 
 
 class SessionCaptureInput(BaseModel):
+    run_id: str | None = None
     login_url: str = Field(min_length=8, max_length=2048)
     max_requests: int = Field(default=300, ge=20, le=1000)
 
@@ -623,10 +813,12 @@ def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) 
         if not repository:
             planned.extend(["anvil", "cast"])
         return planned
-    planned = [] if repository or not body.include_recon else ["subfinder", "httpx", "katana", "nuclei"]
+    cidr = engagement.get("target_type") == "cidr"
+    planned = (["httpx"] if cidr and body.include_recon else
+               [] if repository or not body.include_recon else ["subfinder", "httpx", "katana", "nuclei"])
     if repository or body.include_code or body.source_path:
         planned.extend(["semgrep", "gitleaks", "trivy"])
-    if body.include_native_agent:
+    if body.include_native_agent and not cidr:
         planned.append("native-agent")
     if body.include_strix:
         planned.append("strix")
@@ -727,6 +919,17 @@ class MaintenanceConfirmInput(BaseModel):
 def resolve_target_value(body: ResolveTargetInput) -> dict[str, Any]:
     raw = body.target.strip()
     if body.mode == "traditional":
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            network = None
+        if network is not None and "/" in raw:
+            normalized = str(network)
+            return {
+                "mode": body.mode, "raw_target": raw, "target_type": "cidr",
+                "normalized_target": normalized, "chain_id": None,
+                "metadata": {"ip_version": network.version, "address_count": network.num_addresses},
+            }
         local = Path(raw).expanduser()
         if local.is_dir():
             normalized = str(local.resolve())
@@ -780,6 +983,253 @@ def resolve_target(body: ResolveTargetInput):
     return resolve_target_value(body)
 
 
+SOURCE_IMPORT_EXTENSIONS = {
+    ".sol", ".vy", ".rs", ".go", ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".php", ".rb", ".move", ".toml", ".json",
+    ".yaml", ".yml", ".lock", ".md",
+}
+
+
+def decode_source_archive(body: TargetPackageInput) -> bytes:
+    if body.encoding != "base64":
+        raise HTTPException(422, "源码压缩包必须使用 base64 编码上传")
+    try:
+        archive = base64.b64decode(body.content, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise HTTPException(422, "源码压缩包 base64 无效") from error
+    if len(archive) > 20 * 1024 * 1024:
+        raise HTTPException(413, "源码压缩包不能超过 20 MB")
+    return archive
+
+
+def inspect_source_archive(body: TargetPackageInput) -> tuple[dict[str, Any], bytes]:
+    archive = decode_source_archive(body)
+    try:
+        package = zipfile.ZipFile(io.BytesIO(archive))
+    except zipfile.BadZipFile as error:
+        raise HTTPException(422, "文件不是有效 ZIP 压缩包") from error
+    accepted, rejected, total_size = [], [], 0
+    with package:
+        entries = package.infolist()
+        if len(entries) > 2000:
+            raise HTTPException(413, "源码压缩包文件数超过 2000")
+        for info in entries:
+            raw_name = info.filename.replace("\\", "/")
+            path = Path(raw_name)
+            unsafe = (not raw_name or raw_name.startswith("/") or ".." in path.parts
+                      or any(part in {".git", "node_modules", "vendor", "dist", "build"} for part in path.parts))
+            is_symlink = ((info.external_attr >> 16) & 0o170000) == 0o120000
+            if info.is_dir():
+                continue
+            if unsafe or is_symlink:
+                raise HTTPException(422, f"压缩包包含不安全路径或符号链接：{raw_name[:160]}")
+            suffix = path.suffix.lower()
+            if suffix not in SOURCE_IMPORT_EXTENSIONS or path.name.startswith("."):
+                rejected.append(raw_name)
+                continue
+            if info.file_size > 5 * 1024 * 1024:
+                raise HTTPException(413, f"单个源码文件超过 5 MB：{raw_name[:160]}")
+            total_size += info.file_size
+            if total_size > 100 * 1024 * 1024:
+                raise HTTPException(413, "源码解压后不能超过 100 MB")
+            if info.compress_size and info.file_size / info.compress_size > 200:
+                raise HTTPException(413, f"源码文件压缩比异常：{raw_name[:160]}")
+            accepted.append({"path": raw_name, "bytes": info.file_size,
+                             "sha256": hashlib.sha256(package.read(info)).hexdigest()})
+    if not accepted:
+        raise HTTPException(422, "压缩包中没有支持的源码或构建配置文件")
+    language_counts: dict[str, int] = {}
+    for item in accepted:
+        suffix = Path(item["path"]).suffix.lower() or "other"
+        language_counts[suffix] = language_counts.get(suffix, 0) + 1
+    preview = {
+        "kind": "source_zip", "mode": body.mode,
+        "source_sha256": hashlib.sha256(archive).hexdigest(),
+        "filename": Path(body.filename or "source.zip").name,
+        "files": accepted, "ignored_files": len(rejected),
+        "counts": {"files": len(accepted), "bytes": total_size, "ignored": len(rejected)},
+        "languages": language_counts,
+        "boundary": "仅解压受支持的源码与构建配置；拒绝路径穿越、符号链接、隐藏文件、依赖/构建目录和异常压缩比。导入后仍需确认 Scope。",
+    }
+    return preview, archive
+
+
+def parse_cidr_package(body: TargetPackageInput) -> dict[str, Any]:
+    if body.encoding != "text" or body.mode != "traditional":
+        raise HTTPException(422, "CIDR 导入仅支持 Traditional 文本")
+    tokens = []
+    for line in body.content.splitlines():
+        value = line.split("#", 1)[0].strip()
+        tokens.extend(item.strip() for item in re.split(r"[,\s]+", value) if item.strip())
+    if not tokens or len(tokens) > 256:
+        raise HTTPException(422, "CIDR 列表必须包含 1–256 个网段")
+    networks = []
+    for token in tokens:
+        if "/" not in token:
+            raise HTTPException(422, f"必须使用显式 CIDR 前缀：{token[:80]}")
+        try:
+            networks.append(ipaddress.ip_network(token, strict=False))
+        except ValueError as error:
+            raise HTTPException(422, f"CIDR 无效：{token[:80]}") from error
+    collapsed = []
+    for version in (4, 6):
+        collapsed.extend(ipaddress.collapse_addresses(item for item in networks if item.version == version))
+    if any(item.num_addresses > 65536 for item in collapsed):
+        raise HTTPException(422, "单个 CIDR 最多包含 65,536 个地址；请缩小授权范围")
+    ranges = [{"cidr": str(item), "ip_version": item.version, "addresses": item.num_addresses} for item in collapsed]
+    return {
+        "kind": "cidr", "mode": "traditional",
+        "source_sha256": hashlib.sha256(body.content.encode()).hexdigest(),
+        "root_target": ranges[0]["cidr"], "ranges": ranges,
+        "counts": {"ranges": len(ranges), "addresses": sum(item["addresses"] for item in ranges)},
+        "boundary": "CIDR 仅冻结为授权网络资产；HTTP 请求仍逐个经过 IP 归属、速率和预算门禁。不会自动扩大到相邻网段。",
+    }
+
+
+def parse_target_package(body: TargetPackageInput) -> dict[str, Any]:
+    detected = body.kind
+    if detected == "auto" and (body.encoding == "base64" or (body.filename or "").lower().endswith(".zip")):
+        detected = "source_zip"
+    if detected == "source_zip":
+        return redact_structure(inspect_source_archive(body)[0])
+    if detected == "cidr":
+        return parse_cidr_package(body)
+    try:
+        document = json.loads(body.content)
+    except ValueError:
+        try:
+            document = yaml.safe_load(body.content)
+        except yaml.YAMLError as error:
+            raise HTTPException(422, "目标包不是有效的 JSON 或 YAML") from error
+    if not isinstance(document, dict):
+        raise HTTPException(422, "目标包根节点必须是对象")
+    if detected == "auto":
+        if "openapi" in document or "swagger" in document:
+            detected = "openapi"
+        elif isinstance(document.get("log"), dict) and isinstance(document["log"].get("entries"), list):
+            detected = "har"
+        elif isinstance(document.get("item"), list) and "info" in document:
+            detected = "postman"
+        else:
+            raise HTTPException(422, "无法识别目标包；请选择 OpenAPI、Postman、HAR、源码 ZIP 或 CIDR")
+    records: list[tuple[str, str]] = []
+    if detected == "openapi":
+        servers = [item.get("url") for item in document.get("servers", []) if isinstance(item, dict)]
+        if not servers and document.get("swagger"):
+            schemes = document.get("schemes") or ["https"]
+            servers = [f"{schemes[0]}://{document.get('host', '')}{document.get('basePath', '')}"]
+        for server in servers:
+            if not isinstance(server, str) or "{" in server:
+                continue
+            for path, operations in (document.get("paths") or {}).items():
+                if not isinstance(operations, dict):
+                    continue
+                for method in operations:
+                    if method.lower() in {"get", "head", "options", "post", "put", "patch", "delete"}:
+                        records.append((method.upper(), server.rstrip("/") + "/" + str(path).lstrip("/")))
+    elif detected == "har":
+        for entry in document.get("log", {}).get("entries", []):
+            request = entry.get("request", {}) if isinstance(entry, dict) else {}
+            records.append((str(request.get("method") or "GET").upper(), str(request.get("url") or "")))
+    else:
+        def visit(items):
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                if isinstance(item.get("item"), list):
+                    visit(item["item"])
+                request = item.get("request")
+                if isinstance(request, dict):
+                    url = request.get("url")
+                    raw = url.get("raw") if isinstance(url, dict) else url
+                    records.append((str(request.get("method") or "GET").upper(), str(raw or "")))
+        visit(document.get("item", []))
+    safe, origins, seen = [], {}, set()
+    for method, raw_url in records[:5000]:
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        port = f":{parsed.port}" if parsed.port else ""
+        origin = f"{parsed.scheme}://{parsed.hostname.lower()}{port}"
+        sanitized = urlunparse((parsed.scheme, f"{parsed.hostname.lower()}{port}", parsed.path or "/", "", "", ""))
+        key = (method, sanitized)
+        if key in seen:
+            continue
+        seen.add(key)
+        origins[origin] = origins.get(origin, 0) + 1
+        safe.append({"method": method, "url": sanitized, "origin": origin})
+        if len(safe) >= 1000:
+            break
+    if not safe:
+        raise HTTPException(422, "目标包没有可用的 HTTP(S) 请求；变量 URL、认证内容与非网络项不会导入")
+    ordered_origins = sorted(origins, key=lambda value: (-origins[value], value))
+    root = ordered_origins[0]
+    return redact_structure({
+        "kind": detected, "source_sha256": hashlib.sha256(body.content.encode()).hexdigest(),
+        "root_target": root, "origins": [{"origin": value, "requests": origins[value],
+                                             "default_in_scope": value == root} for value in ordered_origins],
+        "endpoints": safe, "counts": {"endpoints": len(safe), "origins": len(ordered_origins)},
+        "boundary": "只导入方法、去查询参数 URL 与来源哈希；Header、Cookie、Body 和变量值不会持久化。仅主来源默认进入 Scope。",
+    })
+
+
+@router.post("/target-packages/preview")
+def preview_target_package(body: TargetPackageInput):
+    return parse_target_package(body)
+
+
+@router.post("/target-packages/apply", status_code=201)
+def apply_target_package(body: TargetPackageApplyInput):
+    parsed = parse_target_package(body)
+    if parsed["kind"] == "source_zip":
+        preview, archive = inspect_source_archive(body)
+        destination = LOCAL_DATA_ROOT / "repositories" / uid("import")
+        destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+        accepted = {item["path"] for item in preview["files"]}
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive)) as package:
+                for info in package.infolist():
+                    name = info.filename.replace("\\", "/")
+                    if name not in accepted:
+                        continue
+                    output = destination.joinpath(*Path(name).parts)
+                    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    output.write_bytes(package.read(info))
+                    output.chmod(0o600)
+            engagement = create_engagement(EngagementInput(
+                name=body.name, target=str(destination.resolve()), mode=body.mode,
+                scope_source="import:source_zip",
+                scope={"import_source_sha256": preview["source_sha256"], "import_kind": "source_zip",
+                       "source_manifest": preview["files"], "source_filename": preview["filename"]},
+            ))
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        return {"engagement": engagement, "import": {**preview["counts"], "kind": "source_zip",
+                                                         "mode": body.mode, "repository_path": str(destination.resolve())}}
+    if parsed["kind"] == "cidr":
+        ranges = [item["cidr"] for item in parsed["ranges"]]
+        engagement = create_engagement(EngagementInput(
+            name=body.name, target=parsed["root_target"], mode="traditional", scope_source="import:cidr",
+            scope={"allowed_targets": ranges, "cidr_ranges": ranges,
+                   "import_source_sha256": parsed["source_sha256"], "import_kind": "cidr"},
+        ))
+        return {"engagement": engagement, "import": {**parsed["counts"], "kind": "cidr"}}
+    root = body.root_target or parsed["root_target"]
+    known = {item["origin"] for item in parsed["origins"]}
+    if root not in known:
+        raise HTTPException(422, "所选根目标不在导入包来源列表中")
+    endpoints = [item for item in parsed["endpoints"] if item["origin"] == root]
+    engagement = create_engagement(EngagementInput(
+        name=body.name, target=root, mode="traditional", scope_source=f"import:{parsed['kind']}",
+        scope={"imported_surface": endpoints, "import_source_sha256": parsed["source_sha256"],
+               "import_kind": parsed["kind"], "external_origins": sorted(known - {root})},
+    ))
+    return {"engagement": engagement, "import": {**parsed["counts"], "kind": parsed["kind"],
+                                                    "in_scope_endpoints": len(endpoints),
+                                                    "external_origins": len(known - {root})}}
+
+
 @router.post("/engagements", status_code=201)
 def create_engagement(body: EngagementInput):
     resolved = resolve_target_value(body)
@@ -827,11 +1277,18 @@ def create_engagement(body: EngagementInput):
         db.execute("INSERT INTO execution_policies VALUES(?,?,?,?,?)", (
             policy_id, engagement_id, 1, dump(policy), timestamp,
         ))
+        db.execute("INSERT INTO entities VALUES(?,?,?,?,?,?,?)", (
+            uid("entity"), engagement_id, "target", f"target:{resolved['normalized_target']}",
+            resolved["normalized_target"], dump({
+                "target_type": resolved["target_type"], "mode": body.mode,
+                "environment_class": scope["environment_class"], "root": True,
+            }), timestamp,
+        ))
     return get_engagement(engagement_id)
 
 
 @router.get("/engagements")
-def list_engagements(mode: Literal["traditional", "web3"] | None = None):
+def list_engagements(mode: Literal["traditional", "web3", "agent_audit"] | None = None):
     sql = """SELECT e.*,t.raw_target,t.target_type,t.normalized_target,t.chain_id,
              s.rules AS scope_rules,s.confirmed_at,p.policy
              FROM engagements_v2 e JOIN target_specs t ON t.id=e.target_spec_id
@@ -1007,6 +1464,8 @@ async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = N
     if body.execution_mode == "demo" and not test_demo_enabled:
         raise HTTPException(422, "生产模式不提供演示执行，请启动真实工具链")
     engagement = get_engagement(engagement_id)
+    if engagement["mode"] == "agent_audit":
+        raise HTTPException(409, "Agent Audit 仅执行离线分析，请使用审计分析入口")
     if engagement["status"] != "ready" or not engagement["confirmed_at"]:
         raise HTTPException(409, "必须先人工确认 ScopeSnapshot")
     if body.execution_mode == "real" and engagement["mode"] == "traditional" and engagement.get("target_type") == "repository":
@@ -1091,7 +1550,7 @@ def hydrate_run(row: sqlite3.Row, events: list[sqlite3.Row]) -> dict[str, Any]:
 
 
 @router.get("/runs")
-def list_runs(mode: Literal["traditional", "web3"] | None = None):
+def list_runs(mode: Literal["traditional", "web3", "agent_audit"] | None = None):
     sql, params = "SELECT * FROM analysis_runs", ()
     if mode:
         sql += " WHERE mode=?"
@@ -1103,7 +1562,7 @@ def list_runs(mode: Literal["traditional", "web3"] | None = None):
 
 
 @router.get("/task-center")
-def task_center(mode: Literal["traditional", "web3"] | None = None):
+def task_center(mode: Literal["traditional", "web3", "agent_audit"] | None = None):
     runs = list_runs(mode)
     with connect() as db:
         hidden_row = db.execute("SELECT value FROM app_metadata WHERE key=?", (f"task_center_hidden:{mode or 'all'}",)).fetchone()
@@ -1189,7 +1648,7 @@ def get_run_details(run_id: str):
         verified_count = db.execute(
             "SELECT COUNT(*) FROM canonical_findings f JOIN candidate_findings c ON c.id=f.candidate_id WHERE c.run_id=? AND f.status='verified'", (run_id,),
         ).fetchone()[0]
-        candidate_count = db.execute("SELECT COUNT(*) FROM candidate_findings WHERE run_id=? AND status!='archived'", (run_id,)).fetchone()[0]
+        candidate_count = db.execute("SELECT COUNT(*) FROM candidate_findings WHERE run_id=? AND status NOT IN ('archived','verified','graveyard')", (run_id,)).fetchone()[0]
     config = load(config_row["config"], {}) if config_row else {}
     coverage = []
     by_capability: dict[str, list[dict[str, Any]]] = {}
@@ -1257,8 +1716,9 @@ def get_run_details(run_id: str):
                 status, result = ("running", "正在检出") if run["status"] in {"queued", "running"} else ("not_tested", "本地仓库无需远程检出")
                 count = 0
         elif rows:
-            failed = any(row["reason"] not in {"completed", "passed", "compiled"} for row in rows)
-            status = "failed" if failed else "completed"
+            success_reasons = {"completed", "passed", "compiled", "read_only_completed"}
+            failed = any(row["state"] == "failed" or (row["state"] == "tested" and row["reason"] not in success_reasons) for row in rows)
+            status = "failed" if failed else ("completed" if all(row["state"] == "tested" and row["reason"] in success_reasons for row in rows) else "not_tested")
             result = "；".join(dict.fromkeys(row["reason"] for row in rows))
             count = sum(len(row["observation_ids"]) for row in rows)
         elif terminal:
@@ -1272,8 +1732,8 @@ def get_run_details(run_id: str):
         {"id": "surface", "label": "攻击面与输入清单", "status": "completed" if terminal else run["status"], "summary": f"{len([x for x in test_items if x['stage']=='surface'])} 个表面测试项"},
         {"id": "analysis", "label": "工具执行", "status": "completed" if terminal else run["status"], "summary": f"{len(test_items)} 个计划项，{sum(x['status']=='completed' for x in test_items)} 完成，{sum(x['status']=='failed' for x in test_items)} 失败"},
         {"id": "processing", "label": "结果归一化", "status": "completed" if terminal else "queued", "summary": f"{len(observations)} 条 Observation · {len(artifacts)} 个 Artifact"},
-        {"id": "verification", "label": "候选与独立复验", "status": "completed" if terminal else "queued", "summary": f"{candidate_count} 个 Candidate · {verified_count} 个 Verified"},
-        {"id": "impact", "label": "影响与可提交性", "status": "completed" if terminal else "queued", "summary": "无 Verified Finding，未形成影响结论" if not verified_count else f"{verified_count} 个结果进入影响评估"},
+        {"id": "verification", "label": "候选与独立复验", "status": ("human_review" if candidate_count else "completed" if verified_count else "not_tested") if terminal else "queued", "summary": f"{candidate_count} 个 Candidate · {verified_count} 个 Verified"},
+        {"id": "impact", "label": "影响与可提交性", "status": ("completed" if verified_count else "not_applicable") if terminal else "queued", "summary": "无 Verified Finding，未形成影响结论" if not verified_count else f"{verified_count} 个结果进入影响评估"},
         {"id": "report", "label": "覆盖与总结报告", "status": "completed" if terminal else "queued", "summary": "运行总结与 Coverage Ledger 已生成" if terminal else "等待运行进入终态"},
     ]
     return {"run_id": run_id, "engagement": {"id": engagement["id"], "name": engagement["name"], "target": engagement["normalized_target"], "mode": engagement["mode"], "target_type": engagement["target_type"]}, "config": config, "stages": stages_detail, "test_items": test_items, "observations": observations, "artifacts": artifacts, "coverage": coverage}
@@ -1328,7 +1788,29 @@ def record_observation(run_id: str, body: ObservationInput):
             entity_id, run["engagement_id"], body.observation_type, entity_key, body.subject,
             dump({"source": body.source_capability, "confidence": body.confidence}), utcnow(),
         ))
-        coverage_state = "tested" if body.confidence >= .7 else "observed"
+        entity = db.execute(
+            "SELECT id FROM entities WHERE engagement_id=? AND canonical_key=?",
+            (run["engagement_id"], entity_key),
+        ).fetchone()
+        root = db.execute(
+            "SELECT id FROM entities WHERE engagement_id=? AND entity_type='target' ORDER BY created_at LIMIT 1",
+            (run["engagement_id"],),
+        ).fetchone()
+        if root and entity and root["id"] != entity["id"]:
+            relation = db.execute(
+                """SELECT id,evidence_ids FROM relationships
+                   WHERE engagement_id=? AND source_id=? AND target_id=? AND relation_type='observed_surface'""",
+                (run["engagement_id"], root["id"], entity["id"]),
+            ).fetchone()
+            if relation:
+                refs = list(dict.fromkeys([*load(relation["evidence_ids"], []), observation_id]))
+                db.execute("UPDATE relationships SET evidence_ids=? WHERE id=?", (dump(refs), relation["id"]))
+            else:
+                db.execute("INSERT INTO relationships VALUES(?,?,?,?,?,?,?)", (
+                    uid("relation"), run["engagement_id"], root["id"], entity["id"],
+                    "observed_surface", dump([observation_id]), utcnow(),
+                ))
+        coverage_state = "observed"  # Observation confidence is not a test execution receipt.
         db.execute("""INSERT INTO coverage_v2 VALUES(?,?,?,?,?,?,?)
           ON CONFLICT(run_id,surface_key) DO UPDATE SET state=excluded.state,reason=excluded.reason,
           observation_ids=excluded.observation_ids,updated_at=excluded.updated_at""", (
@@ -1337,6 +1819,87 @@ def record_observation(run_id: str, body: ObservationInput):
         ))
     add_event(run_id, "processing", "observation.recorded", f"{body.source_capability} 输出已规范化为 Observation", {"observation_id": observation_id})
     return {"id": observation_id, **body.model_dump()}
+
+
+@router.get("/engagements/{engagement_id}/asset-graph")
+def engagement_asset_graph(engagement_id: str):
+    engagement = get_engagement(engagement_id)
+    with connect() as db:
+        entity_rows = db.execute(
+            "SELECT * FROM entities WHERE engagement_id=? ORDER BY created_at,id", (engagement_id,),
+        ).fetchall()
+        relation_rows = db.execute(
+            "SELECT * FROM relationships WHERE engagement_id=? ORDER BY created_at,id", (engagement_id,),
+        ).fetchall()
+        observation_rows = db.execute(
+            "SELECT * FROM observations WHERE engagement_id=? ORDER BY created_at,id", (engagement_id,),
+        ).fetchall()
+    target_host = urlparse(engagement["normalized_target"]).hostname
+    allow_subdomains = bool(engagement["scope"].get("allow_subdomains", False))
+
+    def scope_status(subject: str) -> str:
+        subject_host = urlparse(subject).hostname if "://" in subject else None
+        if not target_host or not subject_host:
+            return "not_applicable"
+        if subject_host == target_host or (allow_subdomains and subject_host.endswith(f".{target_host}")):
+            return "in_scope"
+        return "outside_root"
+
+    nodes = []
+    for row in entity_rows:
+        item = dict(row)
+        item["attributes"] = load(item["attributes"], {})
+        if item["entity_type"] != "target":
+            item["attributes"]["scope_status"] = scope_status(item["label"])
+        nodes.append(item)
+    known_keys = {item["canonical_key"] for item in nodes}
+    for row in observation_rows:
+        canonical_key = f"{row['observation_type']}:{row['subject']}".lower()
+        if canonical_key in known_keys:
+            continue
+        nodes.append({
+            "id": f"observed-{hashlib.sha256(canonical_key.encode()).hexdigest()[:16]}",
+            "engagement_id": engagement_id, "entity_type": row["observation_type"],
+            "canonical_key": canonical_key, "label": row["subject"], "attributes": {
+                "source": row["source_capability"], "confidence": row["confidence"],
+                "run_id": row["run_id"], "scope_status": scope_status(row["subject"]),
+                "derived_from_observation": True,
+            }, "created_at": row["created_at"],
+        })
+        known_keys.add(canonical_key)
+    roots = [item for item in nodes if item["entity_type"] == "target"]
+    if not roots:
+        roots = [{
+            "id": f"target-{engagement_id}", "engagement_id": engagement_id, "entity_type": "target",
+            "canonical_key": f"target:{engagement['normalized_target']}",
+            "label": engagement["normalized_target"], "attributes": {
+                "target_type": engagement["target_type"], "mode": engagement["mode"],
+                "environment_class": engagement["scope"].get("environment_class"), "root": True,
+            }, "created_at": engagement["created_at"],
+        }]
+        nodes = [*roots, *nodes]
+    edges = []
+    for row in relation_rows:
+        item = dict(row)
+        item["evidence_ids"] = load(item["evidence_ids"], [])
+        edges.append(item)
+    linked = {item["target_id"] for item in edges}
+    root_id = roots[0]["id"]
+    for node in nodes:
+        if node["id"] != root_id and node["id"] not in linked:
+            edges.append({
+                "id": f"inferred-{node['id']}", "engagement_id": engagement_id,
+                "source_id": root_id, "target_id": node["id"], "relation_type": "observed_surface",
+                "evidence_ids": [], "created_at": node["created_at"], "inferred": True,
+            })
+    by_type: dict[str, int] = {}
+    for node in nodes:
+        by_type[node["entity_type"]] = by_type.get(node["entity_type"], 0) + 1
+    return redact_structure({
+        "engagement_id": engagement_id, "mode": engagement["mode"], "root_id": root_id,
+        "nodes": nodes, "edges": edges, "counts": {"nodes": len(nodes), "edges": len(edges), "by_type": by_type},
+        "boundary": "关系图来自已持久化 Observation；未观察到的资产不会被推断为已测试。",
+    })
 
 
 @router.post("/runs/{run_id}/candidates", status_code=201)
@@ -1372,37 +1935,206 @@ def create_candidate(run_id: str, body: CandidateInput):
 
 @router.post("/runs/{run_id}/correlate")
 def correlate_observations(run_id: str):
+    from candidate_quality import security_category
     with connect() as db:
         run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
         if not run:
             raise HTTPException(404, "Run 不存在")
-        rows = db.execute("""SELECT subject,COUNT(*) AS count,AVG(confidence) AS confidence,
-          GROUP_CONCAT(DISTINCT source_capability) AS sources
-          FROM observations WHERE run_id=? GROUP BY subject HAVING COUNT(*)>=2""", (run_id,)).fetchall()
+        observations = db.execute("SELECT * FROM observations WHERE run_id=? ORDER BY created_at", (run_id,)).fetchall()
+    groups = {}
+    for observation in observations:
+        category = security_category(observation)
+        if category:
+            groups.setdefault((observation["subject"], category), []).append(observation)
     created = []
-    for row in rows:
+    for (subject, category), signals in groups.items():
         with connect() as db:
-            existing = db.execute("SELECT id FROM candidate_findings WHERE run_id=? AND target=?", (run_id, row["subject"])).fetchone()
-            observation_ids = [x["id"] for x in db.execute("SELECT id FROM observations WHERE run_id=? AND subject=?", (run_id, row["subject"]))]
+            existing = db.execute("SELECT id FROM candidate_findings WHERE run_id=? AND target=? AND category=?",
+                                  (run_id, subject, category)).fetchone()
         if existing:
             continue
+        sources = sorted({row["source_capability"] for row in signals})
         result = create_candidate(run_id, CandidateInput(
-            title=f"Correlated hypothesis: {row['subject']}", category="correlated_observation",
-            target=row["subject"], hypothesis=f"{row['count']} observations from {row['sources']} require controlled verification",
-            observation_ids=observation_ids,
+            title=f"待复核安全线索 · {category} · {subject}"[:300], category=category,
+            target=subject, hypothesis="\n".join([
+                f"来源：{', '.join(sources)}。工具线索尚未证明漏洞。",
+                *[row["summary"] for row in signals[:5]],
+                "下一步：确认具体安全边界、受影响对象和适用验证方法；普通公开信息应标记为观察。",
+            ])[:4000], observation_ids=[row["id"] for row in signals],
         ))
         created.append(result)
-    return {"run_id": run_id, "created": created, "count": len(created)}
+    return {"run_id": run_id, "created": created, "count": len(created),
+            "discovery_observations": sum(security_category(row) is None for row in observations)}
 
 
-@router.post("/candidates/{candidate_id}/verify")
-def verify_candidate(candidate_id: str, body: VerificationInput):
+@router.get("/candidates/{candidate_id}")
+def candidate_detail(candidate_id: str):
+    with connect() as db:
+        row = db.execute("SELECT * FROM candidate_findings WHERE id=?", (candidate_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Candidate 不存在")
+        candidate = dict(row)
+        ids = load(candidate["evidence_ids"], [])
+        evidence = []
+        for evidence_id in ids:
+            item = db.execute("""SELECT e.id,e.summary,e.evidence_type,e.polarity,e.artifact_id,
+                o.id AS observation_id,o.subject,o.source_capability,o.observation_type,o.summary AS observation_summary
+                FROM evidence_v2 e LEFT JOIN observations o ON o.id=e.observation_id
+                WHERE e.id=? AND e.run_id=?""", (evidence_id, candidate["run_id"])).fetchone()
+            if item:
+                evidence.append(dict(item))
+        attempts = [dict(item) for item in db.execute("SELECT id,oracle,status,attempts,started_at,completed_at FROM verification_attempts WHERE candidate_id=? ORDER BY started_at DESC", (candidate_id,))]
+        verification_jobs = [dict(item) for item in db.execute("""SELECT id,oracle,status,phase,
+            completed_requests,total_requests,error,created_at,started_at,completed_at
+            FROM verification_jobs WHERE candidate_id=? ORDER BY created_at DESC LIMIT 5""", (candidate_id,))]
+        peer_candidates = [dict(item) for item in db.execute("""SELECT id,title,target,status
+            FROM candidate_findings WHERE engagement_id=? AND id!=?
+            AND status NOT IN ('archived','graveyard') ORDER BY updated_at DESC LIMIT 50""",
+            (candidate["engagement_id"], candidate_id))]
+        program_rows = db.execute("SELECT * FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC",
+                                  (candidate["engagement_id"],)).fetchall() if candidate["mode"] == "web3" else []
+        program_authorizations = {item["snapshot_id"]: item for item in db.execute(
+            "SELECT * FROM program_rule_authorizations WHERE engagement_id=?", (candidate["engagement_id"],),
+        ).fetchall()} if candidate["mode"] == "web3" else {}
+        engagement_row = db.execute("""SELECT t.normalized_target FROM engagements_v2 e
+            JOIN target_specs t ON t.id=e.target_spec_id WHERE e.id=?""", (candidate["engagement_id"],)).fetchone()
+    program_rules = []
+    latest_rule_id = next((item["id"] for item in program_rows if load(item["rules"], {}).get("kind") == "program_rules"), None)
+    for item in program_rows:
+        rules = load(item["rules"], {})
+        if rules.get("kind") == "program_rules":
+            authorization = program_authorizations.get(item["id"])
+            program_rules.append({
+                "id": item["id"], "version": item["version"], "platform": item["platform"],
+                "source_uri": item["source_uri"], "created_at": item["created_at"],
+                "valid_until": rules.get("valid_until"), "scope_assets": rules.get("scope_assets", []),
+                "impact_categories": rules.get("impact_categories", {}), "poc_policy": rules.get("poc_policy"),
+                "authorization_status": authorization["status"] if authorization else "missing",
+                "previous_snapshot_id": authorization["previous_snapshot_id"] if authorization else None,
+                "diff": load(authorization["diff"], {}) if authorization else None,
+                "confirmed_at": authorization["confirmed_at"] if authorization else None,
+                "is_latest_program_rules": item["id"] == latest_rule_id,
+            })
+    candidate["evidence_ids"] = ids
+    from candidate_quality import candidate_next_action
+    action_plan = candidate_next_action(candidate)
+    ordinary = action_plan["stage"] == "triage"
+    property_candidate = candidate["mode"] == "web3" and candidate["category"] == "web3_property_violation"
+    http_candidate = candidate["mode"] == "traditional" and candidate["category"].lower() in {
+        "authorization", "authentication", "access_control", "cwe-639", "idor",
+    }
+    next_steps = (["先确认这是否涉及非公开资产或权限边界；公开目录、品牌与普通页面信息通常只是观察。"] if ordinary else [])
+    next_steps.extend(["核对每条来源证据是否真正支持这项假设。", "明确合法行为、异常行为、所需身份与受影响对象。"])
+    next_steps.append("执行两轮独立属性复测，再补部署对齐、反证与影响材料。" if property_candidate else "建立适用的验证计划，比较基线、测试行为及负对照；响应差异本身不等于漏洞。")
+    next_steps.append("只有真实复验收据与必要证明材料齐备，才可升级为已验证漏洞。")
+    return redact_structure({"candidate": candidate, "evidence": evidence, "attempts": attempts,
+        "verification_jobs": verification_jobs,
+        "peer_candidates": peer_candidates,
+        "needs_triage": ordinary, "next_steps": next_steps, "next_action": action_plan,
+        "verification_level": "V2 / 已复现" if candidate["status"] == "reproduced" else "V0 / 缺少安全语义" if ordinary or candidate["status"] == "needs_evidence" else "V1 / 待验证假设",
+        "available_method": "web3_finalize" if property_candidate and candidate["status"] == "reproduced" else "web3_property" if property_candidate else "http_workbench" if http_candidate else "manual_review",
+        "engagement_target": engagement_row["normalized_target"] if engagement_row else None,
+        "program_rules": program_rules,
+        "save_behavior": "保存只更新标题和判断说明，不执行复验，也不改变验证等级。"})
+
+
+@router.post("/candidates/{candidate_id}/triage")
+def triage_candidate(candidate_id: str, body: CandidateTriageInput):
     with connect() as db:
         candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (candidate_id,)).fetchone()
         if not candidate:
             raise HTTPException(404, "Candidate 不存在")
-        if candidate["status"] == "verified":
-            raise HTTPException(409, "Candidate 已验证")
+        if candidate["status"] in {"verified", "archived"}:
+            raise HTTPException(409, "已验证或已归档记录不能重新分诊")
+        if body.disposition == "duplicate":
+            if not body.duplicate_of or body.duplicate_of == candidate_id:
+                raise HTTPException(422, "重复项必须指向同一项目中的另一条 Candidate")
+            duplicate = db.execute("SELECT id FROM candidate_findings WHERE id=? AND engagement_id=?",
+                                   (body.duplicate_of, candidate["engagement_id"])).fetchone()
+            if not duplicate:
+                raise HTTPException(422, "重复项引用不存在或不属于当前项目")
+        if body.disposition in {"not_security", "duplicate"}:
+            grave_id = uid("grave")
+            reason = f"{body.disposition}: {body.reason.strip()}"
+            if body.duplicate_of:
+                reason += f" · duplicate_of={body.duplicate_of}"
+            counter_ids = [row["id"] for row in db.execute(
+                "SELECT id FROM evidence_v2 WHERE run_id=? AND polarity='counter'", (candidate["run_id"],))]
+            db.execute("INSERT INTO graveyard VALUES(?,?,?,?,?,?,?)", (
+                grave_id, candidate["engagement_id"], f"{candidate['category']}:{candidate['target']}",
+                reason, dump(counter_ids), body.resurrect_when, utcnow(),
+            ))
+            status = "graveyard"
+        else:
+            grave_id = None
+            status = "candidate" if body.disposition == "security_hypothesis" else "needs_evidence"
+        db.execute("UPDATE candidate_findings SET status=?,updated_at=? WHERE id=?", (status, utcnow(), candidate_id))
+    add_event(candidate["run_id"], "verification", "candidate.triaged", "候选分诊已记录", {
+        "candidate_id": candidate_id, "disposition": body.disposition, "reason": body.reason,
+        "duplicate_of": body.duplicate_of,
+    })
+    return {"candidate_id": candidate_id, "status": status, "disposition": body.disposition,
+            "graveyard_id": grave_id, "history_preserved": True}
+
+
+def finding_root_fingerprint(engagement_id: str, category: str, target: str, root_cause: str,
+                             weakness: str, location: str) -> str:
+    def normalized(value: str) -> str:
+        return " ".join(value.strip().lower().split())
+    source_location = normalized(location).split(":", 1)[0]
+    material = "|".join((engagement_id, normalized(category), normalized(target),
+                         normalized(root_cause), normalized(weakness), source_location))
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def ensure_finding_lifecycle(db: sqlite3.Connection) -> None:
+    rows = db.execute("""SELECT f.*,c.run_id FROM canonical_findings f
+        JOIN candidate_findings c ON c.id=f.candidate_id""").fetchall()
+    for row in rows:
+        verification = load(row["verification"], {})
+        fingerprint = finding_root_fingerprint(
+            row["engagement_id"], row["category"], row["target"],
+            verification.get("root_cause") or "unknown", verification.get("weakness") or "unknown",
+            verification.get("location") or row["target"],
+        )
+        timestamp = row["updated_at"] or row["created_at"]
+        db.execute("""INSERT OR IGNORE INTO finding_lifecycle
+            VALUES(?,?,?,?,?,?,?,?,?,?)""", (
+            row["id"], row["engagement_id"], fingerprint, "open", row["run_id"], row["run_id"],
+            1, "", dump([{"at": row["created_at"], "kind": "first_seen", "run_id": row["run_id"]}]), timestamp,
+        ))
+        owner = db.execute("""SELECT * FROM finding_lifecycle
+            WHERE engagement_id=? AND fingerprint=?""", (row["engagement_id"], fingerprint)).fetchone()
+        occurrence = db.execute("SELECT id FROM finding_occurrences WHERE candidate_id=?", (row["candidate_id"],)).fetchone()
+        if occurrence:
+            continue
+        occurrence_kind = "first_seen" if owner["finding_id"] == row["id"] else "migrated_repeat"
+        if owner["finding_id"] != row["id"]:
+            canonical_owner = db.execute("SELECT evidence_ids FROM canonical_findings WHERE id=?", (owner["finding_id"],)).fetchone()
+            merged = list(dict.fromkeys([*load(canonical_owner["evidence_ids"], []), *load(row["evidence_ids"], [])]))
+            history = load(owner["history"], [])
+            history.append({"at": timestamp, "kind": occurrence_kind, "run_id": row["run_id"], "candidate_id": row["candidate_id"]})
+            db.execute("UPDATE canonical_findings SET evidence_ids=?,updated_at=? WHERE id=?", (dump(merged), timestamp, owner["finding_id"]))
+            db.execute("UPDATE canonical_findings SET status='deduplicated',updated_at=? WHERE id=?", (timestamp, row["id"]))
+            db.execute("""UPDATE finding_lifecycle SET last_seen_run_id=?,occurrence_count=occurrence_count+1,
+                history=?,updated_at=? WHERE finding_id=?""", (
+                row["run_id"], dump(history), timestamp, owner["finding_id"],
+            ))
+        db.execute("INSERT INTO finding_occurrences VALUES(?,?,?,?,?,?,?)", (
+            uid("occurrence"), owner["finding_id"], row["candidate_id"], row["run_id"], occurrence_kind,
+            verification.get("receipt_id"), row["created_at"],
+        ))
+
+
+@router.post("/candidates/{candidate_id}/verify")
+def verify_candidate(candidate_id: str, body: VerificationInput):
+    deduplicated, occurrence_kind, lifecycle_status = False, "first_seen", "open"
+    with connect() as db:
+        candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (candidate_id,)).fetchone()
+        if not candidate:
+            raise HTTPException(404, "Candidate 不存在")
+        if candidate["status"] in {"verified", "archived"}:
+            raise HTTPException(409, "Candidate 已验证或已归档")
         run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (candidate["run_id"],)).fetchone()
         if not run:
             raise HTTPException(409, "Candidate 没有可追溯 Run")
@@ -1417,13 +2149,19 @@ def verify_candidate(candidate_id: str, body: VerificationInput):
             program_snapshot = db.execute("SELECT * FROM program_snapshots WHERE id=? AND engagement_id=?", (body.program_snapshot_id, candidate["engagement_id"])).fetchone()
             if not program_snapshot:
                 raise HTTPException(409, "ProgramSnapshot 不存在或不属于当前 Engagement")
+        if candidate["mode"] == "agent_audit":
+            raise HTTPException(409, "Agent Audit 必须使用独立的记录重建验证门")
         unsafe_oracle = "demo" in body.oracle.lower() or "synthetic" in body.oracle.lower()
         web3_gates = candidate["mode"] != "web3" or all(x is True for x in (
             body.impact_in_scope, body.known_issue_checked, body.previous_audit_checked, body.poc_rule_checked,
         ))
         passed = body.reproduced and body.attempts >= 2 and body.counterevidence_checked and bool(body.counterevidence_summary.strip()) and not unsafe_oracle and web3_gates
+        receipt_id = None
+        if passed:
+            from verification_receipts import validate_receipt
+            receipt_id = validate_receipt(db, candidate, run, scope, body)
         attempt_id = uid("verify")
-        result = {"reproduced": body.reproduced, "counterevidence_checked": body.counterevidence_checked, "unsafe_oracle": unsafe_oracle}
+        result = {"receipt_id": receipt_id, "reproduced": body.reproduced, "counterevidence_checked": body.counterevidence_checked, "unsafe_oracle": unsafe_oracle}
         db.execute("INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)", (
             attempt_id, candidate_id, body.oracle, "passed" if passed else "human_review", body.attempts, dump(result), utcnow(), utcnow(),
         ))
@@ -1439,14 +2177,13 @@ def verify_candidate(candidate_id: str, body: VerificationInput):
             counter_id, None, run["id"], "counterevidence", body.counterevidence_summary, None, "counter", utcnow(),
         ))
         evidence_ids.append(counter_id)
-        finding_id = uid("finding")
         verification = {
-            "oracle": body.oracle, "attempts": body.attempts, "attempt_id": attempt_id,
+            "oracle": body.oracle, "attempts": body.attempts, "attempt_id": attempt_id, "receipt_id": receipt_id,
             "steps": body.steps, "expected": body.expected, "actual": body.actual,
             "root_cause": body.root_cause, "weakness": body.weakness, "location": body.location,
             "poc_artifact_ids": body.poc_artifact_ids, "summary": candidate["hypothesis"],
         }
-        impact = {"description": body.impact_description, "demonstrated": True, "feasibility": body.feasibility, "funds_at_risk": body.funds_at_risk}
+        impact = {"description": body.impact_description, "demonstrated": candidate["mode"] == "traditional", "feasibility": body.feasibility, "funds_at_risk": body.funds_at_risk}
         eligibility = {
             "in_scope": True if candidate["mode"] == "traditional" else body.impact_in_scope,
             "scope_snapshot_id": run["scope_snapshot_id"], "program_snapshot_id": body.program_snapshot_id,
@@ -1454,14 +2191,69 @@ def verify_candidate(candidate_id: str, body: VerificationInput):
             "poc_rule_checked": body.poc_rule_checked,
         }
         timestamp = utcnow()
-        db.execute("INSERT INTO canonical_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-            finding_id, candidate_id, candidate["engagement_id"], candidate["mode"], candidate["title"],
-            candidate["category"], body.severity, candidate["target"], dump(impact), dump(eligibility),
-            dump(verification), dump(evidence_ids), "verified", timestamp, timestamp,
+        ensure_finding_lifecycle(db)
+        fingerprint = finding_root_fingerprint(
+            candidate["engagement_id"], candidate["category"], candidate["target"],
+            body.root_cause, body.weakness, body.location,
+        )
+        existing = db.execute("""SELECT f.*,l.status AS lifecycle_status,l.history,l.occurrence_count
+            FROM finding_lifecycle l JOIN canonical_findings f ON f.id=l.finding_id
+            WHERE l.engagement_id=? AND l.fingerprint=?""",
+            (candidate["engagement_id"], fingerprint),
+        ).fetchone()
+        if existing:
+            deduplicated, finding_id = True, existing["id"]
+            occurrence_kind = "reopened" if existing["lifecycle_status"] in {"fix_claimed", "retest_required", "verified_fixed"} else "repeat"
+            lifecycle_status = "reopened" if occurrence_kind == "reopened" else "open"
+            merged_evidence = list(dict.fromkeys([*load(existing["evidence_ids"], []), *evidence_ids]))
+            history = load(existing["history"], [])
+            history.append({"at": timestamp, "kind": occurrence_kind, "run_id": run["id"], "candidate_id": candidate_id})
+            db.execute("""UPDATE canonical_findings SET candidate_id=?,title=?,severity=?,impact=?,eligibility=?,verification=?,
+                evidence_ids=?,status='verified',updated_at=? WHERE id=?""", (
+                candidate_id, candidate["title"], body.severity, dump(impact), dump(eligibility), dump(verification),
+                dump(merged_evidence), timestamp, finding_id,
+            ))
+            db.execute("""UPDATE finding_lifecycle SET status=?,last_seen_run_id=?,occurrence_count=?,
+                history=?,updated_at=? WHERE finding_id=?""", (
+                lifecycle_status, run["id"], int(existing["occurrence_count"]) + 1,
+                dump(history), timestamp, finding_id,
+            ))
+            planned_retest = db.execute("""SELECT * FROM finding_retests
+                WHERE finding_id=? AND run_id=? AND status='planned' ORDER BY created_at DESC LIMIT 1""",
+                (finding_id, run["id"]),
+            ).fetchone()
+            if planned_retest:
+                planned_candidate_id = load(planned_retest["result"], {}).get("candidate_id")
+                if planned_candidate_id and planned_candidate_id != candidate_id:
+                    db.execute("UPDATE candidate_findings SET status='duplicate',updated_at=? WHERE id=?", (
+                        timestamp, planned_candidate_id,
+                    ))
+            db.execute("""UPDATE finding_retests SET status='reproduced',
+                result=?,completed_at=? WHERE finding_id=? AND run_id=? AND status='planned'""", (
+                dump({"candidate_id": candidate_id, "receipt_id": receipt_id}), timestamp, finding_id, run["id"],
+            ))
+            evidence_ids = merged_evidence
+        else:
+            finding_id = uid("finding")
+            db.execute("INSERT INTO canonical_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                finding_id, candidate_id, candidate["engagement_id"], candidate["mode"], candidate["title"],
+                candidate["category"], body.severity, candidate["target"], dump(impact), dump(eligibility),
+                dump(verification), dump(evidence_ids), "verified", timestamp, timestamp,
+            ))
+            db.execute("INSERT INTO finding_lifecycle VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                finding_id, candidate["engagement_id"], fingerprint, "open", run["id"], run["id"], 1, "",
+                dump([{"at": timestamp, "kind": "first_seen", "run_id": run["id"], "candidate_id": candidate_id}]), timestamp,
+            ))
+        db.execute("INSERT INTO finding_occurrences VALUES(?,?,?,?,?,?,?)", (
+            uid("occurrence"), finding_id, candidate_id, run["id"], occurrence_kind, receipt_id, timestamp,
         ))
         db.execute("UPDATE candidate_findings SET status='verified',updated_at=? WHERE id=?", (timestamp, candidate_id))
-    add_event(run["id"], "verification", "finding.verified", "独立 Oracle 与反证门槛通过，已生成 CanonicalFinding", {"finding_id": finding_id})
-    return {"id": finding_id, "candidate_id": candidate_id, "status": "verified", "evidence_ids": evidence_ids, "scope_snapshot_id": run["scope_snapshot_id"]}
+    add_event(run["id"], "verification", "finding.reopened" if occurrence_kind == "reopened" else "finding.verified",
+              "同根因在修复复测中再次出现" if occurrence_kind == "reopened" else "独立 Oracle 与反证门槛通过，已关联 CanonicalFinding",
+              {"finding_id": finding_id, "deduplicated": deduplicated, "occurrence_kind": occurrence_kind})
+    return {"id": finding_id, "candidate_id": candidate_id, "status": "verified", "evidence_ids": evidence_ids,
+            "scope_snapshot_id": run["scope_snapshot_id"], "deduplicated": deduplicated,
+            "occurrence_kind": occurrence_kind, "lifecycle_status": lifecycle_status}
 
 
 @router.post("/findings/{candidate_id}/verify")
@@ -1519,9 +2311,9 @@ def stop_run(run_id: str):
 
 
 @router.get("/findings")
-def list_findings(mode: Literal["traditional", "web3"] | None = None, run_id: str | None = None):
+def list_findings(mode: Literal["traditional", "web3", "agent_audit"] | None = None, run_id: str | None = None):
     with connect() as db:
-        clauses, params = ["c.status!='archived'"], []
+        clauses, params = ["c.status NOT IN ('archived','graveyard','verified','verified_fixed','duplicate')"], []
         if mode:
             clauses.append("c.mode=?")
             params.append(mode)
@@ -1530,13 +2322,129 @@ def list_findings(mode: Literal["traditional", "web3"] | None = None, run_id: st
             params.append(run_id)
         where = " WHERE " + " AND ".join(clauses)
         candidates = [dict(row) for row in db.execute("SELECT c.* FROM candidate_findings c" + where + " ORDER BY c.created_at DESC", tuple(params))]
-        verified = [dict(row) for row in db.execute("SELECT f.*,c.run_id AS run_id FROM canonical_findings f JOIN candidate_findings c ON c.id=f.candidate_id" + where.replace("c.status!='archived'", "c.status!='archived' AND f.status!='archived'") + " ORDER BY f.created_at DESC", tuple(params))]
+        ensure_finding_lifecycle(db)
+        verified_clauses, verified_params = ["f.status='verified'"], []
+        if mode:
+            verified_clauses.append("f.mode=?")
+            verified_params.append(mode)
+        if run_id:
+            verified_clauses.append("o.run_id=?")
+            verified_params.append(run_id)
+            verified_sql = """SELECT DISTINCT f.*,o.run_id AS run_id,l.status AS lifecycle_status,
+                l.occurrence_count,l.first_seen_run_id,l.last_seen_run_id
+                FROM canonical_findings f JOIN finding_occurrences o ON o.finding_id=f.id
+                JOIN finding_lifecycle l ON l.finding_id=f.id"""
+        else:
+            verified_sql = """SELECT f.*,c.run_id AS run_id,l.status AS lifecycle_status,
+                l.occurrence_count,l.first_seen_run_id,l.last_seen_run_id
+                FROM canonical_findings f JOIN candidate_findings c ON c.id=f.candidate_id
+                JOIN finding_lifecycle l ON l.finding_id=f.id"""
+        verified_where = " WHERE " + " AND ".join(verified_clauses)
+        verified = [dict(row) for row in db.execute(
+            verified_sql + verified_where + " ORDER BY f.updated_at DESC", tuple(verified_params),
+        )]
     for row in verified:
         for key in ("impact", "eligibility", "verification", "evidence_ids"):
             row[key] = load(row[key], {} if key != "evidence_ids" else [])
+    from candidate_quality import candidate_next_action
     for row in candidates:
         row["evidence_ids"] = load(row["evidence_ids"], [])
+        row["next_action"] = candidate_next_action(row)
     return {"verified": verified, "candidates": candidates}
+
+
+@router.get("/findings/{finding_id}/lifecycle")
+def get_finding_lifecycle(finding_id: str):
+    with connect() as db:
+        ensure_finding_lifecycle(db)
+        row = db.execute("SELECT * FROM finding_lifecycle WHERE finding_id=?", (finding_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "CanonicalFinding 生命周期不存在")
+        occurrences = [dict(item) for item in db.execute(
+            "SELECT * FROM finding_occurrences WHERE finding_id=? ORDER BY created_at", (finding_id,),
+        )]
+        retests = [dict(item) for item in db.execute(
+            "SELECT * FROM finding_retests WHERE finding_id=? ORDER BY created_at DESC", (finding_id,),
+        )]
+    value = dict(row)
+    value["remediation"] = load(value["remediation"], {}) if value["remediation"] else {}
+    value["history"] = load(value["history"], [])
+    for item in retests:
+        item["result"] = load(item["result"], None)
+    return redact_structure({**value, "occurrences": occurrences, "retests": retests,
+        "fixed_gate": "修复声明不会关闭 Finding；只有受支持的负向复测收据才能标记 verified_fixed。"})
+
+
+@router.patch("/findings/{finding_id}/lifecycle")
+def update_finding_lifecycle(finding_id: str, body: FindingLifecycleInput):
+    with connect() as db:
+        ensure_finding_lifecycle(db)
+        row = db.execute("SELECT * FROM finding_lifecycle WHERE finding_id=?", (finding_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "CanonicalFinding 生命周期不存在")
+        if body.status == "fix_claimed" and len(body.remediation.strip()) < 8:
+            raise HTTPException(422, "声明修复时必须记录修复版本、提交或措施")
+        timestamp = utcnow()
+        history = load(row["history"], [])
+        history.append({"at": timestamp, "kind": body.status, "note": body.note.strip()})
+        remediation = load(row["remediation"], {}) if row["remediation"] else {}
+        if body.remediation.strip():
+            remediation = {"description": body.remediation.strip(), "claimed_at": timestamp}
+        db.execute("""UPDATE finding_lifecycle SET status=?,remediation=?,history=?,updated_at=?
+            WHERE finding_id=?""", (body.status, dump(remediation), dump(history), timestamp, finding_id))
+    return get_finding_lifecycle(finding_id)
+
+
+@router.post("/findings/{finding_id}/retest-plans", status_code=201)
+def create_finding_retest_plan(finding_id: str, body: FindingRetestPlanInput):
+    with connect() as db:
+        ensure_finding_lifecycle(db)
+        lifecycle = db.execute("SELECT * FROM finding_lifecycle WHERE finding_id=?", (finding_id,)).fetchone()
+        if not lifecycle:
+            raise HTTPException(404, "CanonicalFinding 生命周期不存在")
+        run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (body.run_id,)).fetchone()
+        if not run or run["engagement_id"] != lifecycle["engagement_id"]:
+            raise HTTPException(422, "复测 Run 必须属于同一项目")
+        if run["id"] == lifecycle["last_seen_run_id"]:
+            raise HTTPException(422, "复测必须选择新的 Run，不能复用最近一次证据所在 Run")
+        existing = db.execute("""SELECT id FROM finding_retests
+            WHERE finding_id=? AND run_id=? AND status='planned'""", (finding_id, body.run_id)).fetchone()
+        if existing:
+            raise HTTPException(409, "该 Run 已有待执行的根因复测计划")
+        finding = db.execute("SELECT * FROM canonical_findings WHERE id=? AND status='verified'", (finding_id,)).fetchone()
+        source_candidate = db.execute(
+            "SELECT * FROM candidate_findings WHERE id=?", (finding["candidate_id"],),
+        ).fetchone() if finding else None
+        if not finding or not source_candidate:
+            raise HTTPException(409, "Finding 缺少可复制的原始验证定义")
+        timestamp, retest_id = utcnow(), uid("retest")
+        observation_id, evidence_id, candidate_id = uid("obs"), uid("evidence"), uid("candidate")
+        db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+            observation_id, run["id"], run["engagement_id"], run["mode"], "retest.plan",
+            finding["target"], f"Planned root-cause retest for {finding_id}", 1.0,
+            "finding-lifecycle", finding_id, timestamp,
+        ))
+        db.execute("INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)", (
+            evidence_id, observation_id, run["id"], "retest.plan",
+            f"定向复测 {finding_id}：{body.note.strip()}", None, "context", timestamp,
+        ))
+        db.execute("INSERT INTO candidate_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            candidate_id, run["id"], run["engagement_id"], run["mode"], finding["title"],
+            finding["category"], finding["target"], source_candidate["hypothesis"],
+            "candidate", dump([evidence_id]), timestamp, timestamp,
+        ))
+        db.execute("INSERT INTO finding_retests VALUES(?,?,?,?,?,?,?,?)", (
+            retest_id, finding_id, body.run_id, "planned", body.note.strip(),
+            dump({"candidate_id": candidate_id}), timestamp, None,
+        ))
+        history = load(lifecycle["history"], [])
+        history.append({"at": timestamp, "kind": "retest_planned", "run_id": body.run_id, "retest_id": retest_id})
+        db.execute("""UPDATE finding_lifecycle SET status='retest_required',history=?,updated_at=?
+            WHERE finding_id=?""", (dump(history), timestamp, finding_id))
+    add_event(body.run_id, "verification", "finding.retest_planned",
+              "已从原始根因建立新 Run 定向复测候选", {"finding_id": finding_id, "candidate_id": candidate_id})
+    return {"id": retest_id, "finding_id": finding_id, "run_id": body.run_id, "candidate_id": candidate_id,
+            "status": "planned", "note": body.note.strip(), "created_at": timestamp}
 
 
 @router.patch("/findings/{finding_id}")
@@ -1560,6 +2468,62 @@ def update_finding(finding_id: str, body: FindingUpdateInput):
             db.execute("UPDATE canonical_findings SET " + ",".join(f"{key}=?" for key in allowed) + ",updated_at=? WHERE id=?", (*allowed.values(), utcnow(), finding_id))
             return {"id": finding_id, "kind": "verified", **allowed}
     raise HTTPException(404, "Finding 不存在")
+
+
+@router.put("/findings/{finding_id}/report-fields")
+def update_finding_report_fields(finding_id: str, body: FindingReportFieldsInput):
+    """Add reviewed report context without mutating receipt-bound machine proof."""
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM canonical_findings WHERE id=? AND status='verified'", (finding_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Verified CanonicalFinding 不存在")
+        finding_evidence = set(load(row["evidence_ids"], []))
+        impact_ids = list(dict.fromkeys(body.impact_evidence_ids))
+        counter_ids = list(dict.fromkeys(body.counterevidence_ids))
+        requested = set(impact_ids + counter_ids)
+        if not requested <= finding_evidence:
+            raise HTTPException(409, "报告资料只能引用当前 Finding 已绑定的 Evidence")
+        evidence_rows = {item["id"]: item for item in db.execute(
+            f"SELECT * FROM evidence_v2 WHERE id IN ({','.join('?' for _ in requested)})",
+            tuple(requested),
+        ).fetchall()} if requested else {}
+        if set(evidence_rows) != requested:
+            raise HTTPException(409, "报告资料引用的 Evidence 不存在")
+        invalid_counter = [evidence_id for evidence_id in counter_ids
+                           if evidence_rows[evidence_id]["polarity"] != "counter"
+                           and "counter" not in evidence_rows[evidence_id]["evidence_type"]]
+        if invalid_counter:
+            raise HTTPException(409, "反证引用必须指向 counter polarity 的 Evidence")
+        invalid_impact = [evidence_id for evidence_id in impact_ids
+                          if evidence_rows[evidence_id]["polarity"] == "counter"]
+        if invalid_impact:
+            raise HTTPException(409, "影响依据不能使用反证 Evidence")
+        prerequisites = [value.strip() for value in body.prerequisites if value.strip()]
+        if not prerequisites:
+            raise HTTPException(422, "至少保留一个复现前置条件")
+        verification = load(row["verification"], {})
+        impact = load(row["impact"], {})
+        verification["editorial"] = {
+            "summary": body.summary.strip(), "prerequisites": prerequisites,
+            "counterevidence_summary": body.counterevidence_summary.strip(),
+            "counterevidence_ids": counter_ids, "remediation": body.remediation.strip(),
+            "platform_custom": {str(key).strip(): str(value).strip()
+                                for key, value in body.platform_custom.items()
+                                if str(key).strip() and str(value).strip()},
+            "reviewed_at": utcnow(),
+        }
+        impact["editorial"] = {
+            "description": body.impact_description.strip(), "affected_users": body.affected_users.strip(),
+            "conditions": body.impact_conditions.strip(), "evidence_ids": impact_ids,
+        }
+        db.execute("UPDATE canonical_findings SET verification=?,impact=?,updated_at=? WHERE id=?", (
+            dump(verification), dump(impact), utcnow(), finding_id,
+        ))
+    finding, evidence, scope_id = finding_report_inputs(finding_id)
+    return {"id": finding_id, "report_fields": universal_model(finding, evidence, scope_id),
+            "receipt_preserved": True}
 
 
 @router.delete("/findings/{finding_id}")
@@ -1658,12 +2622,20 @@ def get_finding(finding_id: str):
 @router.get("/findings/{finding_id}/proof-capsule")
 def proof_capsule(finding_id: str):
     finding, evidence, scope_id = finding_report_inputs(finding_id)
+    attachments = build_proof_attachments(finding, evidence, scope_id)
+    replay = attachments.get("proof/replay-contract.json", {})
+    replay_kind = (replay.get("assertions") or {}).get("kind")
+    supported = replay_kind in {"http_authorization_read_v2", "forge_property_replay_v1", "ptai_recorded_replay"}
+    executable = replay.get("mode") == "isolated_local_execution"
     capsule = {
         "schema": "proof-capsule/1.0", "finding_id": finding_id,
         "scope_snapshot_id": scope_id, "verification": finding["verification"],
         "impact": finding["impact"], "eligibility": finding["eligibility"],
-        "evidence": evidence, "portable": True,
+        "evidence": evidence, "portable": supported,
+        "portability_status": "isolated_local_replay_ready" if executable else "recorded_assertion_ready" if supported else "unsupported_oracle",
+        "replay": {"kind": replay_kind, "mode": replay.get("mode"), "active_execution_supported": executable},
     }
+    capsule = redact_structure(capsule)
     capsule["sha256"] = hashlib.sha256(dump(capsule).encode()).hexdigest()
     return capsule
 
@@ -1683,6 +2655,113 @@ def finding_report_inputs(finding_id: str) -> tuple[dict[str, Any], list[dict[st
         candidate = db.execute("SELECT run_id FROM candidate_findings WHERE id=?", (finding["candidate_id"],)).fetchone()
         run = db.execute("SELECT scope_snapshot_id FROM analysis_runs WHERE id=?", (candidate["run_id"],)).fetchone() if candidate else None
     return finding, evidence, run["scope_snapshot_id"] if run else "MISSING_SCOPE_SNAPSHOT"
+
+
+def build_proof_attachments(finding, evidence, scope_id):
+    """Resolve actual proof bytes, validating ownership and integrity before exporting."""
+    with connect() as db:
+        candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (finding["candidate_id"],)).fetchone()
+        run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (candidate["run_id"],)).fetchone()
+        scope = db.execute("SELECT * FROM scope_snapshots WHERE id=?", (scope_id,)).fetchone()
+        receipt_id = finding["verification"].get("receipt_id")
+        row = db.execute("SELECT result FROM verification_attempts WHERE id=? AND candidate_id=? AND status='machine_receipt'", (receipt_id, candidate["id"])).fetchone()
+        if not row:
+            raise HTTPException(409, "历史结论没有机器复验收据，请重新验证后导出证明包")
+        receipt = load(row["result"], {})
+        # A historical proof may be exported after its promotion window expires, but its
+        # source bytes, scope and original assertions must remain intact.
+        artifact_ids = set(finding["verification"].get("poc_artifact_ids", []))
+        if not artifact_ids or artifact_ids != set(receipt.get("artifacts", {})):
+            raise HTTPException(409, "复现材料与验证收据不一致")
+        oracle = finding["verification"].get("oracle") or ""
+        files = {
+            "proof/environment.json": {"run_id": run["id"], "mode": run["mode"],
+                "scope_snapshot": {"id": scope["id"], "rules": load(scope["rules"], {}), "confirmed_at": scope["confirmed_at"]},
+                "program_snapshot_id": finding["eligibility"].get("program_snapshot_id")},
+            "proof/verification.json": receipt,
+            "proof/expected.json": {"expected": finding["verification"].get("expected"), "actual": finding["verification"].get("actual")},
+            "proof/steps.md": "# Reproduction steps\n\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(finding["verification"].get("steps", []), 1)),
+        }
+        artifact_files = {}
+        for artifact_id in sorted(artifact_ids):
+            artifact = db.execute("SELECT * FROM artifacts WHERE id=? AND run_id=?", (artifact_id, run["id"])).fetchone()
+            if not artifact:
+                raise HTTPException(409, "复现 Artifact 不存在或不属于当前运行")
+            path = Path(artifact["uri"])
+            if not path.is_file() or path.stat().st_size > 10_000_000:
+                raise HTTPException(409, "复现 Artifact 缺失或超过导出大小限制")
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != artifact["sha256"] or digest != receipt["artifacts"][artifact_id]:
+                raise HTTPException(409, "复现 Artifact 哈希校验失败")
+            try:
+                value = json.loads(raw) if artifact["media_type"] == "application/json" else raw.decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                raise HTTPException(409, "复现 Artifact 无法安全解析和脱敏")
+            extension = "json" if artifact["media_type"] == "application/json" else "txt"
+            proof_name = f"proof/evidence/{artifact_id}.{extension}"
+            files[proof_name] = value
+            artifact_files[artifact_id] = proof_name
+        replay_contract = {
+            "schema": "fieldwork-replay-contract/1", "oracle": oracle,
+            "artifact_files": artifact_files, "mode": "recorded_assertion",
+            "expected": finding["verification"].get("expected"),
+            "actual": finding["verification"].get("actual"),
+        }
+        if oracle == "http-authorization-read-v2":
+            replay_contract["assertions"] = {
+                "kind": "http_authorization_read_v2", "minimum_rounds": 2,
+                "require_reproduced": True, "require_stable": True,
+                "require_all_semantic_checks": True,
+            }
+        elif oracle == "forge-property-replay-v1":
+            property_name = finding["target"]
+            replay_contract["assertions"] = {
+                "kind": "forge_property_replay_v1", "property": property_name,
+                "minimum_rounds": 2, "require_distinct_seeds": True,
+                "require_counterexamples": True, "require_stable_failure_reason": True,
+            }
+            source = db.execute("""SELECT subject FROM observations
+                WHERE run_id=? AND observation_type='web3.compiler_result'
+                ORDER BY created_at DESC LIMIT 1""", (run["id"],)).fetchone()
+            root = Path(source["subject"]).expanduser().resolve() if source else None
+            if root and root.is_dir():
+                selected = []
+                for relative in ("foundry.toml", "remappings.txt"):
+                    path = root / relative
+                    if path.is_file() and not path.is_symlink():
+                        selected.append(path)
+                for folder in ("src", "test", "script", "lib"):
+                    base = root / folder
+                    if base.is_dir():
+                        selected.extend(path for path in base.rglob("*.sol") if path.is_file() and not path.is_symlink())
+                total = 0
+                for path in sorted(set(selected))[:300]:
+                    relative = path.resolve().relative_to(root).as_posix()
+                    raw = path.read_bytes()
+                    total += len(raw)
+                    if total > 5_000_000:
+                        raise HTTPException(409, "可移植 Foundry 源码超过 5MB 限制")
+                    try:
+                        files[f"proof/source/{relative}"] = raw.decode("utf-8")
+                    except UnicodeDecodeError as error:
+                        raise HTTPException(409, "Foundry 源码包含不可导出的非 UTF-8 文件") from error
+                if any(name.startswith("proof/source/src/") for name in files) and any(name.startswith("proof/source/test/") for name in files):
+                    replay_contract.update({
+                        "mode": "isolated_local_execution", "source_root": "proof/source",
+                        "commands": [["forge", "test", "--offline", "--match-test", f"^{property_name.split('(', 1)[0]}",
+                                      "--fuzz-seed", hex(seed), "--json"] for seed in (0xF13D01, 0xF13D02)],
+                        "expected_exit": "nonzero_property_failure",
+                    })
+        elif oracle.startswith("ptai:"):
+            replay_contract["assertions"] = {
+                "kind": "ptai_recorded_replay", "require_integrity": True,
+                "require_verified_verdict": True, "minimum_successful_rounds": 2,
+            }
+        else:
+            replay_contract["assertions"] = {"kind": "unsupported", "reason": "No portable replay adapter registered"}
+        files["proof/replay-contract.json"] = replay_contract
+    return redact_structure(files)
 
 
 @router.post("/findings/{finding_id}/reports/{platform}/preview")
@@ -1708,7 +2787,8 @@ def export_report(finding_id: str, platform: str):
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     package_id = uid("submission")
-    path, manifest = export_bundle(package_id, model, platform, content, check)
+    attachments = build_proof_attachments(finding, evidence, scope_id)
+    path, manifest = export_bundle(package_id, model, platform, content, check, attachments)
     with connect() as db:
         db.execute("INSERT INTO submission_packages_v2 VALUES(?,?,?,?,?,?,?,?)", (
             package_id, finding_id, platform, "review_ready" if check["ready"] else "draft_incomplete",
@@ -1751,6 +2831,44 @@ def capabilities(refresh: bool = False):
         else:
             item["ready"] = item["available"] and item["configured"]
     return items
+
+
+@router.get("/verification-oracles")
+def verification_oracles():
+    """Publish the exact proof boundary instead of implying that every candidate is auto-verifiable."""
+    return [
+        {
+            "id": "http-authorization-read-v2", "mode": "traditional", "level": "automatic_proof",
+            "supports": ["CWE-639", "CWE-862", "对象级读取越权"],
+            "requires": ["JSON GET 对象", "两个已认证主体", "主体与对象所有者字段", "未登录负对照", "两轮稳定结果"],
+            "positive": "不同的已认证主体连续两轮读到同一所有者对象，同时未登录访问被拒绝。",
+            "negative": "对象不同、身份归属缺失、未登录也可访问或服务正确拒绝越权时，均不确认漏洞。",
+            "portable": "recorded_assertion", "promotes_finding": True,
+        },
+        {
+            "id": "forge-property-replay-v1", "mode": "web3", "level": "automatic_proof",
+            "supports": ["指定 Foundry 测试", "不变量或属性反例"],
+            "requires": ["本地 Foundry 源码", "两个独立 fuzz seed", "每轮都有反例", "失败原因稳定", "已审阅项目规则快照"],
+            "positive": "指定属性在两个独立 seed 下均失败，且都有反例和一致的失败原因。",
+            "negative": "属性通过、缺少反例、原因波动或部署与规则不匹配时，均不能生成 Finding。",
+            "portable": "isolated_local_execution", "promotes_finding": True,
+        },
+        {
+            "id": "ptai:machine-oracle", "mode": "traditional", "level": "bounded_adapter",
+            "supports": ["带已注册安全重放方法的 pentest-ai 证据胶囊"],
+            "requires": ["胶囊完整性", "已确认 Scope", "安全执行强度", "所有重放轮次均通过"],
+            "positive": "已注册的胶囊方法在每轮重放中都返回 verified。",
+            "negative": "完整性失败、部分重放、目标不安全或仅返回 candidate 时，继续人工复核。",
+            "portable": "recorded_assertion", "promotes_finding": True,
+        },
+        {
+            "id": "unregistered", "mode": "traditional/web3", "level": "human_review_only",
+            "supports": [], "requires": ["专用且版本化的 Oracle 适配器"],
+            "positive": "当前没有可用的机器升级路径。",
+            "negative": "人工文字、扫描器命中或修改 Oracle 名称都不会生成 Verified Finding。",
+            "portable": "unsupported", "promotes_finding": False,
+        },
+    ]
 
 
 @router.get("/runtime/readiness")
@@ -1955,9 +3073,10 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         source.close()
     backup_path.chmod(0o600)
     tables = (
-        "oast_events", "oast_probes", "state_change_journal", "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
-        "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
-        "graveyard", "coverage_v2", "identity_profiles", "identities", "program_snapshots", "submission_packages_v2",
+        "agent_incidents", "agent_reconciliations", "agent_claims", "agent_events", "agent_audits",
+        "oast_events", "oast_probes", "state_change_journal", "campaign_candidate_links", "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
+        "guided_research_jobs", "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
+        "graveyard", "coverage_v2", "identity_profiles", "identities", "program_rule_authorizations", "program_snapshots", "submission_packages_v2",
         "report_previews", "canonical_findings", "verification_attempts", "candidate_findings",
         "relationships", "entities", "evidence_v2", "artifacts", "observations", "checkpoints",
         "run_events_v2", "analysis_runs", "execution_policies", "scope_snapshots", "engagements_v2", "target_specs",
@@ -1972,7 +3091,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         db.execute("DELETE FROM sqlite_sequence")
     removed_files = removed_bytes = 0
     for path in (
-        LOCAL_DATA_ROOT / "agent_workspaces", LOCAL_DATA_ROOT / "repositories",
+        LOCAL_DATA_ROOT / "agent_workspaces", LOCAL_DATA_ROOT / "agent_audit", LOCAL_DATA_ROOT / "repositories",
         LOCAL_DATA_ROOT / "artifacts", LOCAL_DATA_ROOT / "exports",
     ):
         files, size = _directory_usage(path)
@@ -2105,9 +3224,12 @@ def _session_capture_scope(identity_id: str, login_url: str) -> tuple[dict[str, 
 @router.post("/identities/{identity_id}/session-captures", status_code=201)
 def start_identity_session_capture(identity_id: str, body: SessionCaptureInput):
     identity, allowed_hosts = _session_capture_scope(identity_id, body.login_url)
+    engagement=get_engagement(identity['engagement_id'])
+    if body.run_id and get_run(body.run_id)['engagement_id']!=identity['engagement_id']:
+        raise HTTPException(409,'登录材料必须属于当前项目运行')
     import session_capture
     try:
-        result = session_capture.start(identity_id, body.login_url, allowed_hosts, body.max_requests)
+        result = session_capture.start(identity_id, body.login_url, allowed_hosts, body.max_requests,run_id=body.run_id,target_url=engagement['normalized_target'])
     except RuntimeError as error:
         raise HTTPException(409, str(error)) from error
     return {
@@ -2141,9 +3263,22 @@ def complete_identity_session_capture(capture_id: str):
     timestamp = utcnow()
     with connect() as db:
         db.execute("UPDATE identities SET credential_ref=? WHERE id=?", (credential_ref, capture["identity_id"]))
-        db.execute("""UPDATE identity_profiles SET auth_type='keychain_reference',session_status='ready',
+        db.execute("""UPDATE identity_profiles SET auth_type='keychain_reference',session_status='ready',expires_at=NULL,
           last_validated_at=?,updated_at=? WHERE identity_id=?""", (timestamp, timestamp, capture["identity_id"]))
+    from guided_research import resume_after_identity
+    from guided_capture import store_responses
+    imported_responses=0
+    try:
+        imported_responses=store_responses(capture['identity_id'],capture.get('run_id'),result.get('responses',[]))
+        resumed_jobs = resume_after_identity(capture["identity_id"])
+        resume_status = "checked"
+    except Exception:
+        # The session is already stored; a follow-up failure must not report login failure.
+        resumed_jobs, resume_status = [], "retry_needed"
     return {
+        "imported_responses": imported_responses,
+        "resume_status": resume_status,
+        "resumed_jobs": resumed_jobs,
         "id": capture_id, "identity_id": capture["identity_id"], "status": "stored",
         "cookie_count": result["cookie_count"], "domain_count": result["domain_count"],
         "requests_seen": result["requests_seen"], "requests_blocked": result["requests_blocked"],
@@ -2190,6 +3325,99 @@ def hydrate_campaign(row: sqlite3.Row) -> dict[str, Any]:
     return value
 
 
+BUSINESS_WORKFLOW_TEMPLATES = [
+    {"id": "object_ownership", "name": "对象所有权隔离", "category": "access_control",
+     "description": "比较所有者与其他已授权测试身份读取同一对象时的决策。",
+     "variables": [{"name": "resource_url", "label": "对象 URL", "example": "https://authorized.example/api/orders/42"},
+                   {"name": "owner_role", "label": "所有者角色", "example": "owner", "default": "owner"}]},
+    {"id": "sequence_enforcement", "name": "流程顺序约束", "category": "business_logic",
+     "description": "验证依赖步骤在跳过前置步骤时是否仍被错误接受。",
+     "variables": [{"name": "prerequisite_url", "label": "前置步骤 URL", "example": "https://authorized.example/api/checkout/prepare"},
+                   {"name": "dependent_url", "label": "依赖步骤 URL", "example": "https://authorized.example/api/checkout/confirm"},
+                   {"name": "actor_role", "label": "执行角色", "example": "user", "default": "user"}]},
+    {"id": "ledger_consistency", "name": "账本集合一致性", "category": "financial_logic",
+     "description": "读取汇总和明细，检查账本项目标识是否唯一并保留跨身份差异矩阵。",
+     "variables": [{"name": "summary_url", "label": "汇总 URL", "example": "https://authorized.example/api/wallet/summary"},
+                   {"name": "ledger_url", "label": "明细 URL", "example": "https://authorized.example/api/wallet/entries"},
+                   {"name": "item_pointer", "label": "明细 ID 指针", "example": "/id", "default": "/id"},
+                   {"name": "actor_role", "label": "执行角色", "example": "account_owner", "default": "account_owner"}]},
+    {"id": "entitlement_boundary", "name": "租户与权益边界", "category": "tenant_isolation",
+     "description": "先读取当前权益，再访问受保护资源，并用其他测试身份重放整条序列。",
+     "variables": [{"name": "entitlement_url", "label": "权益 URL", "example": "https://authorized.example/api/me/entitlements"},
+                   {"name": "resource_url", "label": "受保护资源 URL", "example": "https://authorized.example/api/export"},
+                   {"name": "actor_role", "label": "有权益角色", "example": "paid_user", "default": "paid_user"}]},
+]
+
+
+@router.get("/business-workflow-templates")
+def list_business_workflow_templates():
+    return BUSINESS_WORKFLOW_TEMPLATES
+
+
+def workflow_from_template(template_id: str, values: dict[str, str]) -> BusinessWorkflowInput:
+    template = next((item for item in BUSINESS_WORKFLOW_TEMPLATES if item["id"] == template_id), None)
+    if not template:
+        raise HTTPException(404, "业务流程模板不存在")
+    resolved = {}
+    for field in template["variables"]:
+        value = str(values.get(field["name"], field.get("default", ""))).strip()
+        if not value:
+            raise HTTPException(422, f"模板缺少参数：{field['label']}")
+        resolved[field["name"]] = value
+    extra = set(values) - {item["name"] for item in template["variables"]}
+    if extra:
+        raise HTTPException(422, f"模板包含未知参数：{', '.join(sorted(extra))}")
+    status_ok = lambda step: ExecutableInvariantInput(
+        name=f"步骤 {step} 返回成功", kind="status_in", step=step, expected_statuses=[200],
+    )
+    if template_id == "object_ownership":
+        steps = [WorkflowStepInput(name="读取目标对象", method="GET", url=resolved["resource_url"],
+                                   actor_role=resolved["owner_role"], state_before="owner authenticated",
+                                   expected_transition="read only", replay_safe=True)]
+        invariants = ["对象所有者可读取；其他测试身份不得获得同一对象内容"]
+        executable = [status_ok(1)]
+    elif template_id == "sequence_enforcement":
+        steps = [
+            WorkflowStepInput(name="执行前置步骤", method="GET", url=resolved["prerequisite_url"],
+                              actor_role=resolved["actor_role"], state_before="authenticated", expected_transition="prerequisite observed"),
+            WorkflowStepInput(name="执行依赖步骤", method="GET", url=resolved["dependent_url"],
+                              actor_role=resolved["actor_role"], state_before="prerequisite complete",
+                              expected_transition="dependent action accepted", requires_steps=[1]),
+        ]
+        invariants = ["依赖步骤在前置步骤缺失或顺序颠倒时必须被服务端拒绝"]
+        executable = [status_ok(1), status_ok(2)]
+    elif template_id == "ledger_consistency":
+        steps = [
+            WorkflowStepInput(name="读取账户汇总", method="GET", url=resolved["summary_url"], actor_role=resolved["actor_role"], expected_transition="read only"),
+            WorkflowStepInput(name="读取账本明细", method="GET", url=resolved["ledger_url"], actor_role=resolved["actor_role"], expected_transition="read only", requires_steps=[1]),
+        ]
+        invariants = ["账本明细标识必须唯一；汇总与明细应由同一授权账户读取"]
+        executable = [status_ok(1), status_ok(2), ExecutableInvariantInput(
+            name="账本项目标识唯一", kind="json_collection_unique", step=2, pointer="", item_pointer=resolved["item_pointer"],
+        )]
+    else:
+        steps = [
+            WorkflowStepInput(name="读取当前权益", method="GET", url=resolved["entitlement_url"], actor_role=resolved["actor_role"], expected_transition="entitlement observed"),
+            WorkflowStepInput(name="读取受保护资源", method="GET", url=resolved["resource_url"], actor_role=resolved["actor_role"], expected_transition="authorized resource read", requires_steps=[1]),
+        ]
+        invariants = ["没有对应租户权益的身份不得读取受保护资源"]
+        executable = [status_ok(1), status_ok(2)]
+    return BusinessWorkflowInput(
+        name=template["name"], objective=template["description"], preconditions=["至少一个就绪测试身份"],
+        steps=steps, invariants=invariants, executable_invariants=executable, risk_class="read_only",
+    )
+
+
+@router.post("/campaigns/{campaign_id}/workflow-templates/{template_id}/apply", status_code=201)
+def apply_business_workflow_template(campaign_id: str, template_id: str, body: BusinessWorkflowTemplateApplyInput):
+    campaign = get_research_campaign(campaign_id)
+    engagement = get_engagement(campaign["engagement_id"])
+    if engagement["mode"] != "traditional" or engagement.get("target_type") in {"repository", "cidr"}:
+        raise HTTPException(409, "业务流程模板仅适用于 Traditional Web/API 项目")
+    workflow = create_business_workflow(campaign_id, workflow_from_template(template_id, body.variables))
+    return {**workflow, "template_id": template_id}
+
+
 @router.post("/engagements/{engagement_id}/campaigns", status_code=201)
 def create_research_campaign(engagement_id: str, body: ResearchCampaignInput):
     engagement = get_engagement(engagement_id)
@@ -2222,6 +3450,9 @@ def get_research_campaign(campaign_id: str):
         workflows = [dict(item) for item in db.execute("SELECT * FROM business_workflows WHERE campaign_id=? AND status='active' ORDER BY updated_at DESC", (campaign_id,))]
         hypotheses = [dict(item) for item in db.execute("SELECT * FROM research_hypotheses WHERE campaign_id=? AND status!='archived' ORDER BY priority DESC,updated_at DESC", (campaign_id,))]
         iterations = [dict(item) for item in db.execute("SELECT * FROM campaign_iterations WHERE campaign_id=? ORDER BY sequence DESC", (campaign_id,))]
+        candidate_links = [dict(item) for item in db.execute("""SELECT l.*,c.title,c.status,c.run_id
+            FROM campaign_candidate_links l JOIN candidate_findings c ON c.id=l.candidate_id
+            WHERE l.campaign_id=? ORDER BY l.created_at DESC""", (campaign_id,))]
     if not row:
         raise HTTPException(404, "Research Campaign 不存在")
     for workflow in workflows:
@@ -2238,6 +3469,7 @@ def get_research_campaign(campaign_id: str):
     engagement = get_engagement(campaign["engagement_id"])
     return {
         **campaign, "workflows": workflows, "hypotheses": hypotheses, "iterations": iterations,
+        "candidate_links": candidate_links,
         "oast_policy": {
             "allowed": bool(engagement.get("confirmed_at") and engagement["scope"].get("allow_oast", False)),
             "allowed_hosts": engagement["scope"].get("oast_allowed_hosts", []),
@@ -3144,6 +4376,48 @@ def _campaign_hypothesis(campaign_id: str, workflow_id: str, category: str, stat
     return hypothesis_id
 
 
+def _campaign_candidates(campaign_id: str, iteration_id: str, run_id: str,
+                         results: list[dict[str, Any]]) -> list[str]:
+    promotable = {
+        "executable_invariant_violation", "workflow_sequence_bypass",
+        "concurrency_nondeterminism", "cross_identity_sequence_access",
+    }
+    created = []
+    for result in results:
+        hypothesis_ids = result.get("hypothesis_ids") or ([result["hypothesis_id"]] if result.get("hypothesis_id") else [])
+        for hypothesis_id in hypothesis_ids:
+            with connect() as db:
+                hypothesis = db.execute(
+                    "SELECT * FROM research_hypotheses WHERE id=? AND campaign_id=?", (hypothesis_id, campaign_id),
+                ).fetchone()
+                workflow = db.execute(
+                    "SELECT * FROM business_workflows WHERE id=? AND campaign_id=?", (result["workflow_id"], campaign_id),
+                ).fetchone()
+                existing = db.execute(
+                    "SELECT candidate_id FROM campaign_candidate_links WHERE iteration_id=? AND hypothesis_id=?",
+                    (iteration_id, hypothesis_id),
+                ).fetchone()
+            if not hypothesis or not workflow or existing or hypothesis["category"] not in promotable or not result.get("observation_id"):
+                continue
+            steps = load(workflow["steps"], [])
+            target = next((step.get("url") for step in steps if step.get("url")), f"workflow:{workflow['id']}")
+            candidate = create_candidate(run_id, CandidateInput(
+                title=f"业务流程待复验 · {workflow['name']}"[:300],
+                category=f"business_logic.{hypothesis['category']}", target=target,
+                hypothesis=f"{hypothesis['statement']}。该信号来自 Campaign 受控执行，仍需独立重放、负对照与影响确认。",
+                observation_ids=[result["observation_id"]],
+            ))
+            with connect() as db:
+                db.execute("INSERT INTO campaign_candidate_links VALUES(?,?,?,?,?,?,?)", (
+                    uid("campaign-link"), campaign_id, iteration_id, workflow["id"],
+                    hypothesis_id, candidate["id"], utcnow(),
+                ))
+            result.setdefault("candidate_ids", []).append(candidate["id"])
+            result.setdefault("candidate_id", candidate["id"])
+            created.append(candidate["id"])
+    return created
+
+
 def _json_pointer(document: Any, pointer: str) -> Any:
     if pointer == "":
         return document
@@ -3911,6 +5185,7 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             results.append({"kind": kind, "workflow_id": workflow_id, "status": "blocked", "reason": str(error.detail)})
         if delay:
             time.sleep(min(delay, 2))
+    candidate_ids = _campaign_candidates(campaign_id, iteration_id, body.run_id, results)
     tested = sum(item["status"] == "observed" for item in results)
     blocked = len(results) - tested
     coverage_key = f"campaign:{campaign_id}:iteration:{iteration['sequence']}"
@@ -3937,6 +5212,7 @@ def execute_campaign_iteration(campaign_id: str, iteration_id: str, body: Campai
             ))
     add_event(body.run_id, "verification", "campaign.iteration_completed", f"长期研究第 {iteration['sequence']} 轮完成：{tested} 已执行，{blocked} 阻塞", {"campaign_id": campaign_id, "iteration_id": iteration_id})
     return {"campaign_id": campaign_id, "iteration_id": iteration_id, "run_id": body.run_id, "status": "completed", "tested": tested, "blocked": blocked, "results": results, "observation_ids": observation_ids,
+            "candidate_ids": candidate_ids,
             "metrics": {key: value for key, value in metrics.items() if key != "signature_hashes"}}
 
 
@@ -4053,15 +5329,221 @@ def create_program_snapshot(body: ProgramSnapshotInput):
     return {"id": snapshot_id, "version": version, **body.model_dump()}
 
 
+def validated_program_rules(snapshot: sqlite3.Row | dict[str, Any], engagement: dict[str, Any], impact_category: str) -> dict[str, Any]:
+    value = dict(snapshot)
+    rules = load(value.get("rules"), {}) if isinstance(value.get("rules"), str) else value.get("rules", {})
+    if rules.get("kind") != "program_rules" or rules.get("reviewed") is not True:
+        raise HTTPException(409, "需要已审阅的项目规则快照")
+    with connect() as db:
+        authorization = db.execute(
+            "SELECT * FROM program_rule_authorizations WHERE snapshot_id=?", (value["id"],),
+        ).fetchone()
+        rows = db.execute(
+            "SELECT id,rules FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC",
+            (value["engagement_id"],),
+        ).fetchall()
+    latest_rule_id = next((row["id"] for row in rows if load(row["rules"], {}).get("kind") == "program_rules"), None)
+    if latest_rule_id != value["id"]:
+        raise HTTPException(409, "已有更新的项目规则版本，请审阅并使用最新版本")
+    if not authorization or authorization["status"] != "confirmed":
+        raise HTTPException(409, "项目规则发生变化，必须完成差异审阅与重新授权")
+    try:
+        valid_until = datetime.fromisoformat(str(rules["valid_until"]).replace("Z", "+00:00"))
+        if valid_until.tzinfo is None:
+            valid_until = valid_until.replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(409, "项目规则有效期无效") from error
+    if valid_until <= datetime.now(timezone.utc):
+        raise HTTPException(409, "项目规则已过期，请导入新版本")
+    if engagement["normalized_target"] not in rules.get("scope_assets", []):
+        raise HTTPException(409, "当前目标不在项目规则快照的资产范围内")
+    severity = rules.get("impact_categories", {}).get(impact_category)
+    if severity not in {"low", "medium", "high", "critical"}:
+        raise HTTPException(409, "所选影响类别不在项目规则范围内")
+    if rules.get("poc_policy") != "allowed":
+        raise HTTPException(409, "项目规则未明确允许此类 PoC")
+    if not rules.get("known_issue_sources") or not rules.get("previous_audit_sources"):
+        raise HTTPException(409, "缺少已知问题或历史审计核查来源")
+    if rules.get("rules_sha256") != hashlib.sha256(rules.get("rules_text", "").encode()).hexdigest():
+        raise HTTPException(409, "项目规则正文与哈希不一致")
+    return {**rules, "severity": severity}
+
+
+def program_rule_diff(previous: dict[str, Any] | None, current: dict[str, Any],
+                      previous_source: str | None, current_source: str | None) -> dict[str, Any]:
+    if previous is None:
+        return {"has_changes": False, "initial_version": True}
+
+    def set_delta(key: str) -> dict[str, list[str]]:
+        before, after = set(previous.get(key, [])), set(current.get(key, []))
+        return {"added": sorted(after - before), "removed": sorted(before - after)}
+
+    old_impacts, new_impacts = previous.get("impact_categories", {}), current.get("impact_categories", {})
+    impact_delta = {
+        "added": {key: new_impacts[key] for key in sorted(new_impacts.keys() - old_impacts.keys())},
+        "removed": {key: old_impacts[key] for key in sorted(old_impacts.keys() - new_impacts.keys())},
+        "changed": [
+            {"category": key, "from": old_impacts[key], "to": new_impacts[key]}
+            for key in sorted(old_impacts.keys() & new_impacts.keys()) if old_impacts[key] != new_impacts[key]
+        ],
+    }
+    diff = {
+        "rules_text_changed": previous.get("rules_sha256") != current.get("rules_sha256"),
+        "scope_assets": set_delta("scope_assets"),
+        "impact_categories": impact_delta,
+        "known_issue_sources": set_delta("known_issue_sources"),
+        "previous_audit_sources": set_delta("previous_audit_sources"),
+        "poc_policy": None if previous.get("poc_policy") == current.get("poc_policy") else {
+            "from": previous.get("poc_policy"), "to": current.get("poc_policy")},
+        "valid_until": None if previous.get("valid_until") == current.get("valid_until") else {
+            "from": previous.get("valid_until"), "to": current.get("valid_until")},
+        "source_uri": None if previous_source == current_source else {"from": previous_source, "to": current_source},
+    }
+    diff["has_changes"] = any((
+        diff["rules_text_changed"], diff["poc_policy"], diff["valid_until"], diff["source_uri"],
+        *(delta[direction] for delta in (diff["scope_assets"], diff["known_issue_sources"], diff["previous_audit_sources"])
+          for direction in ("added", "removed")),
+        impact_delta["added"], impact_delta["removed"], impact_delta["changed"],
+    ))
+    return diff
+
+
+def hydrate_program_snapshot(row: sqlite3.Row | dict[str, Any], authorization: sqlite3.Row | dict[str, Any] | None,
+                             latest_rule_id: str | None) -> dict[str, Any]:
+    value = dict(row)
+    value["rules"] = load(value["rules"], {}) if isinstance(value["rules"], str) else value["rules"]
+    auth = dict(authorization) if authorization else None
+    value.update({
+        "authorization_status": auth["status"] if auth else "not_applicable",
+        "previous_snapshot_id": auth["previous_snapshot_id"] if auth else None,
+        "diff": load(auth["diff"], {}) if auth else None,
+        "confirmed_at": auth["confirmed_at"] if auth else None,
+        "authorization_note": auth["note"] if auth else None,
+        "is_latest_program_rules": value["id"] == latest_rule_id,
+    })
+    return value
+
+
+@router.post("/program-rules/import", status_code=201)
+def import_program_rules(body: ProgramRulesImportInput):
+    engagement = get_engagement(body.engagement_id)
+    if engagement["mode"] != "web3":
+        raise HTTPException(409, "项目规则导入仅用于 Web3 Engagement")
+    try:
+        valid_until = datetime.fromisoformat(body.valid_until.replace("Z", "+00:00"))
+        if valid_until.tzinfo is None:
+            valid_until = valid_until.replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise HTTPException(422, "valid_until 必须是 ISO 8601 时间") from error
+    if valid_until <= datetime.now(timezone.utc):
+        raise HTTPException(422, "不能导入已过期的项目规则")
+    assets = list(dict.fromkeys(item.strip() for item in body.scope_assets if item.strip()))
+    if engagement["normalized_target"] not in assets:
+        raise HTTPException(422, "规则资产列表必须包含当前项目目标")
+    timestamp = utcnow()
+    rules = {
+        "kind": "program_rules", "reviewed": True, "reviewed_at": timestamp,
+        "valid_until": valid_until.isoformat(), "scope_assets": assets,
+        "impact_categories": body.impact_categories,
+        "known_issue_sources": [item.strip() for item in body.known_issue_sources if item.strip()],
+        "previous_audit_sources": [item.strip() for item in body.previous_audit_sources if item.strip()],
+        "poc_policy": body.poc_policy, "rules_text": body.rules_text,
+        "rules_sha256": hashlib.sha256(body.rules_text.encode()).hexdigest(),
+    }
+    if not rules["known_issue_sources"] or not rules["previous_audit_sources"]:
+        raise HTTPException(422, "必须记录已知问题与历史审计的核查来源")
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC", (body.engagement_id,),
+        ).fetchall()
+        previous_row = next((row for row in rows if load(row["rules"], {}).get("kind") == "program_rules"), None)
+        previous_rules = load(previous_row["rules"], {}) if previous_row else None
+        diff = program_rule_diff(previous_rules, rules, previous_row["source_uri"] if previous_row else None, body.source_uri)
+        status = "pending_reauthorization" if diff["has_changes"] else "confirmed"
+        version = (rows[0]["version"] + 1) if rows else 1
+        snapshot_id = uid("program")
+        db.execute("INSERT INTO program_snapshots VALUES(?,?,?,?,?,?,?)", (
+            snapshot_id, body.engagement_id, version, body.platform, dump(rules), body.source_uri, timestamp,
+        ))
+        db.execute("INSERT INTO program_rule_authorizations VALUES(?,?,?,?,?,?,?,?,?)", (
+            snapshot_id, body.engagement_id, status, previous_row["id"] if previous_row else None,
+            dump(diff), timestamp if status == "confirmed" else None,
+            "首次规则导入已确认" if previous_row is None else "规则内容未变化" if status == "confirmed" else "等待人工审阅差异",
+            timestamp, timestamp,
+        ))
+    return {"id": snapshot_id, "version": version, **body.model_dump(),
+            "authorization_status": status, "previous_snapshot_id": previous_row["id"] if previous_row else None,
+            "diff": diff}
+
+
+@router.post("/program-snapshots/{snapshot_id}/confirm-authorization")
+def confirm_program_rule_authorization(snapshot_id: str, body: ProgramRuleAuthorizationInput):
+    timestamp = utcnow()
+    with connect() as db:
+        snapshot = db.execute("SELECT * FROM program_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+        if not snapshot or load(snapshot["rules"], {}).get("kind") != "program_rules":
+            raise HTTPException(404, "项目规则快照不存在")
+        authorization = db.execute(
+            "SELECT * FROM program_rule_authorizations WHERE snapshot_id=?", (snapshot_id,),
+        ).fetchone()
+        if not authorization:
+            raise HTTPException(409, "规则快照缺少授权记录")
+        rows = db.execute(
+            "SELECT id,rules FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC",
+            (snapshot["engagement_id"],),
+        ).fetchall()
+        latest_rule_id = next((row["id"] for row in rows if load(row["rules"], {}).get("kind") == "program_rules"), None)
+        if snapshot_id != latest_rule_id:
+            raise HTTPException(409, "只能授权最新的项目规则版本")
+        rules = load(snapshot["rules"], {})
+        try:
+            valid_until = datetime.fromisoformat(str(rules["valid_until"]).replace("Z", "+00:00"))
+            if valid_until.tzinfo is None:
+                valid_until = valid_until.replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(409, "项目规则有效期无效") from error
+        if valid_until <= datetime.now(timezone.utc):
+            raise HTTPException(409, "项目规则已过期，请导入新版本")
+        engagement = get_engagement(snapshot["engagement_id"])
+        if engagement["normalized_target"] not in rules.get("scope_assets", []):
+            raise HTTPException(409, "当前目标已不在规则资产范围内")
+        db.execute("""UPDATE program_rule_authorizations
+            SET status='confirmed',confirmed_at=?,note=?,updated_at=? WHERE snapshot_id=?""",
+            (timestamp, body.note.strip(), timestamp, snapshot_id))
+    return {"snapshot_id": snapshot_id, "authorization_status": "confirmed",
+            "confirmed_at": timestamp, "note": body.note.strip()}
+
+
+@router.get("/engagements/{engagement_id}/program-snapshots")
+def list_program_snapshots(engagement_id: str):
+    engagement = get_engagement(engagement_id)
+    if engagement["mode"] != "web3":
+        raise HTTPException(409, "ProgramSnapshot 仅用于 Web3 Engagement")
+    with connect() as db:
+        rows = db.execute("SELECT * FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC", (engagement_id,)).fetchall()
+        authorizations = {row["snapshot_id"]: row for row in db.execute(
+            "SELECT * FROM program_rule_authorizations WHERE engagement_id=?", (engagement_id,),
+        ).fetchall()}
+    latest_rule_id = next((row["id"] for row in rows if load(row["rules"], {}).get("kind") == "program_rules"), None)
+    result = [hydrate_program_snapshot(row, authorizations.get(row["id"]), latest_rule_id) for row in rows]
+    return redact_structure(result)
+
+
 @router.get("/program-snapshots/{snapshot_id}")
 def get_program_snapshot(snapshot_id: str):
     with connect() as db:
         row = db.execute("SELECT * FROM program_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+        authorization = db.execute(
+            "SELECT * FROM program_rule_authorizations WHERE snapshot_id=?", (snapshot_id,),
+        ).fetchone()
     if not row:
         raise HTTPException(404, "ProgramSnapshot 不存在")
-    value = dict(row)
-    value["rules"] = load(value["rules"], {})
-    return value
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id,rules FROM program_snapshots WHERE engagement_id=? ORDER BY version DESC", (row["engagement_id"],),
+        ).fetchall()
+    latest_rule_id = next((item["id"] for item in rows if load(item["rules"], {}).get("kind") == "program_rules"), None)
+    return hydrate_program_snapshot(row, authorization, latest_rule_id)
 
 
 @router.post("/web3/execution/check")
@@ -4088,6 +5570,14 @@ def execution_policy_check(body: PolicyCheckInput):
     target_allowed = normalized in allowed_targets or any(
         normalized.startswith(item.rstrip("/") + "/") for item in allowed_targets if isinstance(item, str)
     )
+    if not target_allowed and engagement["mode"] == "traditional" and engagement.get("target_type") == "cidr":
+        candidate_host = urlparse(body.target if "://" in body.target else f"https://{body.target}").hostname
+        try:
+            candidate_ip = ipaddress.ip_address(candidate_host or "")
+            target_allowed = any(candidate_ip in ipaddress.ip_network(item, strict=False)
+                                 for item in engagement["scope"].get("cidr_ranges", []))
+        except ValueError:
+            target_allowed = False
     if not target_allowed and engagement["mode"] == "traditional" and engagement["scope"].get("allow_subdomains"):
         candidate = urlparse(normalized)
         for item in allowed_targets:

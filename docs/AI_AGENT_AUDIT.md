@@ -1,6 +1,6 @@
 # AI Agent Audit：第三工作域架构
 
-状态：**首版离线审计闭环已实现并通过回归验证。**
+状态：**完整离线审计闭环已实现并通过回归验证。**
 
 更新时间：2026-09-23。数据表、API、确定性 Policy 引擎、自述对账、独立验证门、本地 Demo、基准、报告与证据包均已接入。可信采集器支持 Ed25519 签名、nonce 防重放与递增序号。
 
@@ -14,7 +14,7 @@
 
 不重做 Fieldwork、不建立独立 App、不另建导航系统。保留现有浅灰绿色、深绿色文字、低饱和与研究工具视觉语言。复用 Scope、Run、Observation、Artifact、Evidence、Candidate、Verification、Canonical Finding、Evidence Capsule 和 Report 底座。
 
-第一版仅做离线 Observation / Forensics / Reconstruction / Verification。禁止执行导入日志中的命令；不主动攻击 Agent、不越狱、不逃逸、不提升权限、不做凭据窃取或第三方状态修改。遥测中的危险行为是待审查数据，不是执行指令。
+本模式执行离线 Observation / Forensics / Reconstruction / Verification。禁止执行导入日志中的命令；不主动攻击 Agent、不越狱、不逃逸、不提升权限、不做凭据窃取或第三方状态修改。遥测中的危险行为是待审查数据，不是执行指令。
 
 ## 2. 模式与五工作区
 
@@ -93,7 +93,7 @@ flowchart LR
 
 Policy 正文优先复用 `execution_policies`，Scope 复用 `scope_snapshots`。多次分析/补证据采用新 Run 或新输入版本，不能覆盖已确认运行的原快照。明确外键、归属约束、唯一键、时间索引、归档/清理及备份恢复关系。
 
-本次入口提交不修改数据库 schema。真正加入数据表时再提升 schema 版本，并测试升级、旧数据库备份与恢复。
+当前 Schema 15 包含审计、事件、自述、版本化对账、事件关联、可信采集器和签名导入表；升级继续使用现有备份与版本校验流程。
 
 ### AgentEvent
 
@@ -150,7 +150,7 @@ PolicyEvaluation：`allowed | violation | uncertain | not_applicable`。
 
 ## 7. 导入与来源信任
 
-首版支持 Generic JSON、JSONL、Fieldwork Demo Trace、结构化 Tool Call Log、Process / Shell Log、Network Log。OpenAI / Anthropic / MCP 的专用 Parser 后续再扩展。
+支持 Generic JSON、JSONL、Fieldwork Demo Trace、结构化 Tool Call Log、Process / Shell Log、Network Log。OpenAI / Anthropic / MCP 的专用 Parser 属于可选扩展，不影响统一 Canonical Event Schema。
 
 导入需要：格式、文件或文本、采集器/来源名称、独立来源声明、材料是否为完整自述。服务端验证大小/条数、枚举、时区、端口与对象结构，重复导入幂等。解析失败应指出具体记录，不执行或解释日志为 Shell。
 
@@ -307,6 +307,8 @@ report.md
 | 5 | API 与五工作区实际页面 | 已完成 |
 | 6 | Demo、Benchmark、导出 | 已完成 |
 | 7 | 全量回归与文档 | 已完成 |
+| 8 | Ed25519 可信采集器、签名遥测与防重放 | 已完成 |
+| 9 | 一键 Demo 穿过真实验证门、版本化对账记录 | 已完成 |
 
 最少自动化用例：正常无 Incident、ALIGNED、OMITTED、UNSUPPORTED、CONTRADICTED、UNKNOWN；网络越界、文件越界；缺 Policy；仅 Self Report；仅 LLM；独立证据可进入验证；Artifact Hash 改变拒绝；反证冲突拒绝；证据包导出；Traditional/Web3 回归。
 
@@ -316,6 +318,6 @@ report.md
 
 当前不具备 Agent 框架专用采集器、公证级真实性、硬件密钥证明、OS 沙箱、主动遏制、自动隔离或逃逸测试能力。Ed25519 证明材料由已登记私钥签署，但不能证明采集器自身未被攻陷或日志覆盖完整。网络/文件/工具语义以结构化记录与授权 Policy 为界。缺日志、时钟偏差、来源冲突、代理/子 Agent 身份链、符号链接、跨进程因果关系均需明确保留不确定性。
 
-后续优先扩展可信采集器、跨来源关联、补证据版本化、可重复离线重建、外部独立基准与真实影响证明；模型辅助不能替代这些工作。
+未来扩展包括框架专用采集适配器、跨主机时钟校准、多来源因果关联、硬件密钥证明、外部独立基准与真实影响证明；模型辅助不能替代这些工作。
 
 统一原则：**DO NOT TRUST THE CLAIM. VERIFY THE EVIDENCE. Evidence First.**

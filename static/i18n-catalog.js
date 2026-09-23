@@ -408,5 +408,10 @@ window.FIELDWORK_EN = Object.freeze({
   "签名采集器 ✓": "Signed collector ✓",
   "操作员声明": "Operator attestation",
   "签名已验证，材料已导入": "Signature verified and material imported",
-  "可信采集器已登记": "Trusted collector registered"
+  "可信采集器已登记": "Trusted collector registered",
+  "验证状态": "Verification status",
+  "时间范围": "Time range",
+  "签名真实性已验证": "Signature authenticity verified",
+  "操作员来源声明": "Operator source attestation",
+  "Declared audit boundary": "Declared audit boundary"
 });

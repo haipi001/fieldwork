@@ -38,7 +38,7 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 
 ## AI Agent Audit
 
-顶部第三工作域 **AI Agent Audit** 已实现离线审计闭环：冻结任务与 Policy，导入并脱敏 JSON / JSONL 行为材料，对账 Agent 自述与独立遥测，确定性评估网络、文件、工具、权限和副作用边界，再由独立记录重建验证门确认事件。报告可导出 Markdown、JSON、HTML 和带校验清单的 ZIP 证据包。
+顶部第三工作域 **AI Agent Audit** 已实现离线审计闭环：冻结任务与 Policy，导入并脱敏 JSON / JSONL / Fieldwork Demo Trace 行为材料，对账 Agent 自述与独立遥测，确定性评估网络、文件、工具、权限和副作用边界，再由独立记录重建验证门确认事件。可信采集器可登记 Ed25519 公钥，签名导入使用 nonce 和递增序号阻止重放；私钥不进入 Fieldwork。报告可导出 Markdown、JSON、HTML 和带校验清单的 ZIP 证据包。
 
 工作台支持中文与英文界面切换，语言偏好保存在本机；项目名称、用户输入、原始证据和报告内容不会被自动翻译。完整模型、验证门、API、Demo、指标与限制见 [AI Agent Audit 架构](docs/AI_AGENT_AUDIT.md)。
 

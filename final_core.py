@@ -3071,7 +3071,7 @@ def clear_recent_records(body: MaintenanceConfirmInput):
         source.close()
     backup_path.chmod(0o600)
     tables = (
-        "agent_incidents", "agent_claims", "agent_events", "agent_audits",
+        "agent_incidents", "agent_reconciliations", "agent_claims", "agent_events", "agent_audits",
         "oast_events", "oast_probes", "state_change_journal", "campaign_candidate_links", "campaign_iterations", "research_hypotheses", "business_workflows", "research_campaigns",
         "http_exchanges", "request_slots_v2", "run_configs_v2", "run_budgets_v2", "web3_forks", "invariant_registry",
         "graveyard", "coverage_v2", "identity_profiles", "identities", "program_rule_authorizations", "program_snapshots", "submission_packages_v2",

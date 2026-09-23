@@ -18,7 +18,11 @@
     [/^(\d+) 个阶段已结束$/, '$1 stages completed'],
     [/^心跳 (\d+)秒前$/, 'Heartbeat $1s ago'],
     [/^心跳 (\d+)分前$/, 'Heartbeat $1m ago'],
-    [/^独立证据 (\d+) · (.+) · 反证待检查$/, '$1 independent evidence · $2 · counterevidence pending']
+    [/^独立证据 (\d+) · (.+) · 反证待检查$/, '$1 independent evidence · $2 · counterevidence pending'],
+    [/^验证状态 (.+) · 独立证据 (\d+) · 反证待检查$/, 'Verification status $1 · $2 independent evidence · counterevidence pending'],
+    [/^时间范围 (.+) · (.+) · 签名真实性已验证$/, 'Time range $1 · $2 · signature authenticity verified'],
+    [/^时间范围 (.+) · (.+) · 操作员来源声明$/, 'Time range $1 · $2 · operator source attestation'],
+    [/^时间范围 (.+)$/, 'Time range $1']
   ];
   function translateValue(value) {
     if (!value) return value;
@@ -109,4 +113,3 @@
   window.FIELDWORK_I18N = {get language(){return language;},t(value){return language==='en'?translateValue(value):value;},setLanguage,refresh:()=>walk(document.body)};
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, {once:true}); else init();
 })();
-

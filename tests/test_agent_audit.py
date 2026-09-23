@@ -80,7 +80,7 @@ def test_demo_real_pipeline_and_capsule(client):
     assert response.status_code == 201, response.text
     result = response.json()
     assert result['demo'] and len(result['events']) == 3
-    assert not result['findings']
+    assert len(result['findings']) == 1
     assert [r['status'] for r in result['analysis']['reconciliation']['rows']] == ['ALIGNED','ALIGNED','CONTRADICTED']
     assert len(result['candidates']) == 1
     assert {event['policy_decision'] for event in result['events']} == {'allowed', 'violation'}
@@ -89,7 +89,7 @@ def test_demo_real_pipeline_and_capsule(client):
     response = verify(client, result['id'], cid)
     assert response.status_code == 200, response.text
     assert response.json()['status'] == 'verified'
-    proof = response.json()['verification']
+    proof = result['findings'][0]['verification']
     assert proof['counterevidence']['checked'] and proof['synthetic']
     assert proof['self_report_status'] == 'contradicted'
     response = client.get(f"/api/v1/agent-audit/audits/{result['id']}/capsule")
@@ -120,6 +120,8 @@ def test_normal_aligned_no_incident(client, fixture):
     result = analyze(client, aid)
     assert not result['candidates']
     assert all(r['status']=='ALIGNED' for r in result['analysis']['reconciliation']['rows'])
+    assert result['reconciliation_record']['version'] == 1
+    assert result['reconciliation_record']['input_digest'] == result['analysis']['input_digest']
 
 
 @pytest.mark.parametrize('kind', ['omitted','unsupported','unknown'])
@@ -273,12 +275,23 @@ def test_signed_collector_import_verifies_authenticity_and_capsule(client, fixtu
     response = verify(client, aid, result['candidates'][0]['id'])
     assert response.status_code == 200, response.text
     assert response.json()['verification']['authenticity_verified'] is True
-    assert response.json()['verification']['verification_basis'] == 'signed_collector_reconstruction'
+    assert response.json()['verification']['verification_basis'] == 'single_independent_source'
     capsule = client.get(f'/api/v1/agent-audit/audits/{aid}/capsule')
     with zipfile.ZipFile(io.BytesIO(capsule.content)) as z:
         manifest = json.loads(z.read('manifest.json'))
         assert manifest['authenticity_verified'] is True
         assert json.loads(z.read('collector_attestations.json'))[0]['key_id'] == 'local-os-1'
+
+
+def test_fieldwork_demo_trace_parser_and_one_click_verified_chain(client, fixture):
+    aid = create(client, fixture)
+    body = copy.deepcopy(fixture['imports'][0])
+    body['kind'] = 'fieldwork_demo_trace'
+    result = upload(client, aid, body)
+    assert len(result['events']) == 3
+    demo = client.post('/api/v1/agent-audit/demo').json()
+    assert demo['analysis'] and len(demo['candidates']) == 1 and len(demo['findings']) == 1
+    assert demo['candidates'][0]['status'] == 'verified'
 
 
 def test_signed_collector_rejects_tampering_replay_rollback_and_revocation(client, fixture):

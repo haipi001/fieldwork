@@ -40,9 +40,9 @@ with sync_playwright() as p:
     assert 'SELF REPORT' in timeline and 'POLICY VIOLATION' in timeline and 'CONTRADICTION DETECTED' in timeline
     page.screenshot(path=str(OUT/'02-comparison.png'),full_page=True)
     page.locator('.nav-link[data-go="findings"]').click()
-    page.locator('[data-verify-incident]').click()
     page.locator('#agentFindings .agent-incident').wait_for()
     assert 'VERIFIED' in page.locator('#agentFindings').inner_text()
+    assert page.locator('[data-verify-incident]').count() == 0
     page.screenshot(path=str(OUT/'03-verified.png'),full_page=True)
     page.locator('.nav-link[data-go="reports"]').click()
     page.locator('#agentPreview').click()
@@ -51,7 +51,8 @@ with sync_playwright() as p:
         page.locator('#agentDownloads a').last.click()
     download.value.save_as(str(OUT/'ui-evidence.zip'))
     page.locator('.nav-link[data-go="settings"]').click()
-    assert 'Generic JSON' in page.locator('#agentParsers').inner_text()
+    capabilities = page.locator('#agentParsers').inner_text()
+    assert 'Generic JSON' in capabilities and 'Fieldwork Demo Trace' in capabilities and 'Ed25519' in capabilities
     page.reload()
     assert page.locator('#agent-settings').is_visible()
     for width in [1494,1024,800,390]:

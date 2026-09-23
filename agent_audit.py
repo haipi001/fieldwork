@@ -87,7 +87,7 @@ class AuditInput(StrictModel):
 
 
 class ImportInput(StrictModel):
-    kind: Literal['generic_json', 'jsonl', 'tool_call', 'process', 'network', 'self_report'] = 'generic_json'
+    kind: Literal['generic_json', 'jsonl', 'fieldwork_demo_trace', 'tool_call', 'process', 'network', 'self_report'] = 'generic_json'
     content: str = Field(min_length=2, max_length=2_000_000)
     provenance: Literal['agent_supplied', 'operator_telemetry'] = 'agent_supplied'
     source_name: str = Field(default='agent upload', min_length=1, max_length=200)
@@ -155,6 +155,13 @@ def init_agent_audit_db():
         CREATE TABLE IF NOT EXISTS agent_claims (
           id TEXT PRIMARY KEY, audit_id TEXT NOT NULL REFERENCES agent_audits(id) ON DELETE CASCADE,
           claim_json TEXT NOT NULL, artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS agent_reconciliations (
+          id TEXT PRIMARY KEY, audit_id TEXT NOT NULL REFERENCES agent_audits(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+          version INTEGER NOT NULL, input_digest TEXT NOT NULL,
+          reconciliation_json TEXT NOT NULL, policy_evaluations_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, UNIQUE(audit_id,run_id,version)
         );
         CREATE TABLE IF NOT EXISTS agent_incidents (
           candidate_id TEXT PRIMARY KEY REFERENCES candidate_findings(id) ON DELETE CASCADE,
@@ -616,6 +623,9 @@ def analyze(audit_id: str):
         result['input_digest'] = digest({'snapshot': snapshot, 'events': events, 'claims': claims, 'complete': complete})
         db.execute('UPDATE agent_audits SET analysis_json=? WHERE id=?', (core.dump(result), audit_id))
         now = core.utcnow()
+        db.execute('INSERT INTO agent_reconciliations VALUES(?,?,?,?,?,?,?,?)',
+                   (core.uid('reconciliation'), audit_id, audit['run_id'], 1, result['input_digest'],
+                    core.dump(result['reconciliation']), core.dump(result['policy_evaluations']), now))
         db.execute("UPDATE analysis_runs SET status='completed',current_stage='verification',started_at=?,completed_at=? WHERE id=?", (now, now, audit['run_id']))
         db.execute('INSERT INTO checkpoints VALUES(?,?,?,?,?)', (core.uid('checkpoint'), audit['run_id'], 'reconciliation', core.dump(result), now))
     core.add_event(audit['run_id'], 'verification', 'agent.reconciled', '确定性对账完成；候选仍需独立验证', {})
@@ -663,7 +673,7 @@ def verify_incident(audit_id: str, candidate_id: str):
         if existing:
             return {'id': existing['id'], 'status': 'verified'}
         now, fid, receipt = core.utcnow(), core.uid('finding'), core.uid('verify')
-        proof = {'oracle': 'agent-policy-reconstruction-v1', 'verification_basis': 'signed_collector_reconstruction' if authenticity else 'policy_reconstruction', 'independent_evidence_count': 1, 'self_report_status': status.lower(), 'counterevidence': counter, 'policy_sha256': audit['policy_sha256'], 'event_id': event['id'], 'timestamp': event['timestamp'], 'poc_artifact_ids': [event['artifact_id']], 'synthetic': bool(audit['demo']), 'provenance': event.get('trust_level', 'operator_attested'), 'authenticity_verified': authenticity, 'collector_id': event.get('collector_id') or None, 'scope': 'recorded behavior only', 'summary': candidate['title'], 'receipt_id': receipt}
+        proof = {'oracle': 'agent-policy-reconstruction-v1', 'verification_basis': 'single_independent_source' if authenticity else 'policy_reconstruction', 'independent_evidence_count': 1, 'self_report_status': status.lower(), 'counterevidence': counter, 'policy_sha256': audit['policy_sha256'], 'event_id': event['id'], 'timestamp': event['timestamp'], 'poc_artifact_ids': [event['artifact_id']], 'synthetic': bool(audit['demo']), 'provenance': event.get('trust_level', 'operator_attested'), 'authenticity_verified': authenticity, 'collector_id': event.get('collector_id') or None, 'scope': 'recorded behavior only', 'summary': candidate['title'], 'receipt_id': receipt}
         proof_aid, _ = artifact(db, audit['run_id'], 'agent_verification', proof)
         proof['proof_artifact_id'] = proof_aid
         db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (receipt, candidate_id, proof['oracle'], 'passed', 1, core.dump(proof), now, now))
@@ -697,13 +707,14 @@ def get_audit(audit_id: str):
         attestations = [dict(row) for row in db.execute('''SELECT s.id,s.collector_id,c.name AS collector_name,c.key_id,c.fingerprint,c.algorithm,
             s.artifact_id,s.sequence,s.nonce,s.signed_at,s.payload_sha256,s.signature,s.verified_at
             FROM agent_signed_imports s JOIN agent_collectors c ON c.id=s.collector_id WHERE s.audit_id=? ORDER BY s.sequence''', (audit_id,))]
+        reconciliation_record = db.execute('SELECT id,version,input_digest,created_at FROM agent_reconciliations WHERE audit_id=? AND run_id=? ORDER BY version DESC LIMIT 1', (audit_id, audit['run_id'])).fetchone()
     result = core.load(audit['analysis_json'], None)
     if result and digest({'snapshot': snapshot, 'events': events, 'claims': claims, 'complete': complete}) != result['input_digest']:
         raise HTTPException(409, 'Integrity Check Failed: 分析输入改变')
     presented_events = [{**event, 'policy_decision': result['policy_evaluations'][event['id']]['decision'],
                          'policy_boundaries': result['policy_evaluations'][event['id']]['boundaries']}
                         for event in events] if result else events
-    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
+    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
 
 
 def metrics(events, claims, analysis, findings):
@@ -726,7 +737,7 @@ def capabilities():
     from traditional_tools import strix_provider_settings
     settings = strix_provider_settings()
     configured = bool(settings.get('STRIX_LLM') and (settings.get('LLM_API_KEY') or settings.get('OPENAI_API_KEY')))
-    return {'parsers': ['Generic JSON', 'JSONL', 'Tool Call Log', 'Process / Shell JSON Log', 'Network Log'], 'deterministic_audit': 'READY', 'signed_telemetry': 'READY', 'signature_algorithm': 'Ed25519', 'signature_schema': 'fieldwork-agent-telemetry-signature/1', 'llm_semantic_matcher': 'NOT IMPLEMENTED', 'self_report_generator': 'CONFIGURED' if configured else 'NOT CONFIGURED', 'active_execution': False}
+    return {'parsers': ['Generic JSON', 'JSONL', 'Fieldwork Demo Trace', 'Tool Call Log', 'Process / Shell JSON Log', 'Network Log'], 'deterministic_audit': 'READY', 'signed_telemetry': 'READY', 'signature_algorithm': 'Ed25519', 'signature_schema': 'fieldwork-agent-telemetry-signature/1', 'llm_semantic_matcher': 'NOT IMPLEMENTED', 'self_report_generator': 'CONFIGURED' if configured else 'NOT CONFIGURED', 'active_execution': False}
 
 
 @router.post('/audits/{audit_id}/self-report/generate')
@@ -767,7 +778,10 @@ def create_demo():
         db.execute('UPDATE analysis_runs SET synthetic=1 WHERE id=?', (audit['run_id'],))
     for imported in fixture['imports']:
         import_events(audit['id'], ImportInput.model_validate(imported))
-    return analyze(audit['id'])
+    analyzed = analyze(audit['id'])
+    for candidate in analyzed['candidates']:
+        verify_incident(audit['id'], candidate['id'])
+    return get_audit(audit['id'])
 
 
 def report_model(audit):

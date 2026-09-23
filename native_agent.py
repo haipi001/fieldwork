@@ -68,14 +68,13 @@ def _persist_browser_artifact(run: dict[str, Any], url: str, page_data: dict[str
 def _observe_page(run: dict[str, Any], engagement: dict[str, Any], url: str) -> dict[str, Any]:
     import final_core
     from traditional_runtime import ReplayRequest, network_guard
-    from playwright.sync_api import sync_playwright
-
     policy = final_core.execution_policy_check(final_core.PolicyCheckInput(
         engagement_id=engagement["id"], target=url, action="read",
     ))
     if not policy["allowed"]:
         raise ValueError(f"navigation_denied:{policy['reason']}")
     network_guard(engagement, ReplayRequest(url=url))
+    from playwright.sync_api import sync_playwright
     blocked: list[str] = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(

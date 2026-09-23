@@ -5,6 +5,8 @@ an uploaded trace are not an independence claim. No imported command is executed
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import html
 import json
@@ -16,6 +18,8 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import final_core as core
@@ -89,14 +93,30 @@ class ImportInput(StrictModel):
     source_name: str = Field(default='agent upload', min_length=1, max_length=200)
     independent_attested: bool = False
     self_report_complete: bool = False
+    collector_id: str | None = Field(default=None, max_length=200)
+    sequence: int | None = Field(default=None, ge=1)
+    nonce: str | None = Field(default=None, min_length=16, max_length=200)
+    signed_at: str | None = None
+    signature: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode='after')
     def independence(self):
-        if self.provenance == 'operator_telemetry' and not self.independent_attested:
-            raise ValueError('请确认该来源独立于被审计 Agent')
+        signed = [self.collector_id, self.sequence, self.nonce, self.signed_at, self.signature]
+        if any(value is not None for value in signed) and not all(value is not None for value in signed):
+            raise ValueError('签名遥测需要 collector_id、sequence、nonce、signed_at 和 signature')
+        if self.provenance == 'operator_telemetry' and not self.independent_attested and not self.collector_id:
+            raise ValueError('请确认该来源独立于被审计 Agent，或提供采集器签名')
+        if self.collector_id and self.provenance != 'operator_telemetry':
+            raise ValueError('采集器签名只适用于独立遥测')
         if self.kind == 'self_report' and self.provenance != 'agent_supplied':
             raise ValueError('自述不能作为独立遥测导入')
         return self
+
+
+class CollectorInput(StrictModel):
+    name: str = Field(min_length=2, max_length=200)
+    key_id: str = Field(min_length=3, max_length=200, pattern=r'^[A-Za-z0-9._:-]+$')
+    public_key: str = Field(min_length=40, max_length=100)
 
 
 class Claim(StrictModel):
@@ -142,7 +162,20 @@ def init_agent_audit_db():
           event_id TEXT NOT NULL REFERENCES agent_events(id) ON DELETE CASCADE,
           boundary TEXT NOT NULL, UNIQUE(audit_id,event_id,boundary)
         );
+        CREATE TABLE IF NOT EXISTS agent_collectors (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, key_id TEXT NOT NULL UNIQUE,
+          algorithm TEXT NOT NULL, public_key TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS agent_signed_imports (
+          id TEXT PRIMARY KEY, audit_id TEXT NOT NULL REFERENCES agent_audits(id) ON DELETE CASCADE,
+          collector_id TEXT NOT NULL REFERENCES agent_collectors(id), artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+          sequence INTEGER NOT NULL, nonce TEXT NOT NULL, signed_at TEXT NOT NULL,
+          payload_sha256 TEXT NOT NULL, signature TEXT NOT NULL, verified_at TEXT NOT NULL,
+          UNIQUE(collector_id,sequence), UNIQUE(collector_id,nonce)
+        );
         CREATE INDEX IF NOT EXISTS agent_events_audit ON agent_events(audit_id);
+        CREATE INDEX IF NOT EXISTS agent_signed_imports_audit ON agent_signed_imports(audit_id);
         ''')
 
 
@@ -151,6 +184,88 @@ def audit_row(db, audit_id):
     if not row:
         raise HTTPException(404, 'Agent Audit 不存在')
     return dict(row)
+
+
+def decode_public_key(value):
+    try:
+        raw = base64.b64decode(value, validate=True)
+        if len(raw) != 32:
+            raise ValueError()
+        return raw
+    except (binascii.Error, ValueError):
+        raise HTTPException(422, 'Ed25519 公钥必须是 32 字节 Base64')
+
+
+def collector_view(row):
+    value = dict(row)
+    value.pop('public_key', None)
+    return value
+
+
+@router.post('/collectors', status_code=201)
+def register_collector(body: CollectorInput):
+    raw = decode_public_key(body.public_key)
+    fingerprint = 'SHA256:' + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip('=')
+    now, collector_id = core.utcnow(), core.uid('collector')
+    try:
+        with core.connect() as db:
+            db.execute('INSERT INTO agent_collectors VALUES(?,?,?,?,?,?,?,?,?)',
+                       (collector_id, body.name, body.key_id, 'Ed25519', body.public_key, fingerprint, 'active', now, None))
+    except Exception as error:
+        if 'UNIQUE constraint failed' in str(error):
+            raise HTTPException(409, 'key_id 或公钥已经注册')
+        raise
+    with core.connect() as db:
+        return collector_view(db.execute('SELECT * FROM agent_collectors WHERE id=?', (collector_id,)).fetchone())
+
+
+@router.get('/collectors')
+def list_collectors():
+    with core.connect() as db:
+        return [collector_view(row) for row in db.execute('SELECT * FROM agent_collectors ORDER BY created_at DESC')]
+
+
+@router.post('/collectors/{collector_id}/revoke')
+def revoke_collector(collector_id: str):
+    with core.connect() as db:
+        row = db.execute('SELECT * FROM agent_collectors WHERE id=?', (collector_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, '采集器不存在')
+        if row['status'] != 'revoked':
+            db.execute("UPDATE agent_collectors SET status='revoked',revoked_at=? WHERE id=?", (core.utcnow(), collector_id))
+        return collector_view(db.execute('SELECT * FROM agent_collectors WHERE id=?', (collector_id,)).fetchone())
+
+
+def signing_payload(audit_id, body, payload_sha256):
+    return {'schema': 'fieldwork-agent-telemetry-signature/1', 'audit_id': audit_id,
+            'collector_id': body.collector_id, 'sequence': body.sequence, 'nonce': body.nonce,
+            'signed_at': body.signed_at, 'kind': body.kind, 'provenance': body.provenance,
+            'source_name': body.source_name, 'input_sha256': payload_sha256}
+
+
+def canonical_bytes(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+
+
+def verify_collector_signature(db, audit_id, body, payload_sha256):
+    if not body.collector_id:
+        return None
+    collector = db.execute('SELECT * FROM agent_collectors WHERE id=?', (body.collector_id,)).fetchone()
+    if not collector or collector['status'] != 'active':
+        raise HTTPException(409, '采集器不存在或已撤销')
+    try:
+        timestamp(body.signed_at)
+        signature = base64.b64decode(body.signature, validate=True)
+        Ed25519PublicKey.from_public_bytes(decode_public_key(collector['public_key'])).verify(
+            signature, canonical_bytes(signing_payload(audit_id, body, payload_sha256)))
+    except (InvalidSignature, binascii.Error, ValueError):
+        raise HTTPException(422, '采集器签名无效')
+    if db.execute('SELECT 1 FROM agent_signed_imports WHERE collector_id=? AND nonce=?', (body.collector_id, body.nonce)).fetchone():
+        raise HTTPException(409, '签名 nonce 已使用，拒绝重放')
+    latest = db.execute('SELECT MAX(sequence) FROM agent_signed_imports WHERE collector_id=?', (body.collector_id,)).fetchone()[0]
+    if latest is not None and body.sequence <= latest:
+        raise HTTPException(409, 'sequence 必须严格递增，拒绝回滚或重放')
+    return dict(collector)
 
 
 def artifact(db, run_id, kind, value):
@@ -223,7 +338,7 @@ def parse_import(body):
     return events, claims
 
 
-def normalize_event(raw, body, identity):
+def normalize_event(raw, body, identity, signed=False):
     if not isinstance(raw, dict):
         raise HTTPException(422, '每条事件必须为 JSON 对象')
     source = raw.get('source_type', body.kind if body.kind in TELEMETRY else 'agent_trace')
@@ -245,6 +360,8 @@ def normalize_event(raw, body, identity):
                  policy_decision='pending',
                  confidence=0.5, created_at=core.utcnow(), provenance=body.provenance,
                  independent=body.provenance == 'operator_telemetry' and source in TELEMETRY,
+                 trust_level='signed_collector' if signed else 'operator_attested' if body.provenance == 'operator_telemetry' else 'agent_supplied',
+                 authenticity_verified=bool(signed), collector_id=body.collector_id or '',
                  source_name=body.source_name, credential_access=raw.get('credential_access') is True,
                  persistence=raw.get('persistence') is True, external_side_effect=raw.get('external_side_effect') is True)
     value['resource'] = value['resource'] or value['filesystem_path'] or value['network_host'] or value['destination'] or value['tool_name']
@@ -282,20 +399,28 @@ def import_events(audit_id: str, body: ImportInput):
         audit = audit_row(db, audit_id)
         if audit['analysis_json']:
             raise HTTPException(409, '分析输入已冻结；补充证据请新建审计，保留原结论')
+        source_hash = hashlib.sha256(body.content.encode()).hexdigest()
+        collector = verify_collector_signature(db, audit_id, body, source_hash)
         identity = core.load(audit['identity_json'])
-        normalized = [normalize_event(item, body, identity) for item in events]
+        normalized = [normalize_event(item, body, identity, bool(collector)) for item in events]
         normalized_claims = [normalize_claim(item, identity) for item in claims]
         total = db.execute('SELECT COUNT(*) FROM agent_events WHERE audit_id=?', (audit_id,)).fetchone()[0]
         if total + len(normalized) > 5000:
             raise HTTPException(422, '一次审计最多 5000 条事件')
         manifest = core.load(audit['input_manifest'])
-        source_hash = hashlib.sha256(body.content.encode()).hexdigest()
         if any(item['input_sha256'] == source_hash for item in manifest['imports']):
             raise HTTPException(409, '相同文件已经导入')
         raw_id, _ = artifact(db, audit['run_id'], 'agent_import_redacted', {
             'input_sha256': source_hash, 'document': reporting.redact_structure({'events': events, 'claims': claims}),
             'provenance': body.provenance, 'source_name': body.source_name, 'self_report_complete': body.self_report_complete,
+            'trust_level': 'signed_collector' if collector else 'operator_attested' if body.provenance == 'operator_telemetry' else 'agent_supplied',
+            'collector_id': body.collector_id,
+            'signing_payload': signing_payload(audit_id, body, source_hash) if collector else None,
         })
+        if collector:
+            db.execute('INSERT INTO agent_signed_imports VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (core.uid('signed-import'), audit_id, body.collector_id, raw_id, body.sequence, body.nonce,
+                        body.signed_at, source_hash, body.signature, core.utcnow()))
         for event in normalized:
             event.update(audit_id=audit_id, raw_artifact_id=raw_id, raw_sha256=source_hash)
             aid, _ = artifact(db, audit['run_id'], 'agent_event', event)
@@ -309,7 +434,9 @@ def import_events(audit_id: str, body: ImportInput):
             aid, _ = artifact(db, audit['run_id'], 'agent_self_report', claim)
             db.execute('INSERT INTO agent_claims VALUES(?,?,?,?)', (claim['claim_id'], audit_id, core.dump(claim), aid))
             db.execute('INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)', (core.uid('obs'), audit['run_id'], audit_id, 'agent_audit', 'self_report', claim['resource'], claim['statement'], claim['confidence'], 'agent_self_report', aid, core.utcnow()))
-        manifest['imports'].append({'artifact_id': raw_id, 'input_sha256': source_hash, 'events': len(normalized), 'claims': len(claims), 'self_report_complete': body.self_report_complete, 'source_name': body.source_name})
+        manifest['imports'].append({'artifact_id': raw_id, 'input_sha256': source_hash, 'events': len(normalized), 'claims': len(claims), 'self_report_complete': body.self_report_complete, 'source_name': body.source_name,
+                                    'trust_level': 'signed_collector' if collector else 'operator_attested' if body.provenance == 'operator_telemetry' else 'agent_supplied',
+                                    'authenticity_verified': bool(collector), 'collector_id': body.collector_id})
         db.execute('UPDATE agent_audits SET input_manifest=? WHERE id=?', (core.dump(manifest), audit_id))
     core.add_event(audit['run_id'], 'intake', 'agent.imported', '行为材料已导入；原始输入只保留哈希，材料已脱敏', {'events': len(normalized), 'claims': len(claims)})
     return get_audit(audit_id)
@@ -433,6 +560,16 @@ def checked_inputs(db, audit):
         imported, _ = read_artifact(db, item['artifact_id'], audit['run_id'])
         if imported['input_sha256'] != item['input_sha256'] or imported['self_report_complete'] != item['self_report_complete']:
             raise HTTPException(409, 'Integrity Check Failed: Import manifest')
+        if item.get('authenticity_verified'):
+            signed = db.execute('SELECT s.*,c.public_key,c.status FROM agent_signed_imports s JOIN agent_collectors c ON c.id=s.collector_id WHERE s.audit_id=? AND s.artifact_id=?', (audit['id'], item['artifact_id'])).fetchone()
+            payload = imported.get('signing_payload')
+            if not signed or not payload or payload['input_sha256'] != signed['payload_sha256'] or payload['collector_id'] != signed['collector_id']:
+                raise HTTPException(409, 'Integrity Check Failed: Collector attestation')
+            try:
+                Ed25519PublicKey.from_public_bytes(decode_public_key(signed['public_key'])).verify(
+                    base64.b64decode(signed['signature'], validate=True), canonical_bytes(payload))
+            except (InvalidSignature, binascii.Error, ValueError):
+                raise HTTPException(409, 'Integrity Check Failed: Collector signature')
     events, claims = [], []
     for row in db.execute('SELECT * FROM agent_events WHERE audit_id=?', (audit['id'],)):
         event, _ = read_artifact(db, row['artifact_id'], audit['run_id'])
@@ -516,7 +653,8 @@ def verify_incident(audit_id: str, candidate_id: str):
                      and other['actor'] == event['actor'] and other['session_id'] == event['session_id']
                      and other['action_type'] == event['action_type'] and other['resource'] == event['resource']
                      and other['timestamp'] == event['timestamp'] and other['status'] not in SUCCESS]
-        counter = {'checked': True, 'conflicting_events': conflicts, 'checks': ['actor/session/time attribution', 'successful observed action', 'immutable policy reconstruction', 'same-action contradictory telemetry', 'artifact and evidence integrity'], 'unknowns': ['遥测真实性由导入操作者确认；未验证采集器签名', '未观察部分及实际业务影响 UNKNOWN']}
+        authenticity = bool(event.get('authenticity_verified'))
+        counter = {'checked': True, 'conflicting_events': conflicts, 'checks': ['actor/session/time attribution', 'successful observed action', 'immutable policy reconstruction', 'same-action contradictory telemetry', 'artifact and evidence integrity'] + (['Ed25519 collector signature'] if authenticity else []), 'unknowns': ([] if authenticity else ['遥测真实性由导入操作者确认；未验证采集器签名']) + ['未观察部分及实际业务影响 UNKNOWN']}
         if conflicts:
             db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (core.uid('verify'), candidate_id, 'agent-policy-reconstruction-v1', 'human_review', 1, core.dump(counter), core.utcnow(), core.utcnow()))
             db.execute("UPDATE candidate_findings SET status='human_review' WHERE id=?", (candidate_id,))
@@ -525,7 +663,7 @@ def verify_incident(audit_id: str, candidate_id: str):
         if existing:
             return {'id': existing['id'], 'status': 'verified'}
         now, fid, receipt = core.utcnow(), core.uid('finding'), core.uid('verify')
-        proof = {'oracle': 'agent-policy-reconstruction-v1', 'verification_basis': 'policy_reconstruction', 'independent_evidence_count': 1, 'self_report_status': status.lower(), 'counterevidence': counter, 'policy_sha256': audit['policy_sha256'], 'event_id': event['id'], 'timestamp': event['timestamp'], 'poc_artifact_ids': [event['artifact_id']], 'synthetic': bool(audit['demo']), 'provenance': 'operator_attested_import', 'authenticity_verified': False, 'scope': 'recorded behavior only', 'summary': candidate['title'], 'receipt_id': receipt}
+        proof = {'oracle': 'agent-policy-reconstruction-v1', 'verification_basis': 'signed_collector_reconstruction' if authenticity else 'policy_reconstruction', 'independent_evidence_count': 1, 'self_report_status': status.lower(), 'counterevidence': counter, 'policy_sha256': audit['policy_sha256'], 'event_id': event['id'], 'timestamp': event['timestamp'], 'poc_artifact_ids': [event['artifact_id']], 'synthetic': bool(audit['demo']), 'provenance': event.get('trust_level', 'operator_attested'), 'authenticity_verified': authenticity, 'collector_id': event.get('collector_id') or None, 'scope': 'recorded behavior only', 'summary': candidate['title'], 'receipt_id': receipt}
         proof_aid, _ = artifact(db, audit['run_id'], 'agent_verification', proof)
         proof['proof_artifact_id'] = proof_aid
         db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (receipt, candidate_id, proof['oracle'], 'passed', 1, core.dump(proof), now, now))
@@ -556,13 +694,16 @@ def get_audit(audit_id: str):
             finding['impact'] = core.load(finding['impact'])
             read_artifact(db, finding['verification']['proof_artifact_id'], audit['run_id'])
         evidence_manifest = [dict(row) for row in db.execute('SELECT id,kind,sha256,media_type,redacted FROM artifacts WHERE run_id=? ORDER BY created_at', (audit['run_id'],))]
+        attestations = [dict(row) for row in db.execute('''SELECT s.id,s.collector_id,c.name AS collector_name,c.key_id,c.fingerprint,c.algorithm,
+            s.artifact_id,s.sequence,s.nonce,s.signed_at,s.payload_sha256,s.signature,s.verified_at
+            FROM agent_signed_imports s JOIN agent_collectors c ON c.id=s.collector_id WHERE s.audit_id=? ORDER BY s.sequence''', (audit_id,))]
     result = core.load(audit['analysis_json'], None)
     if result and digest({'snapshot': snapshot, 'events': events, 'claims': claims, 'complete': complete}) != result['input_digest']:
         raise HTTPException(409, 'Integrity Check Failed: 分析输入改变')
     presented_events = [{**event, 'policy_decision': result['policy_evaluations'][event['id']]['decision'],
                          'policy_boundaries': result['policy_evaluations'][event['id']]['boundaries']}
                         for event in events] if result else events
-    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
+    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
 
 
 def metrics(events, claims, analysis, findings):
@@ -585,7 +726,7 @@ def capabilities():
     from traditional_tools import strix_provider_settings
     settings = strix_provider_settings()
     configured = bool(settings.get('STRIX_LLM') and (settings.get('LLM_API_KEY') or settings.get('OPENAI_API_KEY')))
-    return {'parsers': ['Generic JSON', 'JSONL', 'Tool Call Log', 'Process / Shell JSON Log', 'Network Log'], 'deterministic_audit': 'READY', 'llm_semantic_matcher': 'NOT IMPLEMENTED', 'self_report_generator': 'CONFIGURED' if configured else 'NOT CONFIGURED', 'active_execution': False}
+    return {'parsers': ['Generic JSON', 'JSONL', 'Tool Call Log', 'Process / Shell JSON Log', 'Network Log'], 'deterministic_audit': 'READY', 'signed_telemetry': 'READY', 'signature_algorithm': 'Ed25519', 'signature_schema': 'fieldwork-agent-telemetry-signature/1', 'llm_semantic_matcher': 'NOT IMPLEMENTED', 'self_report_generator': 'CONFIGURED' if configured else 'NOT CONFIGURED', 'active_execution': False}
 
 
 @router.post('/audits/{audit_id}/self-report/generate')
@@ -631,6 +772,7 @@ def create_demo():
 
 def report_model(audit):
     identity = audit['identity']
+    signed_count = len(audit['collector_attestations'])
     return {'id': audit['id'], 'title': 'AI Incident Report · ' + identity['name'], 'synthetic': audit['demo'],
             'executive_summary': f"{len(audit['events'])} observed events; {len(audit['findings'])} verified recorded incidents", 'agent_identity': identity,
             'original_task': identity['task_objective'], 'authorized_capabilities': audit['policy'] or 'UNKNOWN',
@@ -641,7 +783,8 @@ def report_model(audit):
             'confirmed_incident_findings': audit['findings'], 'audit_candidates': audit['candidates'],
             'impact': 'UNKNOWN — recorded boundary reconstruction is not proof of business loss',
             'counterevidence': [f['verification']['counterevidence'] for f in audit['findings']],
-            'unknowns': ['Collector authenticity and completeness are operator assumptions', 'Missing telemetry does not prove absence', 'No sandbox, command replay or external side effects executed'],
+            'collector_attestations': audit['collector_attestations'],
+            'unknowns': ([] if signed_count else ['Collector authenticity is an operator assumption']) + ['Collector completeness is not proven', 'Missing telemetry does not prove absence', 'No sandbox, command replay or external side effects executed'],
             'containment_actions': 'UNKNOWN — no containment actions performed', 'recommendations': 'Review collector provenance, least privilege and missing telemetry before operational decisions.',
             'evidence': audit['evidence_manifest'], 'metrics': audit['metrics'], 'auto_submit': False}
 
@@ -666,10 +809,12 @@ def capsule(audit_id: str):
     audit = get_audit(audit_id)
     model = report_model(audit)
     content = markdown_report(model)
-    attachments = {'manifest.json': {'schema': 'fieldwork-agent-audit/1', 'audit_id': audit_id, 'synthetic': audit['demo'], 'authenticity_verified': False},
+    signed = bool(audit['collector_attestations'])
+    attachments = {'manifest.json': {'schema': 'fieldwork-agent-audit/1', 'audit_id': audit_id, 'synthetic': audit['demo'], 'authenticity_verified': signed, 'signed_import_count': len(audit['collector_attestations'])},
                    'policy_snapshot.json': {'policy': audit['policy'], 'sha256': audit['policy_sha256']},
                    'normalized_events.jsonl': '\n'.join(core.dump(e) for e in audit['events']) + '\n',
-                   'self_report.json': audit['claims'], 'reconciliation.json': audit['analysis'] or {}, 'incident_findings.json': audit['findings']}
+                   'self_report.json': audit['claims'], 'reconciliation.json': audit['analysis'] or {}, 'incident_findings.json': audit['findings'],
+                   'collector_attestations.json': audit['collector_attestations']}
     with core.connect() as db:
         for item in audit['evidence_manifest']:
             value, _ = read_artifact(db, item['id'], audit['run_id'])
@@ -697,4 +842,3 @@ def benchmark_metrics(audit, ground_truth):
             'verified_reconstruction_rate': ratio(len(verified & truth), len(truth)),
             'verified_reconstruction_precision': ratio(len(verified & truth), len(verified)),
             'ground_truth': 'external labelled synthetic fixture; not real-world performance'}
-

@@ -1,4 +1,5 @@
 import copy
+import base64
 import hashlib
 import io
 import json
@@ -11,6 +12,8 @@ import app
 import agent_audit as audit
 import final_core as core
 import reporting
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 @pytest.fixture
@@ -51,6 +54,25 @@ def analyze(client, aid):
 
 def verify(client, aid, cid):
     return client.post(f'/api/v1/agent-audit/audits/{aid}/incidents/{cid}/verify')
+
+
+def register_collector(client):
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    response = client.post('/api/v1/agent-audit/collectors', json={
+        'name': 'Local OS Collector', 'key_id': 'local-os-1', 'public_key': base64.b64encode(public).decode()})
+    assert response.status_code == 201, response.text
+    assert 'public_key' not in response.json()
+    return private, response.json()
+
+
+def signed_body(private, collector, aid, body, sequence=1, nonce='0123456789abcdef'):
+    value = copy.deepcopy(body)
+    value['independent_attested'] = False
+    value.update(collector_id=collector['id'], sequence=sequence, nonce=nonce, signed_at='2026-09-14T14:03:00+08:00')
+    payload = audit.signing_payload(aid, audit.ImportInput.model_validate({**value, 'signature': 'pending'}), hashlib.sha256(value['content'].encode()).hexdigest())
+    value['signature'] = base64.b64encode(private.sign(audit.canonical_bytes(payload))).decode()
+    return value
 
 
 def test_demo_real_pipeline_and_capsule(client):
@@ -237,3 +259,42 @@ def test_jsonl_and_untrusted_provenance(client, fixture):
     body.update(kind='process',content='rm -rf /',provenance='agent_supplied')
     assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=body).status_code==422
 
+
+def test_signed_collector_import_verifies_authenticity_and_capsule(client, fixture):
+    aid = create(client, fixture)
+    private, collector = register_collector(client)
+    body = signed_body(private, collector, aid, fixture['imports'][0])
+    result = upload(client, aid, body)
+    assert result['events'][0]['trust_level'] == 'signed_collector'
+    assert result['events'][0]['authenticity_verified'] is True
+    assert result['collector_attestations'][0]['fingerprint'] == collector['fingerprint']
+    upload(client, aid, fixture['imports'][1])
+    result = analyze(client, aid)
+    response = verify(client, aid, result['candidates'][0]['id'])
+    assert response.status_code == 200, response.text
+    assert response.json()['verification']['authenticity_verified'] is True
+    assert response.json()['verification']['verification_basis'] == 'signed_collector_reconstruction'
+    capsule = client.get(f'/api/v1/agent-audit/audits/{aid}/capsule')
+    with zipfile.ZipFile(io.BytesIO(capsule.content)) as z:
+        manifest = json.loads(z.read('manifest.json'))
+        assert manifest['authenticity_verified'] is True
+        assert json.loads(z.read('collector_attestations.json'))[0]['key_id'] == 'local-os-1'
+
+
+def test_signed_collector_rejects_tampering_replay_rollback_and_revocation(client, fixture):
+    private, collector = register_collector(client)
+    aid = create(client, fixture)
+    valid = signed_body(private, collector, aid, fixture['imports'][0])
+    tampered = copy.deepcopy(valid)
+    tampered['content'] += ' '
+    assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports', json=tampered).status_code == 422
+    upload(client, aid, valid)
+    other = create(client, fixture)
+    replay = signed_body(private, collector, other, fixture['imports'][0], sequence=2, nonce=valid['nonce'])
+    assert client.post(f'/api/v1/agent-audit/audits/{other}/imports', json=replay).status_code == 409
+    rollback = signed_body(private, collector, other, fixture['imports'][0], sequence=1, nonce='fedcba9876543210')
+    assert client.post(f'/api/v1/agent-audit/audits/{other}/imports', json=rollback).status_code == 409
+    assert client.post(f"/api/v1/agent-audit/collectors/{collector['id']}/revoke").status_code == 200
+    revoked = signed_body(private, collector, other, fixture['imports'][0], sequence=2, nonce='abcdef0123456789')
+    assert client.post(f'/api/v1/agent-audit/audits/{other}/imports', json=revoked).status_code == 409
+    assert client.get('/api/v1/agent-audit/collectors').json()[0]['status'] == 'revoked'

@@ -2,7 +2,7 @@
 
 状态：**首版离线审计闭环已实现并通过回归验证。**
 
-更新时间：2026-09-22。数据表、API、确定性 Policy 引擎、自述对账、独立验证门、本地 Demo、基准、报告与证据包均已接入。当前能力只审查导入记录；采集器真实性仍由操作者证明，限制见第 16 节。
+更新时间：2026-09-23。数据表、API、确定性 Policy 引擎、自述对账、独立验证门、本地 Demo、基准、报告与证据包均已接入。可信采集器支持 Ed25519 签名、nonce 防重放与递增序号。
 
 顶部工作域：`传统 SRC` / `Web3` / `AI Agent Audit`。Web3 按钮去掉 Immunefi；现有 Immunefi 报告适配能力不因此删除。
 
@@ -156,10 +156,19 @@ PolicyEvaluation：`allowed | violation | uncertain | not_applicable`。
 
 - Agent 自述与 Agent 自带 trace 默认不独立。
 - 单凭 `source_type=network`、`independent=true` 或 `verified=true` 不能提升信任级别。
-- 首版外部遥测的可信性由操作者确认，并明确披露；后续可接入采集器签名、可信连接器与来源证明。
+- 外部遥测可由操作者声明独立性（较低可信度），或由已登记 Ed25519 采集器签名。签名绑定 audit、collector、sequence、nonce、签名时间、来源元数据和内容 SHA256；重复 nonce、回退序号、无效签名及已撤销采集器均被拒绝。
 - 哈希证明导入后的完整性，不证明采集时真实性或覆盖完整性。
 - 原始输入与脱敏派生材料分别记录哈希及派生关系。默认不持久化或导出原始 Secret；导出清单的校验和必须对应实际导出字节。
 - 追加证据不得使既有确认结果悄悄失效；先建立版本与重新验证机制。
+
+采集端私钥不会进入 Fieldwork。使用本地工具生成密钥并签署导入包：
+
+```bash
+python3 scripts/agent_audit_collector.py generate-key --key-id local-os-1 --private-key ~/.fieldwork/collector.pem
+python3 scripts/agent_audit_collector.py sign --private-key ~/.fieldwork/collector.pem --audit-id AUDIT_ID --collector-id COLLECTOR_ID --sequence 1 --content telemetry.json > signed-import.json
+```
+
+私钥文件权限为 `0600`；只把第一条命令输出的公钥登记到「AI Agent Audit → 设置与工具」。
 
 ## 8. 自述导入与可选生成
 
@@ -261,9 +270,11 @@ report.md
 | GET /audits/{id}/report?format=… | AI Incident Report |
 | GET /audits/{id}/capsule | 脱敏证据包 |
 | GET /capabilities | Parser / 可选模型的真实可用状态 |
+| POST /collectors、GET /collectors | 登记和列出 Ed25519 采集器公钥 |
+| POST /collectors/{id}/revoke | 撤销采集器，阻止后续签名导入 |
 | GET /demo-fixture、POST /demo | 显式标记的本地模拟材料与流程 |
 
-共享 Engagement / Run / Findings 查询已支持 `agent_audit`；写路由验证实体所属工作域，传统扫描和通用验证入口会拒绝 Agent Audit 实体。系统延续本机 Host/Origin 边界；会话鉴权和采集器签名仍属于后续独立安全工作。
+共享 Engagement / Run / Findings 查询已支持 `agent_audit`；写路由验证实体所属工作域，传统扫描和通用验证入口会拒绝 Agent Audit 实体。系统延续本机 Host/Origin 边界。
 
 ## 14. Demo 与研究指标
 
@@ -303,7 +314,7 @@ report.md
 
 ## 16. 限制与未来工作
 
-首版不具备 Agent 框架专用采集器、签名遥测、公证真实性、OS 沙箱、主动遏制、自动隔离或逃逸测试能力。网络/文件/工具语义以结构化记录与授权 Policy 为界。缺日志、时钟偏差、来源冲突、代理/子 Agent 身份链、符号链接、跨进程因果关系均需明确保留不确定性。
+当前不具备 Agent 框架专用采集器、公证级真实性、硬件密钥证明、OS 沙箱、主动遏制、自动隔离或逃逸测试能力。Ed25519 证明材料由已登记私钥签署，但不能证明采集器自身未被攻陷或日志覆盖完整。网络/文件/工具语义以结构化记录与授权 Policy 为界。缺日志、时钟偏差、来源冲突、代理/子 Agent 身份链、符号链接、跨进程因果关系均需明确保留不确定性。
 
 后续优先扩展可信采集器、跨来源关联、补证据版本化、可重复离线重建、外部独立基准与真实影响证明；模型辅助不能替代这些工作。
 

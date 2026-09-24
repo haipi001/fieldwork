@@ -1,0 +1,14 @@
+{
+  "openapi": "3.1.0",
+  "servers": [{"url": "https://fixture.example.test"}],
+  "paths": {
+    "/orders/{orderId}": {
+      "get": {
+        "parameters": [
+          {"name": "orderId", "in": "path", "required": true, "schema": {"type": "string"}},
+          {"name": "include", "in": "query", "schema": {"type": "string"}}
+        ]
+      }
+    }
+  }
+}

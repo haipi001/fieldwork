@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from isolated_execution import run_isolated
 from fastapi.responses import FileResponse
 from web3_lab import binary
 
@@ -87,7 +88,7 @@ def run_practice():
             for seed in SEEDS:
                 argv = [forge, 'test', '--json', '-vv', '--fuzz-runs', '64', '--fuzz-seed', seed]
                 try:
-                    process = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=45)
+                    process = run_isolated(argv, root, timeout=45, output_limit=1_000_000)
                     payload = json.loads(process.stdout)
                     round_result = evaluate_round(payload, process.returncode)
                     round_result['output_sha256'] = hashlib.sha256(process.stdout.encode()).hexdigest()

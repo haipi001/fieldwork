@@ -62,6 +62,43 @@ def test_target_resolution_and_immutable_scope(client):
     assert scope[0] == 1 and scope[1]
 
 
+def test_engagement_batch_is_atomic_and_idempotent(client, monkeypatch):
+    items = [{"name": "First local target", "target": "https://one.example.test", "mode": "traditional"},
+             {"name": "Second local target", "target": "https://two.example.test", "mode": "traditional"}]
+    payload = {"request_id": "batch-atomic-001", "items": items}
+    original = final_core._insert_engagement
+    calls = 0
+    def fail_second(db, body, resolved):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated database failure")
+        return original(db, body, resolved)
+    monkeypatch.setattr(final_core, "_insert_engagement", fail_second)
+    with pytest.raises(RuntimeError):
+        client.post("/api/v1/engagements/batch", json=payload)
+    assert client.get("/api/v1/engagements?mode=traditional").json() == []
+    monkeypatch.setattr(final_core, "_insert_engagement", original)
+    first = client.post("/api/v1/engagements/batch", json=payload)
+    assert first.status_code == 201 and first.json()["deduplicated"] is False
+    assert len(first.json()["engagements"]) == 2
+    again = client.post("/api/v1/engagements/batch", json=payload)
+    assert again.status_code == 201 and again.json()["deduplicated"] is True
+    assert [item["id"] for item in again.json()["engagements"]] == [item["id"] for item in first.json()["engagements"]]
+    changed = client.post("/api/v1/engagements/batch", json={**payload, "items": items[:1]})
+    assert changed.status_code == 409
+    assert len(client.get("/api/v1/engagements?mode=traditional").json()) == 2
+
+
+def test_engagement_batch_validates_all_targets_before_insert(client):
+    result = client.post("/api/v1/engagements/batch", json={"request_id": "batch-validate-001", "items": [
+        {"name": "Valid target", "target": "https://one.example.test", "mode": "traditional"},
+        {"name": "Invalid target", "target": "https://", "mode": "traditional"},
+    ]})
+    assert result.status_code == 422
+    assert client.get("/api/v1/engagements?mode=traditional").json() == []
+
+
 @pytest.mark.parametrize("kind,document", [
     ("openapi", {"openapi": "3.1.0", "servers": [{"url": "https://api.example.test/v1"}],
                  "paths": {"/orders": {"get": {}, "post": {}}, "/me": {"get": {}}}}),
@@ -90,6 +127,75 @@ def test_target_package_preview_and_apply_only_persists_safe_surface(client, kin
     assert engagement["scope"]["import_source_sha256"] == data["source_sha256"]
     assert all(item["origin"] == "https://api.example.test" for item in engagement["scope"]["imported_surface"])
     assert "SECRET" not in json.dumps(engagement)
+
+
+def test_target_package_preserves_safe_request_semantics_without_values(client):
+    document = {"openapi": "3.1.0", "servers": [{"url": "https://api.example.test"}],
+                "security": [{"session": []}], "paths": {"/orders/{orderId}": {
+                    "parameters": [{"name": "orderId", "in": "path", "required": True, "schema": {"type": "string", "example": "SECRET"}}],
+                    "post": {"parameters": [{"name": "dry_run", "in": "query", "schema": {"type": "boolean", "default": "SECRET"}}],
+                             "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {
+                                 "quantity": {"type": "integer", "example": "SECRET"}}}}}}}}}}
+    content = json.dumps(document)
+    preview = client.post("/api/v1/target-packages/preview", json={"content": content}).json()
+    endpoint = preview["endpoints"][0]
+    assert endpoint["parameters"] == [
+        {"name": "orderId", "in": "path", "type": "string", "required": True},
+        {"name": "dry_run", "in": "query", "type": "boolean", "required": False},
+    ]
+    assert endpoint["body_fields"] == [{"name": "quantity", "type": "integer"}]
+    assert endpoint["auth_required"] is True
+    assert "SECRET" not in json.dumps(preview)
+    applied = client.post("/api/v1/target-packages/apply", json={"content": content, "name": "Semantic API"}).json()
+    assert applied["engagement"]["scope"]["imported_surface"][0]["body_fields"] == endpoint["body_fields"]
+    assert "SECRET" not in json.dumps(applied)
+
+
+@pytest.mark.parametrize("kind,document", [
+    ("postman", {"info": {"name": "API"}, "item": [{"request": {"method": "POST",
+        "url": {"raw": "https://api.example.test/orders?token=SECRET", "query": [{"key": "dry_run", "value": "SECRET"}]},
+        "body": {"mode": "urlencoded", "urlencoded": [{"key": "quantity", "value": "SECRET"}]},
+        "header": [{"key": "Authorization", "value": "SECRET"}]}}]}),
+    ("har", {"log": {"entries": [{"request": {"method": "POST", "url": "https://api.example.test/orders?token=SECRET",
+        "queryString": [{"name": "dry_run", "value": "SECRET"}], "postData": {"params": [{"name": "quantity", "value": "SECRET"}]},
+        "headers": [{"name": "Cookie", "value": "SECRET"}]}}]}}),
+])
+def test_imported_postman_and_har_keep_structure_not_secrets(client, kind, document):
+    preview = client.post("/api/v1/target-packages/preview", json={"kind": kind, "content": json.dumps(document)}).json()
+    endpoint = preview["endpoints"][0]
+    assert endpoint["parameters"] == [{"name": "dry_run", "in": "query", "type": "unknown", "required": False}]
+    assert endpoint["body_fields"] == [{"name": "quantity", "type": "unknown"}]
+    assert endpoint["auth_required"] is True
+    assert "SECRET" not in json.dumps(preview)
+
+
+def test_target_package_skips_malformed_url_and_schema_type(client):
+    document = {"openapi": "3.1.0", "servers": [{"url": "https://api.example.test"}],
+                "paths": {"/safe": {"get": {"parameters": [{"name": "page", "in": "query", "schema": {"type": ["string", "null"]}}]}}}}
+    response = client.post("/api/v1/target-packages/preview", json={"content": json.dumps(document)})
+    assert response.status_code == 200
+    assert response.json()["endpoints"][0]["parameters"][0]["type"] == "unknown"
+    malformed = {"log": {"entries": [{"request": {"method": "GET", "url": "http://[invalid"}},
+                                      {"request": {"method": "GET", "url": "https://api.example.test/safe"}}]}}
+    response = client.post("/api/v1/target-packages/preview", json={"content": json.dumps(malformed)})
+    assert response.status_code == 200
+    assert response.json()["counts"]["endpoints"] == 1
+
+
+def test_imported_semantics_reach_traditional_run_details_without_claiming_tested(client):
+    document = {"openapi": "3.1.0", "servers": [{"url": "https://api.example.test"}],
+                "paths": {"/orders/{orderId}": {"get": {"parameters": [
+                    {"name": "orderId", "in": "path", "schema": {"type": "string"}}]}}}}
+    created = client.post("/api/v1/target-packages/apply", json={
+        "content": json.dumps(document), "name": "Imported research target"}).json()["engagement"]
+    client.post(f"/api/v1/engagements/{created['id']}/confirm")
+    run = client.post(f"/api/v1/engagements/{created['id']}/start", json={"execution_mode": "demo"}).json()
+    details = client.get(f"/api/v1/runs/{run['id']}/details").json()
+    assert details["imported_surface"][0]["parameters"][0]["name"] == "orderId"
+    imported = next(item for item in details["test_items"] if item["id"] == "imported-api")
+    assert imported["status"] == "not_tested"
+    assert imported["observation_count"] == 0
+    assert "尚须独立测试" in imported["result"]
 
 
 def test_source_zip_preview_and_apply_extracts_only_safe_source(client):
@@ -2229,10 +2335,12 @@ def test_web3_chain_real_run_requires_source_and_https_fork(client):
     assert insecure.status_code == 422 and "HTTPS" in insecure.json()["detail"]
 
 
+@pytest.mark.skipif(not web3_lab.binary("forge"), reason="Forge optional capability not installed")
 def test_web3_deployment_alignment_binds_bytecode_block_chain_and_program_snapshot(client, monkeypatch):
     address = "0x3333333333333333333333333333333333333333"
     engagement = create_ready(client, "web3", address)
     fixture = app.ROOT / "fixtures" / "web3-vault"
+    assert web3_analysis.run_forge_build(fixture)["status"] == "compiled"
     artifact = json.loads((fixture / "out" / "Vault.sol" / "Vault.json").read_text())
     runtime = artifact["deployedBytecode"]["object"]
 
@@ -2281,10 +2389,12 @@ def test_web3_deployment_alignment_binds_bytecode_block_chain_and_program_snapsh
     assert "deployment_alignment" not in {item["id"] for item in plan.json()["blockers"]}
 
 
+@pytest.mark.skipif(not web3_lab.binary("forge"), reason="Forge optional capability not installed")
 def test_web3_deployment_alignment_blocks_bytecode_or_chain_mismatch(client, monkeypatch):
     address = "0x4444444444444444444444444444444444444444"
     engagement = create_ready(client, "web3", address)
     fixture = app.ROOT / "fixtures" / "web3-vault"
+    assert web3_analysis.run_forge_build(fixture)["status"] == "compiled"
 
     class RpcHandler(BaseHTTPRequestHandler):
         def do_POST(self):

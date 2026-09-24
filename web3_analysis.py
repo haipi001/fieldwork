@@ -415,9 +415,9 @@ def run_forge_build(root: Path) -> dict[str, Any]:
     # Production compilation is deliberately isolated from test fixtures. A
     # broken Echidna harness must not hide whether the deployable contracts
     # themselves compile.
-    result = subprocess.run(
+    result = run_isolated(
         [forge, "build", "--ast", "--build-info", "--no-cache", "--no-lint", "--skip", "test", "--skip", "script"],
-        cwd=root, capture_output=True, text=True, timeout=600,
+        root, timeout=600, output_limit=12000, export_dirs=("out", "cache"),
     )
     output = (result.stdout + "\n" + result.stderr)[-12000:]
     return {"status": "compiled" if result.returncode == 0 else "failed", "exit_code": result.returncode, "output": output}
@@ -455,9 +455,9 @@ def run_forge_tests(root: Path) -> dict[str, Any]:
     forge = binary("forge")
     if not forge:
         return {"status": "degraded", "reason": "forge_missing"}
-    result = subprocess.run(
+    result = run_isolated(
         [forge, "test", "--fuzz-runs", "64", "--skip", "echidna", "--json"],
-        cwd=root, capture_output=True, text=True, timeout=600,
+        root, timeout=600, output_limit=1_000_000, export_dirs=("out", "cache"),
     )
     output = (result.stdout + "\n" + result.stderr)[-12000:]
     tests = parse_forge_test_json(result.stdout)
@@ -477,12 +477,12 @@ def run_forge_property_replay(root: Path, property_name: str, seed: int) -> dict
     base_name = property_name.split("(", 1)[0]
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", base_name):
         raise HTTPException(422, "Property 名称不符合 Forge 测试函数格式")
-    result = subprocess.run(
+    result = run_isolated(
         [
             forge, "test", "--match-test", f"^{base_name}", "--fuzz-runs", "64",
             "--fuzz-seed", hex(seed), "--skip", "echidna", "--json",
         ],
-        cwd=root, capture_output=True, text=True, timeout=600,
+        root, timeout=600, output_limit=1_000_000, export_dirs=("out", "cache"),
     )
     tests = [item for item in parse_forge_test_json(result.stdout) if item["name"].split("(", 1)[0] == base_name]
     failed = [item for item in tests if item["status"].lower() not in {"success", "passed"}]
@@ -1143,3 +1143,4 @@ def execute_repository_pipeline(engagement_id: str, run_id: str, source_path: st
             final_core.add_event(run_id, "analysis", f"web3.{capability}.failed", f"{capability}: {error.detail}")
             results["tools"][capability] = {"status": "failed", "reason": str(error.detail)}
     return results
+from isolated_execution import run_isolated

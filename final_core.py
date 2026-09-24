@@ -500,6 +500,11 @@ class EngagementInput(ResolveTargetInput):
     scope_source: str = "manual"
 
 
+class EngagementBatchInput(BaseModel):
+    request_id: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9-]+$")
+    items: list[EngagementInput] = Field(min_length=1, max_length=20)
+
+
 class EngagementUpdateInput(BaseModel):
     name: str = Field(min_length=2, max_length=160)
 
@@ -1084,6 +1089,84 @@ def parse_cidr_package(body: TargetPackageInput) -> dict[str, Any]:
     }
 
 
+def _safe_parameter_name(value: Any) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,79}", value):
+        return None
+    return value
+
+
+def _schema_fields(schema: Any) -> list[dict[str, str]]:
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+    fields = []
+    for name, details in list(properties.items())[:100]:
+        safe_name = _safe_parameter_name(name)
+        if safe_name:
+            field_type = details.get("type") if isinstance(details, dict) else None
+            if not isinstance(field_type, str):
+                field_type = None
+            fields.append({"name": safe_name, "type": field_type if field_type in {"string", "number", "integer", "boolean", "array", "object", "null"} else "unknown"})
+    return fields
+
+
+def _package_semantics(kind: str, source: dict[str, Any], operation: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Preserve structure for planning without persisting request values or credentials."""
+    parameters: list[dict[str, Any]] = []
+    body_fields: list[dict[str, str]] = []
+    auth_required = False
+    if kind == "openapi":
+        operation = operation or {}
+        for item in list(source.get("parameters") or []) + list(operation.get("parameters") or []):
+            if not isinstance(item, dict):
+                continue
+            name = _safe_parameter_name(item.get("name"))
+            location = item.get("in")
+            if name and location in {"path", "query", "header", "cookie"}:
+                schema = item.get("schema") if isinstance(item.get("schema"), dict) else {}
+                field_type = schema.get("type")
+                if not isinstance(field_type, str):
+                    field_type = None
+                parameters.append({"name": name, "in": location, "type": field_type if field_type in {"string", "number", "integer", "boolean", "array", "object"} else "unknown", "required": bool(item.get("required"))})
+        request_body = operation.get("requestBody") if isinstance(operation.get("requestBody"), dict) else {}
+        content = request_body.get("content") if isinstance(request_body.get("content"), dict) else {}
+        for media in content.values():
+            if isinstance(media, dict):
+                body_fields = _schema_fields(media.get("schema"))
+                if body_fields:
+                    break
+        auth_required = bool(operation.get("security", source.get("security")))
+    else:
+        request = source
+        if kind == "postman":
+            url = request.get("url")
+            for item in (url.get("query") or []) if isinstance(url, dict) else []:
+                name = _safe_parameter_name(item.get("key")) if isinstance(item, dict) else None
+                if name:
+                    parameters.append({"name": name, "in": "query", "type": "unknown", "required": False})
+            body = request.get("body") if isinstance(request.get("body"), dict) else {}
+            for item in list(body.get("formdata") or []) + list(body.get("urlencoded") or []):
+                name = _safe_parameter_name(item.get("key")) if isinstance(item, dict) else None
+                if name:
+                    body_fields.append({"name": name, "type": "unknown"})
+            auth_required = bool(request.get("auth"))
+        else:
+            for item in request.get("queryString") or []:
+                name = _safe_parameter_name(item.get("name")) if isinstance(item, dict) else None
+                if name:
+                    parameters.append({"name": name, "in": "query", "type": "unknown", "required": False})
+            post_data = request.get("postData") if isinstance(request.get("postData"), dict) else {}
+            for item in post_data.get("params") or []:
+                name = _safe_parameter_name(item.get("name")) if isinstance(item, dict) else None
+                if name:
+                    body_fields.append({"name": name, "type": "unknown"})
+        headers = request.get("header" if kind == "postman" else "headers") or []
+        auth_required = auth_required or any(isinstance(item, dict) and str(item.get("key" if kind == "postman" else "name", "")).lower() in {"authorization", "cookie", "x-api-key"} for item in headers)
+    return {"parameters": parameters[:100], "body_fields": body_fields[:100], "auth_required": auth_required}
+
+
 def parse_target_package(body: TargetPackageInput) -> dict[str, Any]:
     detected = body.kind
     if detected == "auto" and (body.encoding == "base64" or (body.filename or "").lower().endswith(".zip")):
@@ -1110,7 +1193,7 @@ def parse_target_package(body: TargetPackageInput) -> dict[str, Any]:
             detected = "postman"
         else:
             raise HTTPException(422, "无法识别目标包；请选择 OpenAPI、Postman、HAR、源码 ZIP 或 CIDR")
-    records: list[tuple[str, str]] = []
+    records: list[tuple[str, str, dict[str, Any]]] = []
     if detected == "openapi":
         servers = [item.get("url") for item in document.get("servers", []) if isinstance(item, dict)]
         if not servers and document.get("swagger"):
@@ -1122,13 +1205,13 @@ def parse_target_package(body: TargetPackageInput) -> dict[str, Any]:
             for path, operations in (document.get("paths") or {}).items():
                 if not isinstance(operations, dict):
                     continue
-                for method in operations:
-                    if method.lower() in {"get", "head", "options", "post", "put", "patch", "delete"}:
-                        records.append((method.upper(), server.rstrip("/") + "/" + str(path).lstrip("/")))
+                for method, operation in operations.items():
+                    if method.lower() in {"get", "head", "options", "post", "put", "patch", "delete"} and isinstance(operation, dict):
+                        records.append((method.upper(), server.rstrip("/") + "/" + str(path).lstrip("/"), _package_semantics("openapi", {**document, "parameters": operations.get("parameters", []), "security": document.get("security")}, operation)))
     elif detected == "har":
         for entry in document.get("log", {}).get("entries", []):
             request = entry.get("request", {}) if isinstance(entry, dict) else {}
-            records.append((str(request.get("method") or "GET").upper(), str(request.get("url") or "")))
+            records.append((str(request.get("method") or "GET").upper(), str(request.get("url") or ""), _package_semantics("har", request)))
     else:
         def visit(items):
             for item in items if isinstance(items, list) else []:
@@ -1140,14 +1223,20 @@ def parse_target_package(body: TargetPackageInput) -> dict[str, Any]:
                 if isinstance(request, dict):
                     url = request.get("url")
                     raw = url.get("raw") if isinstance(url, dict) else url
-                    records.append((str(request.get("method") or "GET").upper(), str(raw or "")))
+                    records.append((str(request.get("method") or "GET").upper(), str(raw or ""), _package_semantics("postman", request)))
         visit(document.get("item", []))
     safe, origins, seen = [], {}, set()
-    for method, raw_url in records[:5000]:
-        parsed = urlparse(raw_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    for method, raw_url, semantics in records[:5000]:
+        try:
+            parsed = urlparse(raw_url)
+        except ValueError:
             continue
-        port = f":{parsed.port}" if parsed.port else ""
+        if method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"} or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        try:
+            port = f":{parsed.port}" if parsed.port else ""
+        except ValueError:
+            continue
         origin = f"{parsed.scheme}://{parsed.hostname.lower()}{port}"
         sanitized = urlunparse((parsed.scheme, f"{parsed.hostname.lower()}{port}", parsed.path or "/", "", "", ""))
         key = (method, sanitized)
@@ -1155,7 +1244,7 @@ def parse_target_package(body: TargetPackageInput) -> dict[str, Any]:
             continue
         seen.add(key)
         origins[origin] = origins.get(origin, 0) + 1
-        safe.append({"method": method, "url": sanitized, "origin": origin})
+        safe.append({"method": method, "url": sanitized, "origin": origin, **semantics})
         if len(safe) >= 1000:
             break
     if not safe:
@@ -1167,7 +1256,7 @@ def parse_target_package(body: TargetPackageInput) -> dict[str, Any]:
         "root_target": root, "origins": [{"origin": value, "requests": origins[value],
                                              "default_in_scope": value == root} for value in ordered_origins],
         "endpoints": safe, "counts": {"endpoints": len(safe), "origins": len(ordered_origins)},
-        "boundary": "只导入方法、去查询参数 URL 与来源哈希；Header、Cookie、Body 和变量值不会持久化。仅主来源默认进入 Scope。",
+        "boundary": "导入方法、路径、参数名称/位置/类型和 Body 字段结构，不保存 Header、Cookie、Body、参数值或认证秘密；仅主来源默认进入 Scope。",
     })
 
 
@@ -1231,6 +1320,12 @@ def apply_target_package(body: TargetPackageApplyInput):
 @router.post("/engagements", status_code=201)
 def create_engagement(body: EngagementInput):
     resolved = resolve_target_value(body)
+    with connect() as db:
+        engagement_id = _insert_engagement(db, body, resolved)
+    return get_engagement(engagement_id)
+
+
+def _insert_engagement(db: sqlite3.Connection, body: EngagementInput, resolved: dict[str, Any]) -> str:
     timestamp = utcnow()
     target_id, engagement_id = uid("target"), uid("eng")
     scope_id, policy_id = uid("scope"), uid("policy")
@@ -1261,28 +1356,50 @@ def create_engagement(body: EngagementInput):
         "allow_real_keys": False,
         **body.policy,
     }
-    with connect() as db:
-        db.execute("INSERT INTO target_specs VALUES(?,?,?,?,?,?,?,?)", (
+    db.execute("INSERT INTO target_specs VALUES(?,?,?,?,?,?,?,?)", (
             target_id, body.mode, resolved["raw_target"], resolved["target_type"],
             resolved["normalized_target"], body.chain_id, dump(resolved["metadata"]), timestamp,
         ))
-        db.execute("INSERT INTO engagements_v2 VALUES(?,?,?,?,?,?,?,?,?)", (
+    db.execute("INSERT INTO engagements_v2 VALUES(?,?,?,?,?,?,?,?,?)", (
             engagement_id, body.name, body.mode, target_id, "draft", scope_id, policy_id, timestamp, timestamp,
         ))
-        db.execute("INSERT INTO scope_snapshots VALUES(?,?,?,?,?,?,?,?)", (
+    db.execute("INSERT INTO scope_snapshots VALUES(?,?,?,?,?,?,?,?)", (
             scope_id, engagement_id, 1, body.mode, dump(scope), body.scope_source, None, timestamp,
         ))
-        db.execute("INSERT INTO execution_policies VALUES(?,?,?,?,?)", (
+    db.execute("INSERT INTO execution_policies VALUES(?,?,?,?,?)", (
             policy_id, engagement_id, 1, dump(policy), timestamp,
         ))
-        db.execute("INSERT INTO entities VALUES(?,?,?,?,?,?,?)", (
+    db.execute("INSERT INTO entities VALUES(?,?,?,?,?,?,?)", (
             uid("entity"), engagement_id, "target", f"target:{resolved['normalized_target']}",
             resolved["normalized_target"], dump({
                 "target_type": resolved["target_type"], "mode": body.mode,
                 "environment_class": scope["environment_class"], "root": True,
             }), timestamp,
         ))
-    return get_engagement(engagement_id)
+    return engagement_id
+
+
+@router.post("/engagements/batch", status_code=201)
+def create_engagement_batch(body: EngagementBatchInput):
+    """Create all drafts in one transaction; retries with the same request ID return the originals."""
+    resolved = [resolve_target_value(item) for item in body.items]
+    payload = [item.model_dump(mode="json") for item in body.items]
+    digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    key = f"engagement_batch:{body.request_id}"
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        previous = db.execute("SELECT value FROM app_metadata WHERE key=?", (key,)).fetchone()
+        if previous:
+            stored = load(previous["value"], {})
+            if stored.get("sha256") != digest:
+                raise HTTPException(409, "同一批次编号不能用于不同目标或授权策略")
+            ids = stored["engagement_ids"]
+            deduplicated = True
+        else:
+            ids = [_insert_engagement(db, item, target) for item, target in zip(body.items, resolved)]
+            db.execute("INSERT INTO app_metadata VALUES(?,?,?)", (key, dump({"sha256": digest, "engagement_ids": ids}), utcnow()))
+            deduplicated = False
+    return {"engagements": [get_engagement(item_id) for item_id in ids], "deduplicated": deduplicated}
 
 
 @router.get("/engagements")
@@ -1724,6 +1841,11 @@ def get_run_details(run_id: str):
         else:
             status, result, count = "queued", "等待上游测试完成", 0
         test_items.append({"id": capability, "label": label, "stage": stage, "description": description, "status": status, "result": result, "observation_count": count})
+    imported_surface = engagement.get("scope", {}).get("imported_surface") or []
+    if run["mode"] == "traditional" and imported_surface:
+        test_items.insert(0, {"id": "imported-api", "label": "导入的接口研究清单", "stage": "surface",
+                              "description": "方法、路径、参数和 Body 字段来自授权目标包；导入本身不代表接口已接受请求或完成漏洞验证",
+                              "status": "not_tested", "result": f"{len(imported_surface)} 个范围内端点已纳入研究清单；尚须独立测试", "observation_count": 0})
     stages_detail = [
         {"id": "target", "label": "目标与版本", "status": "completed" if ("repository.checkout_completed" in event_kinds or "toolchain.started" in event_kinds) else run["status"], "summary": engagement["normalized_target"]},
         {"id": "scope", "label": "授权范围与策略", "status": "completed", "summary": f"{engagement['policy'].get('max_requests_per_second', 1)} req/s · {engagement['policy'].get('max_runtime_minutes', 30)} min · read/analyze"},
@@ -1734,7 +1856,7 @@ def get_run_details(run_id: str):
         {"id": "impact", "label": "影响与可提交性", "status": ("completed" if verified_count else "not_applicable") if terminal else "queued", "summary": "无 Verified Finding，未形成影响结论" if not verified_count else f"{verified_count} 个结果进入影响评估"},
         {"id": "report", "label": "覆盖与总结报告", "status": "completed" if terminal else "queued", "summary": "运行总结与 Coverage Ledger 已生成" if terminal else "等待运行进入终态"},
     ]
-    return {"run_id": run_id, "engagement": {"id": engagement["id"], "name": engagement["name"], "target": engagement["normalized_target"], "mode": engagement["mode"], "target_type": engagement["target_type"]}, "config": config, "stages": stages_detail, "test_items": test_items, "observations": observations, "artifacts": artifacts, "coverage": coverage}
+    return {"run_id": run_id, "engagement": {"id": engagement["id"], "name": engagement["name"], "target": engagement["normalized_target"], "mode": engagement["mode"], "target_type": engagement["target_type"]}, "config": config, "stages": stages_detail, "test_items": test_items, "imported_surface": imported_surface, "observations": observations, "artifacts": artifacts, "coverage": coverage}
 
 
 @router.get("/runs/{run_id}/events")

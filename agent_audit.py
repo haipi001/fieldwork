@@ -12,7 +12,7 @@ import html
 import json
 import posixpath
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -181,6 +181,11 @@ def init_agent_audit_db():
           payload_sha256 TEXT NOT NULL, signature TEXT NOT NULL, verified_at TEXT NOT NULL,
           UNIQUE(collector_id,sequence), UNIQUE(collector_id,nonce)
         );
+        CREATE TABLE IF NOT EXISTS agent_monitors (
+          audit_id TEXT PRIMARY KEY REFERENCES agent_audits(id) ON DELETE CASCADE,
+          status TEXT NOT NULL, event_cursor INTEGER NOT NULL DEFAULT 0,
+          started_at TEXT NOT NULL, stopped_at TEXT, last_scan_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS agent_events_audit ON agent_events(audit_id);
         CREATE INDEX IF NOT EXISTS agent_signed_imports_audit ON agent_signed_imports(audit_id);
         ''')
@@ -320,6 +325,81 @@ def create_audit(body: AuditInput):
         db.execute('INSERT INTO agent_audits VALUES(?,?,?,?,?,?,?,?)', (eid, rid, core.dump(identity), digest(snapshot) if snapshot else None, core.dump({'snapshot': aid, 'imports': []}), None, 0, now))
         db.execute('INSERT INTO audit_log(engagement_id,action,detail,created_at) VALUES(?,?,?,?)', (eid, 'agent_audit.created', core.dump({'snapshot_artifact_id': aid, 'sha256': sha}), now))
     return get_audit(eid)
+
+
+def monitor_event(row, identity):
+    kind = row['kind']
+    if 'page_observed' in kind:
+        source_type, action_type = 'browser', 'navigate'
+    elif 'policy_denied' in kind:
+        source_type, action_type = 'browser', 'navigate'
+    else:
+        source_type, action_type = 'system', 'unknown'
+    return {'timestamp': row['created_at'], 'actor': identity['agent_name'], 'session_id': identity['session_id'],
+            'source_type': source_type, 'action_type': action_type, 'resource': row['message'],
+            'status': 'blocked' if 'denied' in kind else 'success', 'tool_name': kind if source_type == 'tool_call' else ''}
+
+
+def scan_monitor(audit_id: str):
+    with core.connect() as db:
+        monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
+        if not monitor:
+            raise HTTPException(404, '自动监控不存在')
+        audit = audit_row(db, audit_id)
+        identity = core.load(audit['identity_json'])
+        rows = db.execute('SELECT * FROM run_events_v2 WHERE id>? AND run_id!=? ORDER BY id LIMIT 500',
+                          (monitor['event_cursor'], audit['run_id'])).fetchall()
+    if rows:
+        body = ImportInput(content=core.dump({'events': [monitor_event(row, identity) for row in rows]}),
+                           provenance='operator_telemetry', source_name='Fieldwork runtime event stream', independent_attested=True)
+        import_events(audit_id, body)
+    cursor = rows[-1]['id'] if rows else monitor['event_cursor']
+    with core.connect() as db:
+        db.execute('UPDATE agent_monitors SET event_cursor=?,last_scan_at=? WHERE audit_id=?', (cursor, core.utcnow(), audit_id))
+    return get_audit(audit_id)
+
+
+@router.post('/monitor/start', status_code=201)
+def start_monitor():
+    with core.connect() as db:
+        active = db.execute("SELECT audit_id FROM agent_monitors WHERE status='active' ORDER BY started_at DESC LIMIT 1").fetchone()
+        cursor = db.execute('SELECT COALESCE(MAX(id),0) FROM run_events_v2').fetchone()[0]
+    if active:
+        return scan_monitor(active['audit_id'])
+    started = datetime.now().astimezone()
+    session = 'live-' + started.strftime('%Y%m%d-%H%M%S')
+    audit = create_audit(AuditInput(name='实时 Agent 自动监控', agent_name='fieldwork-agent', session_id=session,
+        task_objective='自动记录 Fieldwork 内 Agent 与工具行为', start_time=started.isoformat(),
+        end_time=(started + timedelta(days=365)).isoformat(), runtime='Fieldwork event stream', environment='local',
+        policy=Policy(browser_access=True, allowed_filesystem_paths=['/workspace'], allowed_tools=[])))
+    now = core.utcnow()
+    with core.connect() as db:
+        db.execute('INSERT INTO agent_monitors VALUES(?,?,?,?,?,?)', (audit['id'], 'active', cursor, now, None, now))
+    lifecycle = ImportInput(content=core.dump({'events': [{'timestamp': now, 'actor': audit['identity']['agent_name'],
+        'session_id': audit['identity']['session_id'], 'source_type': 'system', 'action_type': 'unknown',
+        'resource': '自动监控已启动', 'status': 'success'}]}), provenance='operator_telemetry',
+        source_name='Fieldwork monitor', independent_attested=True)
+    return import_events(audit['id'], lifecycle)
+
+
+@router.post('/monitor/{audit_id}/scan')
+def poll_monitor(audit_id: str):
+    return scan_monitor(audit_id)
+
+
+@router.post('/monitor/{audit_id}/stop')
+def stop_monitor(audit_id: str):
+    result = scan_monitor(audit_id)
+    with core.connect() as db:
+        monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
+        if not monitor:
+            raise HTTPException(404, '自动监控不存在')
+        if monitor['status'] == 'active':
+            now = core.utcnow()
+            db.execute("UPDATE agent_monitors SET status='stopped',stopped_at=?,last_scan_at=? WHERE audit_id=?", (now, now, audit_id))
+    if not result['analysis']:
+        result = analyze(audit_id)
+    return result
 
 
 def parse_import(body):
@@ -689,7 +769,7 @@ def verify_incident(audit_id: str, candidate_id: str):
 @router.get('/audits')
 def list_audits():
     with core.connect() as db:
-        return [dict(row) for row in db.execute("SELECT a.id,a.run_id,a.demo,a.created_at,e.name,r.status FROM agent_audits a JOIN engagements_v2 e ON e.id=a.id JOIN analysis_runs r ON r.id=a.run_id WHERE e.status!='archived' ORDER BY a.created_at DESC")]
+        return [dict(row) for row in db.execute("SELECT a.id,a.run_id,a.demo,a.created_at,e.name,r.status,m.status AS monitor_status FROM agent_audits a JOIN engagements_v2 e ON e.id=a.id JOIN analysis_runs r ON r.id=a.run_id LEFT JOIN agent_monitors m ON m.audit_id=a.id WHERE e.status!='archived' ORDER BY a.created_at DESC")]
 
 
 @router.get('/audits/{audit_id}')
@@ -708,13 +788,14 @@ def get_audit(audit_id: str):
             s.artifact_id,s.sequence,s.nonce,s.signed_at,s.payload_sha256,s.signature,s.verified_at
             FROM agent_signed_imports s JOIN agent_collectors c ON c.id=s.collector_id WHERE s.audit_id=? ORDER BY s.sequence''', (audit_id,))]
         reconciliation_record = db.execute('SELECT id,version,input_digest,created_at FROM agent_reconciliations WHERE audit_id=? AND run_id=? ORDER BY version DESC LIMIT 1', (audit_id, audit['run_id'])).fetchone()
+        monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
     result = core.load(audit['analysis_json'], None)
     if result and digest({'snapshot': snapshot, 'events': events, 'claims': claims, 'complete': complete}) != result['input_digest']:
         raise HTTPException(409, 'Integrity Check Failed: 分析输入改变')
     presented_events = [{**event, 'policy_decision': result['policy_evaluations'][event['id']]['decision'],
                          'policy_boundaries': result['policy_evaluations'][event['id']]['boundaries']}
                         for event in events] if result else events
-    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
+    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'monitor': dict(monitor) if monitor else None, 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
 
 
 def metrics(events, claims, analysis, findings):

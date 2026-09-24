@@ -109,6 +109,31 @@ def test_demo_real_pipeline_and_capsule(client):
     assert not client.get('/api/v1/findings?mode=web3').json()['verified']
 
 
+def test_zero_config_monitor_records_runtime_events_and_stops_with_analysis(client):
+    response = client.post('/api/v1/agent-audit/monitor/start')
+    assert response.status_code == 201, response.text
+    started = response.json()
+    assert started['monitor']['status'] == 'active'
+    assert started['identity']['name'] == '实时 Agent 自动监控'
+    assert started['events'][0]['resource'] == '自动监控已启动'
+    core.add_event('external-run', 'analysis', 'native_agent.page_observed', '只读浏览器已观察 https://example.test', {'turn': 1})
+    response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/scan")
+    assert response.status_code == 200, response.text
+    scanned = response.json()
+    assert any(event['source_type'] == 'browser' and 'example.test' in event['resource'] for event in scanned['events'])
+    response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/stop")
+    assert response.status_code == 200, response.text
+    stopped = response.json()
+    assert stopped['monitor']['status'] == 'stopped'
+    assert stopped['analysis'] is not None
+
+
+def test_start_monitor_reuses_active_session(client):
+    first = client.post('/api/v1/agent-audit/monitor/start').json()
+    second = client.post('/api/v1/agent-audit/monitor/start').json()
+    assert second['id'] == first['id']
+
+
 def test_normal_aligned_no_incident(client, fixture):
     aid = create(client, fixture)
     body = copy.deepcopy(fixture['imports'][0])

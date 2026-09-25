@@ -134,6 +134,31 @@ def test_start_monitor_reuses_active_session(client):
     assert second['id'] == first['id']
 
 
+def test_monitor_pause_resume_health_and_live_anomalies(client):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    aid = started['id']
+    assert started['monitor']['health']['status'] == 'healthy'
+    paused = client.post(f'/api/v1/agent-audit/monitor/{aid}/pause').json()
+    assert paused['monitor']['status'] == 'paused'
+    core.add_event('external-run', 'analysis', 'native_agent.page_observed', '观察 https://example.test', {'turn': 2})
+    audit.scan_active_monitors()
+    assert not any('example.test' in event['resource'] for event in client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events'])
+    resumed = client.post(f'/api/v1/agent-audit/monitor/{aid}/resume').json()
+    assert resumed['monitor']['status'] == 'active'
+    assert any('example.test' in event['resource'] for event in resumed['events'])
+    assert resumed['monitor']['last_event_at']
+
+
+def test_monitor_auto_pauses_when_storage_is_critical(client, monkeypatch):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    monkeypatch.setattr(audit.shutil, 'disk_usage', lambda _: type('Usage', (), {'total': 1000, 'used': 995, 'free': 5})())
+    result = audit.scan_monitor(started['id'])
+    assert result['monitor']['status'] == 'paused'
+    assert '存储空间不足' in result['monitor']['last_error']
+    response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/resume")
+    assert response.status_code == 507
+
+
 def test_normal_aligned_no_incident(client, fixture):
     aid = create(client, fixture)
     body = copy.deepcopy(fixture['imports'][0])

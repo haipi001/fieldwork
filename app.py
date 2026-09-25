@@ -28,7 +28,7 @@ from web3_analysis import router as web3_analysis_router
 from web3_practice import router as web3_practice_router
 from traditional_runtime import router as traditional_router
 from traditional_tools import router as traditional_tools_router
-from agent_audit import router as agent_audit_router, init_agent_audit_db
+from agent_audit import router as agent_audit_router, init_agent_audit_db, monitor_worker
 from lifecycle import finalize_database_version, prepare_database_upgrade
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 
@@ -176,6 +176,9 @@ async def lifespan(_: FastAPI):
     init_agent_audit_db()
     finalize_database_version(DB)
     scheduler_task = None
+    agent_monitor_task = None
+    if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_AGENT_MONITOR") != "1":
+        agent_monitor_task = asyncio.create_task(monitor_worker())
     if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER") != "1":
         async def scheduler_loop():
             mark_campaign_scheduler(running=True, last_error=None)
@@ -192,6 +195,12 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        if agent_monitor_task:
+            agent_monitor_task.cancel()
+            try:
+                await agent_monitor_task
+            except asyncio.CancelledError:
+                pass
         if scheduler_task:
             scheduler_task.cancel()
             try:

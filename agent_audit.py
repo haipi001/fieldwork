@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import asyncio
 import hashlib
 import html
 import json
 import posixpath
 import re
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -189,6 +191,10 @@ def init_agent_audit_db():
         CREATE INDEX IF NOT EXISTS agent_events_audit ON agent_events(audit_id);
         CREATE INDEX IF NOT EXISTS agent_signed_imports_audit ON agent_signed_imports(audit_id);
         ''')
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(agent_monitors)')}
+        for name, definition in {'paused_at': 'TEXT', 'last_error': 'TEXT', 'last_event_at': 'TEXT'}.items():
+            if name not in columns:
+                db.execute(f'ALTER TABLE agent_monitors ADD COLUMN {name} {definition}')
 
 
 def audit_row(db, audit_id):
@@ -340,32 +346,73 @@ def monitor_event(row, identity):
             'status': 'blocked' if 'denied' in kind else 'success', 'tool_name': kind if source_type == 'tool_call' else ''}
 
 
-def scan_monitor(audit_id: str):
+def storage_health():
+    usage = shutil.disk_usage(core.LOCAL_DATA_ROOT)
+    free_ratio = usage.free / usage.total if usage.total else 0
+    status = 'critical' if usage.free < 512 * 1024**2 or free_ratio < .01 else 'warning' if usage.free < 2 * 1024**3 or free_ratio < .05 else 'healthy'
+    return {'status': status, 'free_bytes': usage.free, 'free_percent': round(free_ratio * 100, 1)}
+
+
+def scan_monitor(audit_id: str, allow_paused=False):
     with core.connect() as db:
         monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
         if not monitor:
             raise HTTPException(404, '自动监控不存在')
+        if monitor['status'] == 'paused' and not allow_paused:
+            return get_audit(audit_id)
+        if monitor['status'] not in {'active', 'paused'}:
+            return get_audit(audit_id)
         audit = audit_row(db, audit_id)
         identity = core.load(audit['identity_json'])
         rows = db.execute('SELECT * FROM run_events_v2 WHERE id>? AND run_id!=? ORDER BY id LIMIT 500',
                           (monitor['event_cursor'], audit['run_id'])).fetchall()
-    if rows:
-        body = ImportInput(content=core.dump({'events': [monitor_event(row, identity) for row in rows]}),
-                           provenance='operator_telemetry', source_name='Fieldwork runtime event stream', independent_attested=True)
-        import_events(audit_id, body)
-    cursor = rows[-1]['id'] if rows else monitor['event_cursor']
-    with core.connect() as db:
-        db.execute('UPDATE agent_monitors SET event_cursor=?,last_scan_at=? WHERE audit_id=?', (cursor, core.utcnow(), audit_id))
+    health = storage_health()
+    if health['status'] == 'critical':
+        message = '存储空间不足，监控已自动暂停。请释放至少 512 MB 后恢复。'
+        with core.connect() as db:
+            db.execute("UPDATE agent_monitors SET status='paused',paused_at=?,last_error=? WHERE audit_id=?", (core.utcnow(), message, audit_id))
+        return get_audit(audit_id)
+    try:
+        if rows:
+            body = ImportInput(content=core.dump({'events': [monitor_event(row, identity) for row in rows]}),
+                               provenance='operator_telemetry', source_name='Fieldwork 后台事件流', independent_attested=True)
+            import_events(audit_id, body)
+        cursor = rows[-1]['id'] if rows else monitor['event_cursor']
+        now = core.utcnow()
+        with core.connect() as db:
+            db.execute('UPDATE agent_monitors SET event_cursor=?,last_scan_at=?,last_event_at=COALESCE(?,last_event_at),last_error=NULL WHERE audit_id=?',
+                       (cursor, now, rows[-1]['created_at'] if rows else None, audit_id))
+    except (OSError, IOError) as error:
+        message = f'记录写入失败，监控已暂停：{type(error).__name__}。释放存储空间后可恢复。'
+        with core.connect() as db:
+            db.execute("UPDATE agent_monitors SET status='paused',paused_at=?,last_error=? WHERE audit_id=?", (core.utcnow(), message, audit_id))
     return get_audit(audit_id)
+
+
+def scan_active_monitors():
+    with core.connect() as db:
+        ids = [row['audit_id'] for row in db.execute("SELECT audit_id FROM agent_monitors WHERE status='active'")]
+    for audit_id in ids:
+        scan_monitor(audit_id)
+    return ids
+
+
+async def monitor_worker():
+    while True:
+        try:
+            await asyncio.to_thread(scan_active_monitors)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
 
 
 @router.post('/monitor/start', status_code=201)
 def start_monitor():
     with core.connect() as db:
-        active = db.execute("SELECT audit_id FROM agent_monitors WHERE status='active' ORDER BY started_at DESC LIMIT 1").fetchone()
+        active = db.execute("SELECT audit_id FROM agent_monitors WHERE status IN ('active','paused') ORDER BY started_at DESC LIMIT 1").fetchone()
         cursor = db.execute('SELECT COALESCE(MAX(id),0) FROM run_events_v2').fetchone()[0]
     if active:
-        return scan_monitor(active['audit_id'])
+        return get_audit(active['audit_id'])
     started = datetime.now().astimezone()
     session = 'live-' + started.strftime('%Y%m%d-%H%M%S')
     audit = create_audit(AuditInput(name='实时 Agent 自动监控', agent_name='fieldwork-agent', session_id=session,
@@ -374,7 +421,8 @@ def start_monitor():
         policy=Policy(browser_access=True, allowed_filesystem_paths=['/workspace'], allowed_tools=[])))
     now = core.utcnow()
     with core.connect() as db:
-        db.execute('INSERT INTO agent_monitors VALUES(?,?,?,?,?,?)', (audit['id'], 'active', cursor, now, None, now))
+        db.execute('INSERT INTO agent_monitors(audit_id,status,event_cursor,started_at,stopped_at,last_scan_at,paused_at,last_error,last_event_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                   (audit['id'], 'active', cursor, now, None, now, None, None, now))
     lifecycle = ImportInput(content=core.dump({'events': [{'timestamp': now, 'actor': audit['identity']['agent_name'],
         'session_id': audit['identity']['session_id'], 'source_type': 'system', 'action_type': 'unknown',
         'resource': '自动监控已启动', 'status': 'success'}]}), provenance='operator_telemetry',
@@ -387,14 +435,38 @@ def poll_monitor(audit_id: str):
     return scan_monitor(audit_id)
 
 
-@router.post('/monitor/{audit_id}/stop')
-def stop_monitor(audit_id: str):
-    result = scan_monitor(audit_id)
+@router.post('/monitor/{audit_id}/pause')
+def pause_monitor(audit_id: str):
     with core.connect() as db:
         monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
         if not monitor:
             raise HTTPException(404, '自动监控不存在')
         if monitor['status'] == 'active':
+            db.execute("UPDATE agent_monitors SET status='paused',paused_at=?,last_error=NULL WHERE audit_id=?", (core.utcnow(), audit_id))
+    return get_audit(audit_id)
+
+
+@router.post('/monitor/{audit_id}/resume')
+def resume_monitor(audit_id: str):
+    if storage_health()['status'] == 'critical':
+        raise HTTPException(507, '存储空间不足，暂时无法恢复监控。请释放至少 512 MB。')
+    with core.connect() as db:
+        monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
+        if not monitor:
+            raise HTTPException(404, '自动监控不存在')
+        if monitor['status'] == 'paused':
+            db.execute("UPDATE agent_monitors SET status='active',paused_at=NULL,last_error=NULL WHERE audit_id=?", (audit_id,))
+    return scan_monitor(audit_id)
+
+
+@router.post('/monitor/{audit_id}/stop')
+def stop_monitor(audit_id: str):
+    result = scan_monitor(audit_id, allow_paused=True)
+    with core.connect() as db:
+        monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
+        if not monitor:
+            raise HTTPException(404, '自动监控不存在')
+        if monitor['status'] in {'active', 'paused'}:
             now = core.utcnow()
             db.execute("UPDATE agent_monitors SET status='stopped',stopped_at=?,last_scan_at=? WHERE audit_id=?", (now, now, audit_id))
     if not result['analysis']:
@@ -792,10 +864,18 @@ def get_audit(audit_id: str):
     result = core.load(audit['analysis_json'], None)
     if result and digest({'snapshot': snapshot, 'events': events, 'claims': claims, 'complete': complete}) != result['input_digest']:
         raise HTTPException(409, 'Integrity Check Failed: 分析输入改变')
+    live_evaluations = {event['id']: evaluate_policy(event, snapshot['policy']) for event in events}
     presented_events = [{**event, 'policy_decision': result['policy_evaluations'][event['id']]['decision'],
                          'policy_boundaries': result['policy_evaluations'][event['id']]['boundaries']}
                         for event in events] if result else events
-    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'monitor': dict(monitor) if monitor else None, 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
+    monitor_view = dict(monitor) if monitor else None
+    if monitor_view:
+        monitor_view['health'] = storage_health()
+        monitor_view['source'] = 'Fieldwork 后台事件流'
+        monitor_view['scope'] = '当前设备上的 Fieldwork Agent、工具与策略事件'
+    live_anomalies = [{'event_id': event['id'], **live_evaluations[event['id']]} for event in events
+                      if live_evaluations[event['id']]['decision'] == 'violation' and event['status'] in SUCCESS]
+    return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'monitor': monitor_view, 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'live_evaluations': live_evaluations, 'live_anomalies': live_anomalies, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})
 
 
 def metrics(events, claims, analysis, findings):

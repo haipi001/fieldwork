@@ -8,7 +8,7 @@ body[data-mode="agent_audit"] [data-workspace]:not([data-workspace="new"]) > :no
 .agent-audit-panel[hidden] { display: none !important; }
 .agent-card { margin-top: 28px; padding: 26px; border: 1px solid var(--line); border-radius: 12px; background: var(--white); }
 .agent-card .section-heading { margin-bottom: 20px; }
-.agent-workflow { display:grid; grid-template-columns:repeat(4,1fr); margin:0 0 34px; border-block:1px solid var(--line); }
+.agent-workflow { display:grid; grid-template-columns:repeat(3,1fr); margin:0 0 34px; border-block:1px solid var(--line); }
 .agent-workflow span { display:flex; align-items:center; gap:10px; padding:14px 4px; color:var(--muted); font-size:13px; }
 .agent-workflow b { display:grid; place-items:center; width:24px; height:24px; border:1px solid var(--line); border-radius:50%; font:700 11px ui-monospace,monospace; }
 .agent-workflow .active { color:var(--ink); font-weight:700; }
@@ -60,6 +60,7 @@ body[data-mode="agent_audit"] [data-workspace]:not([data-workspace="new"]) > :no
 .agent-monitor-control { display:flex; justify-content:space-between; align-items:center; gap:24px; margin-top:18px; padding:20px; border:1px solid #b7c9ab; border-radius:11px; background:#eef4e9; }
 .agent-monitor-control > div { display:grid; grid-template-columns:auto 1fr; align-items:center; gap:4px 10px; }
 .agent-monitor-control small { grid-column:2; color:var(--muted); }
+.agent-monitor-actions { display:flex; align-items:center; gap:10px; }
 .agent-live-dot { width:10px; height:10px; border-radius:50%; background:#67923f; box-shadow:0 0 0 5px rgba(103,146,63,.12); }
 .agent-manual-tools > summary { margin-bottom:18px; }
 .agent-card--result { border-color:#cbd8c3; }

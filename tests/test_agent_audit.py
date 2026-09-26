@@ -22,6 +22,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core, 'DB', tmp_path / 'test.db')
     monkeypatch.setattr(core, 'LOCAL_DATA_ROOT', tmp_path)
     monkeypatch.setattr(reporting, 'EXPORTS', tmp_path / 'exports')
+    monkeypatch.setattr(audit.application_ai_monitor, 'roots', lambda: {'Codex': tmp_path / 'codex-logs', 'Claude Code': tmp_path / 'claude-logs'})
     monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: {
         'platform': 'Darwin', 'applications': [{'name': 'Cursor', 'installed': True}],
         'processes': {'42': {'pid': 42, 'parent_pid': 1, 'uid': 501, 'executable': 'Cursor', 'app': 'Cursor'}},
@@ -228,6 +229,32 @@ def test_monitor_failure_pauses_visibly(client, monkeypatch):
     assert result['monitor']['status'] == 'paused'
     assert 'RuntimeError' in result['monitor']['last_error']
     assert 'internal details' not in result['monitor']['last_error']
+
+
+def test_monitor_app_log_is_automatic_and_never_independent(client, tmp_path):
+    root = tmp_path / 'codex-logs'
+    root.mkdir()
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    path = root / 'new-session.jsonl'
+    path.write_text(json.dumps({'timestamp': core.utcnow(), 'type': 'response_item', 'payload': {
+        'type': 'custom_tool_call', 'name': 'exec', 'call_id': 'local-call',
+        'input': 'sensitive private command'}}) + '\n')
+    result = audit.scan_monitor(started['id'])
+    tool = next(e for e in result['events'] if e['source_type'] == 'tool_call')
+    assert tool['tool_name'] == 'exec' and tool['status'] == 'requested'
+    assert tool['independent'] is False and tool['authenticity_verified'] is False
+    assert tool['trust_level'] == 'agent_supplied'
+    assert 'sensitive private command' not in json.dumps(result)
+    assert 'application_log_state' not in result['monitor']['desktop']
+    assert len(audit.scan_monitor(started['id'])['events']) == len(result['events'])
+    client.post(f"/api/v1/agent-audit/monitor/{started['id']}/pause")
+    with path.open('a') as stream:
+        stream.write(json.dumps({'timestamp': core.utcnow(), 'type': 'response_item', 'payload': {
+            'type': 'custom_tool_call_output', 'call_id': 'local-call', 'output': 'private output'}}) + '\n')
+    resumed = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/resume").json()
+    assert len(resumed['events']) == len(result['events'])
+    stopped = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/stop").json()
+    assert not stopped['findings']
 
 
 def test_monitor_auto_pauses_when_storage_is_critical(client, monkeypatch):

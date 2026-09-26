@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 import final_core as core
 import reporting
 import desktop_ai_monitor
+import application_ai_monitor
 
 router = APIRouter(prefix='/api/v1/agent-audit', tags=['AI Agent Audit'])
 SOURCES = {'agent_trace', 'self_report', 'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
@@ -394,6 +395,14 @@ def scan_monitor(audit_id: str, allow_paused=False):
             current = desktop_ai_monitor.snapshot()
             previous = core.load(monitor['collector_state'], {})
             now = core.utcnow()
+            app_events, app_state, app_summary = application_ai_monitor.scan(
+                previous.get('application_log_state'), now, identity['session_id'],
+                reset=allow_paused and monitor['status'] == 'paused' or previous.get('_reset_application_logs', False))
+            current['application_log_state'] = app_state
+            current['application_logs'] = app_summary
+            current['coverage']['tool_calls'] = 'application_log' if any(s['status'] == 'available' for s in app_summary['sources']) else 'waiting'
+            current['coverage']['mcp'] = current['coverage']['tool_calls']
+            current['errors'].extend(app_summary['errors'])
             observed = desktop_ai_monitor.events(previous, current, now, identity['session_id'])
             # A failed process snapshot is never interpreted as every app exiting.
             if current['coverage']['processes'] != 'unavailable':
@@ -408,9 +417,12 @@ def scan_monitor(audit_id: str, allow_paused=False):
                     current[key] = previous.get(key, {})
                 elif current['coverage'].get(coverage_key) == 'partial':
                     current[key] = {**previous.get(key, {}), **current.get(key, {})}
+            for offset in range(0, len(app_events), 500):
+                import_events(audit_id, ImportInput(content=core.dump({'events': app_events[offset:offset + 500]}),
+                    provenance='agent_supplied', source_name='本机应用工具日志（非独立证据）'))
             with core.connect() as db:
                 db.execute('UPDATE agent_monitors SET collector_state=?,last_scan_at=?,last_event_at=COALESCE(?,last_event_at),last_error=? WHERE audit_id=?',
-                           (core.dump(current), now, now if observed else None, '；'.join(current['errors']) or None, audit_id))
+                           (core.dump(current), now, now if observed or app_events else None, '；'.join(current['errors']) or None, audit_id))
             return get_audit(audit_id)
         if rows:
             body = ImportInput(content=core.dump({'events': [monitor_event(row, identity) for row in rows]}),
@@ -463,7 +475,7 @@ def start_monitor():
     started = datetime.now().astimezone()
     session = 'live-' + started.strftime('%Y%m%d-%H%M%S')
     audit = create_audit(AuditInput(name='本机 AI 活动监控', agent_name='desktop-ai-apps', session_id=session,
-        task_objective='观察本机可识别 AI 软件的进程与可见 TCP 连接，显示采集覆盖情况', start_time=started.isoformat(),
+        task_objective='观察本机 AI 进程、TCP 连接、打开文件与已适配的应用工具日志，显示各来源覆盖与证据边界', start_time=started.isoformat(),
         end_time=(started + timedelta(days=365)).isoformat(), runtime='macOS passive collector', environment='local',
         policy=None))
     now = core.utcnow()
@@ -480,7 +492,12 @@ def start_monitor():
 
 @router.get('/desktop/discovery')
 def desktop_discovery():
-    return desktop_ai_monitor.snapshot()
+    current = desktop_ai_monitor.snapshot()
+    current['application_logs'] = application_ai_monitor.summary()
+    current['coverage']['tool_calls'] = 'application_log' if any(s['status'] == 'available' for s in current['application_logs']['sources']) else 'waiting'
+    current['coverage']['mcp'] = current['coverage']['tool_calls']
+    current['errors'].extend(current['application_logs']['errors'])
+    return current
 
 
 @router.post('/monitor/{audit_id}/scan')
@@ -510,7 +527,9 @@ def resume_monitor(audit_id: str):
         if not monitor:
             raise HTTPException(404, '自动监控不存在')
         if monitor['status'] == 'paused':
-            db.execute("UPDATE agent_monitors SET status='active',paused_at=NULL,last_error=NULL WHERE audit_id=?", (audit_id,))
+            collector_state = core.load(monitor['collector_state'], {})
+            collector_state['_reset_application_logs'] = True
+            db.execute("UPDATE agent_monitors SET status='active',paused_at=NULL,last_error=NULL,collector_state=? WHERE audit_id=?", (core.dump(collector_state), audit_id))
     return scan_monitor(audit_id)
 
 
@@ -566,7 +585,7 @@ def normalize_event(raw, body, identity, signed=False):
             timestamp(time)
         except ValueError:
             raise HTTPException(422, '事件 timestamp 需要 ISO 8601 时区')
-    keys = ['actor', 'tool_name', 'command_category', 'resource', 'destination', 'filesystem_path', 'network_host', 'request_method', 'input_hash', 'output_hash', 'session_id', 'mcp_server', 'privilege', 'process_started_at', 'process_executable', 'attribution_method']
+    keys = ['actor', 'tool_name', 'command_category', 'resource', 'destination', 'filesystem_path', 'network_host', 'request_method', 'input_hash', 'output_hash', 'session_id', 'mcp_server', 'privilege', 'process_started_at', 'process_executable', 'attribution_method', 'tool_call_ref', 'application_session_ref']
     value = {key: str(raw.get(key) or '')[:5000] for key in keys}
     for key in ('process_id', 'parent_process_id'):
         number = raw.get(key)
@@ -934,8 +953,11 @@ def get_audit(audit_id: str):
         monitor_view['health'] = storage_health()
         desktop = monitor_view['collector_kind'] == 'desktop'
         monitor_view['source'] = 'macOS 本机 AI 活动采集器' if desktop else 'Fieldwork 后台事件流'
-        monitor_view['scope'] = '本机可识别 AI 软件及其子进程、可见 TCP 连接与打开文件' if desktop else '旧记录：Fieldwork 内部运行事件'
+        monitor_view['scope'] = '本机 AI 进程、TCP 连接、打开文件与已适配的应用工具日志' if desktop else '旧记录：Fieldwork 内部运行事件'
         monitor_view['desktop'] = core.load(monitor_view.pop('collector_state'), {}) if desktop else None
+        if desktop:
+            monitor_view['desktop'].pop('application_log_state', None)
+            monitor_view['desktop'].pop('_reset_application_logs', None)
     live_anomalies = [{'event_id': event['id'], **live_evaluations[event['id']]} for event in events
                       if live_evaluations[event['id']]['decision'] == 'violation' and event['status'] in SUCCESS]
     return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'monitor': monitor_view, 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'live_evaluations': live_evaluations, 'live_anomalies': live_anomalies, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})

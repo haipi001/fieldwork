@@ -11,7 +11,11 @@
 static NSMutableDictionary<NSNumber *, NSDictionary *> *lineage;
 static dispatch_queue_t writer;
 static dispatch_semaphore_t capacity;
+static dispatch_group_t outputGroup;
+static dispatch_source_t stopSignals[2];
 static _Atomic unsigned long dropped = 0;
+static _Atomic unsigned long pending = 0, outputFailures = 0;
+static _Atomic bool stopping = false;
 static uint64_t lastSequence = 0, kernelDropped = 0;
 static NSISO8601DateFormatter *clockFormat;
 static BOOL syntheticMode = NO;
@@ -41,13 +45,24 @@ static void emit(NSDictionary *event) {
     NSMutableDictionary *copy = [event mutableCopy];
     copy[@"collector_dropped"] = @(atomic_load(&dropped));
     copy[@"kernel_dropped"] = @(kernelDropped);
-    dispatch_async(writer, ^{
+    atomic_fetch_add(&pending, 1);
+    dispatch_group_async(outputGroup, writer, ^{
         @autoreleasepool {
             NSData *json = [NSJSONSerialization dataWithJSONObject:copy options:NSJSONWritingSortedKeys error:nil];
-            if (json) { fwrite(json.bytes, 1, json.length, stdout); fputc('\n', stdout); fflush(stdout); }
+            if (!json || fwrite(json.bytes, 1, json.length, stdout) != json.length
+                || fputc('\n', stdout) == EOF || fflush(stdout) == EOF) atomic_fetch_add(&outputFailures, 1);
+            atomic_fetch_sub(&pending, 1);
             dispatch_semaphore_signal(capacity);
         }
     });
+}
+
+static int drainOutput(void) {
+    long timeout = dispatch_group_wait(outputGroup, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+    unsigned long outstanding = atomic_load(&pending), failed = atomic_load(&outputFailures);
+    fprintf(stderr,"Collector stopped: queue_dropped=%lu output_failed=%lu pending=%lu drain_timeout=%d\n",
+        atomic_load(&dropped), failed, outstanding, timeout != 0);
+    return failed || timeout ? 74 : 0;
 }
 
 static NSString *birth(struct timeval time) {
@@ -195,19 +210,21 @@ static int selfTest(void) {
     event(&message);
     message.event.close.modified = true; file.path_truncated = true; message.global_seq_num = 3; event(&message);
     fprintf(stderr,"SYNTHETIC SELF TEST: no live Endpoint Security collection\n");
-    dispatch_sync(writer,^{}); return 0;
+    return drainOutput();
 }
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
         lineage = [NSMutableDictionary dictionary]; writer = dispatch_queue_create("fieldwork.native.writer", DISPATCH_QUEUE_SERIAL);
+        outputGroup = dispatch_group_create();
+        signal(SIGPIPE, SIG_IGN);
         capacity = dispatch_semaphore_create(512); clockFormat = [NSISO8601DateFormatter new];
         callbackLock = [NSLock new];
         clockFormat.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
         if (argc == 2 && !strcmp(argv[1],"--self-test")) return selfTest();
         if (argc != 1) { fprintf(stderr,"Only --self-test is supported; no arbitrary commands are accepted.\n"); return 64; }
         es_client_t *client = NULL;
-        es_new_client_result_t result = es_new_client(&client, ^(es_client_t *unused, const es_message_t *message) { (void)unused; @autoreleasepool { [callbackLock lock]; event(message); [callbackLock unlock]; } });
+        es_new_client_result_t result = es_new_client(&client, ^(es_client_t *unused, const es_message_t *message) { (void)unused; @autoreleasepool { [callbackLock lock]; if (!atomic_load(&stopping)) event(message); [callbackLock unlock]; } });
         if (result != ES_NEW_CLIENT_RESULT_SUCCESS) {
             fprintf(stderr,"Endpoint Security inactive (result %d): requires Apple-approved signing, administrator privilege and Full Disk Access.\n",result); return 78;
         }
@@ -215,6 +232,19 @@ int main(int argc, const char **argv) {
         es_event_type_t types[] = {ES_EVENT_TYPE_NOTIFY_EXEC,ES_EVENT_TYPE_NOTIFY_FORK,ES_EVENT_TYPE_NOTIFY_EXIT,
             ES_EVENT_TYPE_NOTIFY_OPEN,ES_EVENT_TYPE_NOTIFY_WRITE,ES_EVENT_TYPE_NOTIFY_CLOSE,ES_EVENT_TYPE_NOTIFY_UNLINK,ES_EVENT_TYPE_NOTIFY_RENAME};
         if (es_subscribe(client,types,sizeof(types)/sizeof(types[0])) != ES_RETURN_SUCCESS) { es_delete_client(client); return 70; }
+        int signals[] = {SIGTERM, SIGINT};
+        for (int index = 0; index < 2; index++) {
+            signal(signals[index], SIG_IGN);
+            stopSignals[index] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, signals[index], 0, dispatch_get_main_queue());
+            dispatch_source_set_event_handler(stopSignals[index], ^{
+                [callbackLock lock]; atomic_store(&stopping, true); [callbackLock unlock];
+                es_unsubscribe_all(client);
+                es_return_t deleted = es_delete_client(client);
+                int status = drainOutput();
+                exit(deleted == ES_RETURN_SUCCESS ? status : 70);
+            });
+            dispatch_resume(stopSignals[index]);
+        }
         fprintf(stderr,"Endpoint Security active; metadata only, notification events only.\n");
         dispatch_main();
     }

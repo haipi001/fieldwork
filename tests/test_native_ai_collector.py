@@ -10,7 +10,7 @@ import native_ai_events as native
 
 
 @pytest.fixture(scope='module')
-def emitted(tmp_path_factory):
+def collector_binary(tmp_path_factory):
     if platform.system() != 'Darwin' or not shutil.which('xcrun'):
         pytest.skip('Apple SDK required for native collector build')
     root = Path(__file__).resolve().parents[1]
@@ -19,9 +19,25 @@ def emitted(tmp_path_factory):
         str(root/'collectors/native-ai/collector.m'),'-framework','Foundation','-lbsm','-lEndpointSecurity','-o',str(binary)],
         capture_output=True,text=True,timeout=60)
     assert build.returncode == 0, build.stderr
-    result = subprocess.run([str(binary),'--self-test'],capture_output=True,text=True,timeout=10)
+    return binary
+
+
+@pytest.fixture(scope='module')
+def emitted(collector_binary):
+    result = subprocess.run([str(collector_binary),'--self-test'],capture_output=True,text=True,timeout=10)
     assert result.returncode == 0 and 'SYNTHETIC' in result.stderr
     return [json.loads(line) for line in result.stdout.splitlines()]
+
+
+def test_native_failed_output_is_not_silent(collector_binary):
+    # A read-only descriptor forces fwrite failure without requesting ES access.
+    with open('/dev/null','rb') as unavailable_output:
+        result = subprocess.run([str(collector_binary),'--self-test'],stdout=unavailable_output,
+            stderr=subprocess.PIPE,text=True,timeout=10)
+    assert result.returncode == 74
+    assert 'output_failed=2' in result.stderr
+    assert 'pending=0' in result.stderr
+    assert 'drain_timeout=0' in result.stderr
 
 
 def test_native_close_mapping_does_not_claim_read_or_write_success(emitted):

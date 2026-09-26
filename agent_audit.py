@@ -14,6 +14,8 @@ import json
 import posixpath
 import re
 import shutil
+import threading
+from functools import wraps
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -26,12 +28,22 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import final_core as core
 import reporting
+import desktop_ai_monitor
 
 router = APIRouter(prefix='/api/v1/agent-audit', tags=['AI Agent Audit'])
 SOURCES = {'agent_trace', 'self_report', 'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
 ACTIONS = {'read', 'write', 'execute', 'connect', 'request', 'authenticate', 'modify', 'spawn', 'install', 'escalate', 'invoke_tool', 'navigate', 'unknown'}
 TELEMETRY = {'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
 SUCCESS = {'success', 'succeeded', 'completed', 'ok', 'connected'}
+MONITOR_LOCK = threading.RLock()
+
+
+def serialized_monitor(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with MONITOR_LOCK:
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def digest(value):
@@ -192,7 +204,9 @@ def init_agent_audit_db():
         CREATE INDEX IF NOT EXISTS agent_signed_imports_audit ON agent_signed_imports(audit_id);
         ''')
         columns = {row['name'] for row in db.execute('PRAGMA table_info(agent_monitors)')}
-        for name, definition in {'paused_at': 'TEXT', 'last_error': 'TEXT', 'last_event_at': 'TEXT'}.items():
+        for name, definition in {'paused_at': 'TEXT', 'last_error': 'TEXT', 'last_event_at': 'TEXT',
+                                 'collector_kind': "TEXT NOT NULL DEFAULT 'fieldwork'",
+                                 'collector_state': "TEXT NOT NULL DEFAULT '{}'"}.items():
             if name not in columns:
                 db.execute(f'ALTER TABLE agent_monitors ADD COLUMN {name} {definition}')
 
@@ -353,6 +367,7 @@ def storage_health():
     return {'status': status, 'free_bytes': usage.free, 'free_percent': round(free_ratio * 100, 1)}
 
 
+@serialized_monitor
 def scan_monitor(audit_id: str, allow_paused=False):
     with core.connect() as db:
         monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
@@ -373,6 +388,23 @@ def scan_monitor(audit_id: str, allow_paused=False):
             db.execute("UPDATE agent_monitors SET status='paused',paused_at=?,last_error=? WHERE audit_id=?", (core.utcnow(), message, audit_id))
         return get_audit(audit_id)
     try:
+        if monitor['collector_kind'] == 'desktop':
+            current = desktop_ai_monitor.snapshot()
+            previous = core.load(monitor['collector_state'], {})
+            now = core.utcnow()
+            observed = desktop_ai_monitor.events(previous, current, now, identity['session_id'])
+            # A failed process snapshot is never interpreted as every app exiting.
+            if current['coverage']['processes'] != 'unavailable':
+                for offset in range(0, len(observed), 500):
+                    import_events(audit_id, ImportInput(content=core.dump({'events': observed[offset:offset + 500]}),
+                        provenance='operator_telemetry', source_name='macOS 本机 AI 活动采集器', independent_attested=True))
+            else:
+                current['processes'] = previous.get('processes', {})
+                current['connections'] = previous.get('connections', {})
+            with core.connect() as db:
+                db.execute('UPDATE agent_monitors SET collector_state=?,last_scan_at=?,last_event_at=COALESCE(?,last_event_at),last_error=? WHERE audit_id=?',
+                           (core.dump(current), now, now if observed else None, '；'.join(current['errors']) or None, audit_id))
+            return get_audit(audit_id)
         if rows:
             body = ImportInput(content=core.dump({'events': [monitor_event(row, identity) for row in rows]}),
                                provenance='operator_telemetry', source_name='Fieldwork 后台事件流', independent_attested=True)
@@ -407,27 +439,34 @@ async def monitor_worker():
 
 
 @router.post('/monitor/start', status_code=201)
+@serialized_monitor
 def start_monitor():
     with core.connect() as db:
-        active = db.execute("SELECT audit_id FROM agent_monitors WHERE status IN ('active','paused') ORDER BY started_at DESC LIMIT 1").fetchone()
+        active = db.execute("SELECT audit_id FROM agent_monitors WHERE status IN ('active','paused') AND collector_kind='desktop' ORDER BY started_at DESC LIMIT 1").fetchone()
         cursor = db.execute('SELECT COALESCE(MAX(id),0) FROM run_events_v2').fetchone()[0]
     if active:
         return get_audit(active['audit_id'])
     started = datetime.now().astimezone()
     session = 'live-' + started.strftime('%Y%m%d-%H%M%S')
-    audit = create_audit(AuditInput(name='实时 Agent 自动监控', agent_name='fieldwork-agent', session_id=session,
-        task_objective='自动记录 Fieldwork 内 Agent 与工具行为', start_time=started.isoformat(),
-        end_time=(started + timedelta(days=365)).isoformat(), runtime='Fieldwork event stream', environment='local',
-        policy=Policy(browser_access=True, allowed_filesystem_paths=['/workspace'], allowed_tools=[])))
+    audit = create_audit(AuditInput(name='本机 AI 活动监控', agent_name='desktop-ai-apps', session_id=session,
+        task_objective='观察本机可识别 AI 软件的进程与可见 TCP 连接，显示采集覆盖情况', start_time=started.isoformat(),
+        end_time=(started + timedelta(days=365)).isoformat(), runtime='macOS passive collector', environment='local',
+        policy=None))
     now = core.utcnow()
     with core.connect() as db:
-        db.execute('INSERT INTO agent_monitors(audit_id,status,event_cursor,started_at,stopped_at,last_scan_at,paused_at,last_error,last_event_at) VALUES(?,?,?,?,?,?,?,?,?)',
-                   (audit['id'], 'active', cursor, now, None, now, None, None, now))
+        db.execute('INSERT INTO agent_monitors(audit_id,status,event_cursor,started_at,stopped_at,last_scan_at,paused_at,last_error,last_event_at,collector_kind) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                   (audit['id'], 'active', cursor, now, None, now, None, None, now, 'desktop'))
     lifecycle = ImportInput(content=core.dump({'events': [{'timestamp': now, 'actor': audit['identity']['agent_name'],
         'session_id': audit['identity']['session_id'], 'source_type': 'system', 'action_type': 'unknown',
         'resource': '自动监控已启动', 'status': 'success'}]}), provenance='operator_telemetry',
         source_name='Fieldwork monitor', independent_attested=True)
-    return import_events(audit['id'], lifecycle)
+    import_events(audit['id'], lifecycle)
+    return scan_monitor(audit['id'])
+
+
+@router.get('/desktop/discovery')
+def desktop_discovery():
+    return desktop_ai_monitor.snapshot()
 
 
 @router.post('/monitor/{audit_id}/scan')
@@ -436,6 +475,7 @@ def poll_monitor(audit_id: str):
 
 
 @router.post('/monitor/{audit_id}/pause')
+@serialized_monitor
 def pause_monitor(audit_id: str):
     with core.connect() as db:
         monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
@@ -447,6 +487,7 @@ def pause_monitor(audit_id: str):
 
 
 @router.post('/monitor/{audit_id}/resume')
+@serialized_monitor
 def resume_monitor(audit_id: str):
     if storage_health()['status'] == 'critical':
         raise HTTPException(507, '存储空间不足，暂时无法恢复监控。请释放至少 512 MB。')
@@ -460,6 +501,7 @@ def resume_monitor(audit_id: str):
 
 
 @router.post('/monitor/{audit_id}/stop')
+@serialized_monitor
 def stop_monitor(audit_id: str):
     result = scan_monitor(audit_id, allow_paused=True)
     with core.connect() as db:
@@ -871,8 +913,10 @@ def get_audit(audit_id: str):
     monitor_view = dict(monitor) if monitor else None
     if monitor_view:
         monitor_view['health'] = storage_health()
-        monitor_view['source'] = 'Fieldwork 后台事件流'
-        monitor_view['scope'] = '当前设备上的 Fieldwork Agent、工具与策略事件'
+        desktop = monitor_view['collector_kind'] == 'desktop'
+        monitor_view['source'] = 'macOS 本机 AI 活动采集器' if desktop else 'Fieldwork 后台事件流'
+        monitor_view['scope'] = '本机可识别 AI 软件及其子进程、可见 TCP 连接' if desktop else '旧记录：Fieldwork 内部运行事件'
+        monitor_view['desktop'] = core.load(monitor_view.pop('collector_state'), {}) if desktop else None
     live_anomalies = [{'event_id': event['id'], **live_evaluations[event['id']]} for event in events
                       if live_evaluations[event['id']]['decision'] == 'violation' and event['status'] in SUCCESS]
     return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'monitor': monitor_view, 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'live_evaluations': live_evaluations, 'live_anomalies': live_anomalies, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})

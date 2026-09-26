@@ -1,6 +1,6 @@
 /* Domain-specific UI; the existing mode router and five workspaces remain shared. */
 (() => {
-  const auditState = {items: [], current: null, collectors: [], filter: 'ALL', monitorTimer: null};
+  const auditState = {items: [], current: null, collectors: [], filter: 'ALL', monitorTimer: null, discovery: null};
   const workspace = name => document.querySelector(`[data-workspace="${name}"]`);
   const originalHero = workspace('new').querySelector('.hero-grid').innerHTML;
   const panels = {};
@@ -11,7 +11,7 @@
     workspace(name).append(panel); panels[name] = panel;
   }
   const workflow = active => `<nav class="agent-workflow" aria-label="监控进度">${[['monitor','1','开始监控'],['record','2','实时记录'],['review','3','结束分析']].map(([key,n,label])=>`<span data-step="${key}" class="${key===active?'active':''}"><b>${n}</b>${label}</span>`).join('')}</nav>`;
-  panels.new.innerHTML = `<section class="agent-scanner"><div class="agent-scanner-signal" aria-hidden="true"><i></i><i></i><i></i><span></span></div><div><p class="eyebrow">LIVE AGENT MONITOR</p><h1>开启后，自动记录。</h1><p>持续监听 Fieldwork 内的 Agent、工具与策略事件，自动整理时间线。无需填写表单。</p><div class="agent-scanner-facts"><span>本地记录</span><span>实时刷新</span><span>结束后自动分析</span></div><button type="button" id="agentMonitorStart" class="primary-action">开始自动监控 ↗</button><p class="target-hint">只记录启动后产生的 Fieldwork 运行事件；不会执行命令或修改目标。</p><p class="inline-error" id="agentCreateError" role="alert"></p></div></section><details class="agent-demo-option"><summary>想先了解结果？运行模拟示例</summary><button type="button" id="agentDemo" class="quiet-button">运行本地示例 ↗</button></details><section class="recent-section"><div class="section-heading"><div><p class="eyebrow">RECENT MONITORS</p><h2>最近记录</h2></div><span id="agentAuditCount"></span></div><div id="agentAuditList"></div></section>`;
+  panels.new.innerHTML = `<section class="agent-scanner"><div class="agent-scanner-signal" aria-hidden="true"><i></i><i></i><i></i><span></span></div><div><p class="eyebrow">DESKTOP AI ACTIVITY MONITOR</p><h1>看见本机 AI 的活动。</h1><p>自动发现电脑上的 AI 软件，持续记录可见进程、子进程与 TCP 连接，整理行为时间线。无需填写表单。</p><div class="agent-scanner-facts"><span>本机软件发现</span><span>后台记录</span><span>采集范围可见</span></div><button type="button" id="agentMonitorStart" class="primary-action">开始本机监控 ↗</button><p class="target-hint">目前采用系统快照采样。文件读写、浏览器内 AI 操作和 MCP 调用尚未接入，短暂活动可能无法捕获。</p><p class="inline-error" id="agentCreateError" role="alert"></p></div></section><section class="agent-card"><div class="section-heading"><h2>本机 AI 软件与采集范围</h2><button id="agentDiscoveryRefresh" class="quiet-button">重新检测</button></div><div id="agentDesktopDiscovery">正在检测本机 AI 软件…</div></section><details class="agent-demo-option"><summary>想先了解结果？运行模拟示例</summary><button type="button" id="agentDemo" class="quiet-button">运行本地示例 ↗</button></details><section class="recent-section"><div class="section-heading"><div><p class="eyebrow">RECENT MONITORS</p><h2>最近记录</h2></div><span id="agentAuditCount"></span></div><div id="agentAuditList"></div></section>`;
   panels.run.innerHTML = `${workflow('record')}<div class="agent-toolbar"><label>当前记录<select id="agentAuditSelect"></select></label><span id="agentAuditBadge" class="state-badge"></span></div>
     <div class="page-intro"><div><p class="eyebrow">LIVE AGENT MONITOR</p><h1>实时观察 Agent 行为。</h1><p id="agentRunHint">监控在后台持续运行，离开此页面也不会中断。</p></div></div>
     <div id="agentKpis" class="run-metrics"></div><section id="agentMonitorControl" class="agent-monitor-control" hidden><div><span class="agent-live-dot"></span><b id="agentMonitorTitle">正在自动监控</b><small id="agentMonitorMeta"></small><small id="agentMonitorHealth"></small></div><div class="agent-monitor-actions"><button type="button" id="agentMonitorPause" class="quiet-button">暂停</button><button type="button" id="agentMonitorStop" class="primary-action">结束并分析 ↗</button></div></section>
@@ -37,12 +37,20 @@
   async function select(id) {auditState.current=await call(`/audits/${id}`);render();}
   const formatTime = value => value ? new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'medium'}).format(new Date(value)) : '尚无记录';
   const formatBytes = value => value >= 1073741824 ? `${(value/1073741824).toFixed(1)} GB` : `${Math.round(value/1048576)} MB`;
+  function renderDiscovery(snapshot) {
+    if(!snapshot)return;
+    const apps=new Map((snapshot.applications||[]).map(app=>[app.name,{...app,count:0}]));
+    for(const process of Object.values(snapshot.processes||{})){if(!apps.has(process.app))apps.set(process.app,{name:process.app,count:0});apps.get(process.app).count++;}
+    $('#agentDesktopDiscovery').innerHTML=Array.from(apps.values()).map(app=>`<div class="agent-list-row"><b>${esc(app.name)}</b><span>${app.count?`${app.count} 个可见进程`:'已安装 · 未发现运行进程'}</span></div>`).join('')||empty('未发现可识别的 AI 软件。未识别的软件和浏览器内 AI 服务仍需适配。');
+    $('#agentDesktopDiscovery').innerHTML+=`<p class="target-hint">进程与 TCP：快照采样 · 文件读写 / 浏览器内 AI / MCP：未接入</p>${(snapshot.errors||[]).map(error=>`<p class="inline-error">${esc(error)}</p>`).join('')}`;
+  }
+  async function discover(){auditState.discovery=await call('/desktop/discovery');renderDiscovery(auditState.discovery);}
   function monitorLoop() {clearInterval(auditState.monitorTimer);if(['active','paused'].includes(auditState.current?.monitor?.status))auditState.monitorTimer=setInterval(async()=>{try{auditState.current=await call(`/audits/${auditState.current.id}`);render();}catch(e){$('#agentMonitorHealth').textContent='状态刷新失败，将自动重试';}},2000);}
   function applyMode() {
     const active=state.mode==='agent_audit';
     for(const panel of Object.values(panels))panel.hidden=!active;
     const hero=workspace('new').querySelector('.hero-grid');
-    if(active&&!hero.dataset.agent){hero.dataset.agent='1';hero.innerHTML='<div class="hero-copy"><p class="eyebrow"><span class="live-dot"></span> AI AGENT AUDIT WORKSPACE</p><h1>审查一次 Agent 行为。<br><em>让每个判断，都有独立证据。</em></h1><p class="lede" id="modeLede">开启实时监控后正常运行 Agent。Fieldwork 自动记录行为、整理时间线，并在结束时完成对账分析。</p></div><aside class="truth-panel"><div class="truth-index">SELF-REPORT ≠ GROUND TRUTH</div><p>Agent 的解释只是证词，不是事实。只有经过独立遥测、Policy 和证据交叉验证的事件，才能成为确认结论。</p><div class="truth-chain"><span>自动记录</span><i></i><span>对账行为</span><i></i><span>独立验证</span></div></aside>'}
+    if(active&&!hero.dataset.agent){hero.dataset.agent='1';hero.innerHTML='<div class="hero-copy"><p class="eyebrow"><span class="live-dot"></span> AI AGENT AUDIT WORKSPACE</p><h1>检查电脑上的 AI 活动。<br><em>让软件的动作，有迹可查。</em></h1><p class="lede" id="modeLede">自动发现本机 AI 软件，记录可见活动。每个采集来源都显示覆盖范围，未接入的行为会明确标注。</p></div><aside class="truth-panel"><div class="truth-index">SELF-REPORT ≠ GROUND TRUTH</div><p>Agent 的解释只是证词，不是事实。只有经过独立遥测、Policy 和证据交叉验证的事件，才能成为确认结论。</p><div class="truth-chain"><span>自动记录</span><i></i><span>对账行为</span><i></i><span>独立验证</span></div></aside>'}
     if(!active&&hero.dataset.agent){hero.innerHTML=originalHero;delete hero.dataset.agent;$('#modeLede').textContent=state.mode==='web3'?'输入已获授权的合约、协议或代码仓库。生产网保持只读，写入只允许 local fork / devnet。':'输入已获授权的网站或代码仓库。系统先冻结 Scope，再安排分析、复验和报告。'}
     const nav=document.querySelector('.nav-link[data-go="findings"]');nav.innerHTML=`<span>03</span>${active?'事件结果':'漏洞结果'}`;
     if(active){const current=Object.keys(panels).find(name=>workspace(name).classList.contains('active'))||'new',meta={new:['自动监控','开启即记录，无需填写'],run:['实时记录','持续采集与整理时间线'],findings:['事件结果','审阅独立证据支持的结论'],reports:['报告中心','导出事件与证据'],settings:['设置与工具','外部采集器与信任边界']}[current];$('#contextMode').textContent='AI Agent Audit';$('#contextTaskFact').textContent=`${auditState.items.length} 个记录`;$('#contextTitle').textContent=meta[0];$('#contextHint').textContent=meta[1];}
@@ -57,16 +65,17 @@
     $('#agentCollectors').innerHTML=auditState.collectors.map(c=>`<div class="agent-list-row"><div><b>${esc(c.name)}</b><small>${esc(c.key_id)} · ${esc(c.fingerprint)}</small></div><span class="state-badge">${esc(c.status.toUpperCase())}</span></div>`).join('')||empty('尚未登记采集器。');
     $('#agentCollectorSelect').innerHTML='<option value="">未签名 / 操作员声明</option>'+auditState.collectors.filter(c=>c.status==='active').map(c=>`<option value="${esc(c.id)}">${esc(c.name)} · ${esc(c.key_id)}</option>`).join('');
     applyMode();
+    await discover();
   }
   function render() {
     const a=auditState.current;$('#agentAuditCount').textContent=`${auditState.items.length} 个审计`;
-    $('#agentAuditList').innerHTML=auditState.items.map(x=>`<article class="agent-list-row"><div><b>${esc(x.name)}</b><small>${new Date(x.created_at).toLocaleString()}${x.demo?' · SIMULATED':''}</small></div><button class="quiet-button" data-open-audit="${esc(x.id)}">打开审计 →</button></article>`).join('')||empty('还没有审计。建立审计或体验本地示例。');
+    $('#agentAuditList').innerHTML=auditState.items.map(x=>`<article class="agent-list-row"><div><b>${esc(x.name)}</b><small>${new Date(x.created_at).toLocaleString()}${x.demo?' · SIMULATED':''}</small></div><button class="quiet-button" data-open-audit="${esc(x.id)}">查看记录 →</button></article>`).join('')||empty('还没有审计。建立审计或体验本地示例。');
     $('#agentAuditSelect').innerHTML='<option value="">选择审计</option>'+auditState.items.map(x=>`<option value="${esc(x.id)}" ${a?.id===x.id?'selected':''}>${esc(x.name)}</option>`).join('');
     $('#agentManualTools').hidden=!a||!!a.analysis||a?.monitor?.status==='active';$('#agentInputSummary').hidden=!a||!a.analysis;
     if(!a){$('#agentKpis').innerHTML='';$('#agentMonitorControl').hidden=true;$('#agentComparisonCard').hidden=true;$('#agentTimeline').innerHTML=empty('暂无行为记录。');$('#agentCandidates').innerHTML=empty('暂无候选。');$('#agentFindings').innerHTML=empty('暂无确认事件。');return;}
     const monitor=a.monitor, monitorStatus=monitor?.status;
     $('#agentAuditBadge').textContent=a.demo?'模拟示例':a.analysis?'分析完成':monitorStatus==='paused'?'已暂停':'实时监控';
-    $('#agentRunHint').textContent=monitor ? '后台持续采集当前设备上的 Fieldwork 运行事件。可以离开本页面。' : `${a.identity.name} · ${a.identity.agent_name}`;
+    $('#agentRunHint').textContent=monitor?.collector_kind==='desktop' ? '后台采样本机 AI 软件及其子进程、可见 TCP 连接。可以离开本页面。' : monitor ? '这是旧版 Fieldwork 内部监控记录。请从首页开始本机监控。' : `${a.identity.name} · ${a.identity.agent_name}`;
     const evaluations=Object.values(a.analysis?.policy_evaluations||a.live_evaluations||{}), rows=a.analysis?.reconciliation.rows||[];
     const blocked=a.events.filter(x=>x.status==='blocked').length;
     $('#agentKpis').innerHTML=[['已记录事件',a.events.length],['实时异常',a.live_anomalies?.length||0],['已阻止',blocked],['已确认事件',a.findings.length]].map(([label,n])=>`<div class="metric"><small>${label}</small><strong>${n}</strong></div>`).join('');
@@ -79,10 +88,11 @@
       const paused=monitorStatus==='paused', health=monitor.health||{};
       $('#agentMonitorTitle').textContent=paused?'监控已暂停':'后台监控中';
       $('#agentMonitorMeta').textContent=`范围：${monitor.scope} · 最近采集：${formatTime(monitor.last_event_at||monitor.last_scan_at)}`;
-      $('#agentMonitorHealth').textContent=monitor.last_error||`采集连接正常 · 可用空间 ${formatBytes(health.free_bytes||0)} (${health.free_percent||0}%)`;
+      $('#agentMonitorHealth').textContent=monitor.last_error||`${monitor.collector_kind==='desktop'?'系统快照采样 · 文件读写 / 浏览器 AI / MCP 尚未接入':'内部事件流'} · 可用空间 ${formatBytes(health.free_bytes||0)}`;
       $('#agentMonitorHealth').classList.toggle('inline-error',!!monitor.last_error||health.status==='critical');
       $('#agentMonitorPause').textContent=paused?'恢复监控':'暂停';
       $('#agentMonitorPause').dataset.action=paused?'resume':'pause';
+      if(monitor.desktop)renderDiscovery(monitor.desktop);
     }
     $('#agentInputSummary').innerHTML=`<b>输入与 Policy 已冻结</b><p>${a.events.length} 个行为 · ${a.claims.length} 条自述 · ${a.imports.length} 次导入</p><small class="agent-hash">Policy SHA256 · ${esc(a.policy_sha256||'UNKNOWN')}</small><div class="agent-actions"><button class="primary-action" data-agent-go="findings">审阅事件结果 →</button><button class="quiet-button" data-agent-go="reports">查看报告</button></div>`;
     $('#agentComparisonCard').hidden=!a.analysis;
@@ -102,7 +112,7 @@
     if(auditState.filter==='ALL'||auditState.filter==='SELF REPORT')for(const c of a.claims)items.push({at:c.time_start,order:3,html:`<article class="agent-list-row"><time>${formatTime(c.time_start)}</time><div><b>Agent 自述</b><p>${esc(c.statement)}</p><small>${esc(c.assertion)}</small></div><span class="state-badge">${esc(a.analysis?.reconciliation.rows.find(row=>row.claim_id===c.claim_id)?.status||'待分析')}</span></article>`});
     if(auditState.filter!=='SELF REPORT')for(const e of a.events){
       const evaluation=a.analysis?.policy_evaluations[e.id]||a.live_evaluations?.[e.id],reconciled=a.analysis?.reconciliation.event_status[e.id]||'UNKNOWN';
-      if(auditState.filter==='ALL'||(mapping[auditState.filter]||[]).includes(e.source_type)||auditState.filter==='VIOLATIONS'&&evaluation?.decision==='violation')items.push({at:e.timestamp,order:1,html:`<article class="agent-list-row"><time>${formatTime(e.timestamp)}</time><div><b>${esc(e.source_type)} · ${esc(e.action_type)}</b><p>${esc(e.resource)}</p><small>${esc(e.source_name)} · ${e.independent?'独立记录':'Agent 材料'} · ${e.status==='blocked'?'已阻止':'已记录'}</small></div><span class="state-badge ${evaluation?.decision==='violation'&&e.status!=='blocked'?'agent-alert':''}">${e.status==='blocked'?'已阻止':evaluation?.decision==='violation'?'异常':'正常'}</span></article>`});
+      if(auditState.filter==='ALL'||(mapping[auditState.filter]||[]).includes(e.source_type)||auditState.filter==='VIOLATIONS'&&evaluation?.decision==='violation')items.push({at:e.timestamp,order:1,html:`<article class="agent-list-row"><time>${formatTime(e.timestamp)}</time><div><b>${esc(e.source_type)} · ${esc(e.action_type)}</b><p>${esc(e.resource)}</p><small>${esc(e.source_name)} · ${e.independent?'独立记录':'Agent 材料'} · ${e.status==='blocked'?'已阻止':'已记录'}</small></div><span class="state-badge ${evaluation?.decision==='violation'&&e.status!=='blocked'?'agent-alert':''}">${e.status==='blocked'?'已阻止':evaluation?.decision==='violation'?'异常':evaluation?.decision==='allowed'?'规则内':'待评估'}</span></article>`});
       if(evaluation?.decision==='violation'&&e.status!=='blocked'&&['ALL','VIOLATIONS'].includes(auditState.filter))items.push({at:e.timestamp,order:2,html:`<article class="agent-list-row agent-derived-event"><time>${formatTime(e.timestamp)}</time><div><b>检测到策略异常</b><p>${esc(evaluation.boundaries.join(' · '))}</p><small>实时规则检查</small></div><span class="state-badge agent-alert">需审阅</span></article>`});
       if(['CONTRADICTED','OMITTED'].includes(reconciled)&&auditState.filter==='ALL')items.push({at:e.timestamp,order:4,html:`<article class="agent-list-row agent-derived-event"><time>${esc(e.timestamp)}</time><div><b>${reconciled==='CONTRADICTED'?'CONTRADICTION DETECTED':'OMISSION DETECTED'}</b><p>${esc(e.resource)}</p><small>Claim ↔ Evidence Reconciliation</small></div><span class="state-badge agent-alert">${esc(reconciled)}</span></article>`});
     }
@@ -111,6 +121,7 @@
   }
   $('#agentDemo').onclick=event=>action(event.currentTarget,'agentCreateError',async()=>{auditState.current=await call('/demo',{});await refreshAudit();go('run');});
   $('#agentMonitorStart').onclick=event=>action(event.currentTarget,'agentCreateError',async()=>{auditState.current=await call('/monitor/start',{});await refreshAudit();go('run');});
+  $('#agentDiscoveryRefresh').onclick=event=>action(event.currentTarget,'agentCreateError',discover);
   $('#agentMonitorPause').onclick=event=>action(event.currentTarget,'agentImportError',async()=>{const verb=event.currentTarget.dataset.action;auditState.current=await call(`/monitor/${auditState.current.id}/${verb}`,{});render();});
   $('#agentMonitorStop').onclick=event=>{if(!window.confirm('结束后将停止采集并生成分析结果。确定结束本次监控吗？'))return;action(event.currentTarget,'agentImportError',async()=>{clearInterval(auditState.monitorTimer);auditState.current=await call(`/monitor/${auditState.current.id}/stop`,{});render();go('findings');});};
   $('#agentAuditSelect').onchange=event=>{if(event.target.value)select(event.target.value).catch(e=>toast(e.message));};

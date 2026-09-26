@@ -22,6 +22,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core, 'DB', tmp_path / 'test.db')
     monkeypatch.setattr(core, 'LOCAL_DATA_ROOT', tmp_path)
     monkeypatch.setattr(reporting, 'EXPORTS', tmp_path / 'exports')
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: {
+        'platform': 'Darwin', 'applications': [{'name': 'Cursor', 'installed': True}],
+        'processes': {'42': {'pid': 42, 'parent_pid': 1, 'uid': 501, 'executable': 'Cursor', 'app': 'Cursor'}},
+        'connections': {}, 'errors': [], 'coverage': {'processes': 'sampling', 'network': 'sampling', 'file_io': 'not_connected'}})
     with TestClient(app.app, base_url='http://127.0.0.1:8000') as client:
         yield client
 
@@ -109,18 +113,22 @@ def test_demo_real_pipeline_and_capsule(client):
     assert not client.get('/api/v1/findings?mode=web3').json()['verified']
 
 
-def test_zero_config_monitor_records_runtime_events_and_stops_with_analysis(client):
+def test_zero_config_monitor_records_desktop_events_and_stops_with_analysis(client):
     response = client.post('/api/v1/agent-audit/monitor/start')
     assert response.status_code == 201, response.text
     started = response.json()
     assert started['monitor']['status'] == 'active'
-    assert started['identity']['name'] == '实时 Agent 自动监控'
+    assert started['identity']['name'] == '本机 AI 活动监控'
+    assert started['policy'] is None
+    assert started['monitor']['collector_kind'] == 'desktop'
     assert started['events'][0]['resource'] == '自动监控已启动'
     core.add_event('external-run', 'analysis', 'native_agent.page_observed', '只读浏览器已观察 https://example.test', {'turn': 1})
     response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/scan")
     assert response.status_code == 200, response.text
     scanned = response.json()
-    assert any(event['source_type'] == 'browser' and 'example.test' in event['resource'] for event in scanned['events'])
+    assert any(event['actor'] == 'Cursor' and 'PID 42' in event['resource'] for event in scanned['events'])
+    assert not any('example.test' in event['resource'] for event in scanned['events'])
+    assert len(scanned['events']) == len(started['events'])
     response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/stop")
     assert response.status_code == 200, response.text
     stopped = response.json()
@@ -134,19 +142,45 @@ def test_start_monitor_reuses_active_session(client):
     assert second['id'] == first['id']
 
 
-def test_monitor_pause_resume_health_and_live_anomalies(client):
+def test_monitor_pause_resume_health_and_live_anomalies(client, monkeypatch):
     started = client.post('/api/v1/agent-audit/monitor/start').json()
     aid = started['id']
     assert started['monitor']['health']['status'] == 'healthy'
     paused = client.post(f'/api/v1/agent-audit/monitor/{aid}/pause').json()
     assert paused['monitor']['status'] == 'paused'
-    core.add_event('external-run', 'analysis', 'native_agent.page_observed', '观察 https://example.test', {'turn': 2})
+    snapshot = audit.desktop_ai_monitor.snapshot()
+    snapshot['connections'] = {'42|socket': {'pid': 42, 'app': 'Cursor', 'host': 'example.test', 'port': 443}}
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: snapshot)
     audit.scan_active_monitors()
     assert not any('example.test' in event['resource'] for event in client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events'])
     resumed = client.post(f'/api/v1/agent-audit/monitor/{aid}/resume').json()
     assert resumed['monitor']['status'] == 'active'
     assert any('example.test' in event['resource'] for event in resumed['events'])
     assert resumed['monitor']['last_event_at']
+    assert not resumed['live_anomalies'] # No arbitrary desktop permission policy.
+
+
+def test_desktop_process_attribution_and_connection_parser():
+    monitor = audit.desktop_ai_monitor
+    processes = monitor.parse_processes('42 1 501 /Applications/Cursor.app/Contents/MacOS/Cursor\n43 42 501 /usr/bin/python3\n44 1 501 /tmp/cursor-token\n')
+    assert set(processes) == {'42', '43'}
+    assert processes['43']['app'] == 'Cursor'
+    connections = monitor.parse_connections('p43\nf10\nn127.0.0.1:50000->[::1]:443\nTST=ESTABLISHED\n', processes)
+    assert next(iter(connections.values()))['host'] == '::1'
+    current = {'processes': processes, 'connections': connections, 'coverage': {'processes': 'sampling'}}
+    events = monitor.events({}, current, core.utcnow(), 'session')
+    assert len(events) == 3
+    assert monitor.events(current, current, core.utcnow(), 'session') == []
+
+
+def test_desktop_failure_does_not_generate_false_exit_events(client, monkeypatch):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    failed = {'processes': {}, 'connections': {}, 'applications': [], 'errors': ['采集超时'], 'coverage': {'processes': 'unavailable'}}
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: failed)
+    result = audit.scan_monitor(started['id'])
+    assert len(result['events']) == len(started['events'])
+    assert result['monitor']['last_error'] == '采集超时'
+    assert '42' in result['monitor']['desktop']['processes']
 
 
 def test_monitor_auto_pauses_when_storage_is_critical(client, monkeypatch):

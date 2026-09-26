@@ -8,6 +8,7 @@
   let language = localStorage.getItem(storageKey) === 'en' ? 'en' : 'zh-CN';
   let applying = false;
   const patterns = [
+    [/^(\d+) 个可见进程$/, '$1 visible processes'],
     [/^(\d+) 个活动任务$/, '$1 active tasks'],
     [/^(\d+) 个运行中$/, '$1 running'],
     [/^(\d+) 个运行中 · 上限 (\d+)$/, '$1 running · limit $2'],

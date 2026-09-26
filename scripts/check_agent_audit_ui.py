@@ -31,14 +31,14 @@ with sync_playwright() as p:
     assert page.locator('#analysisForm').is_hidden()
     assert page.locator('.agent-scanner input').count() == 0
     page.locator('#languageToggle').click()
-    assert 'Start automatic monitoring' in page.locator('#agent-new').inner_text()
+    assert 'Start desktop monitoring' in page.locator('#agent-new').inner_text()
     page.locator('#languageToggle').click()
     page.wait_for_timeout(250)
     page.screenshot(path=str(OUT/'01-new.png'),full_page=True)
     page.locator('#agentMonitorStart').click()
     page.locator('#agentMonitorControl').wait_for(state='visible')
     assert '后台监控中' in page.locator('#agentMonitorControl').inner_text()
-    assert '采集连接正常' in page.locator('#agentMonitorControl').inner_text()
+    assert '系统快照采样' in page.locator('#agentMonitorControl').inner_text()
     assert '自动监控已启动' in page.locator('#agentTimeline').inner_text()
     assert page.locator('#agentKpis').inner_text().count('已记录事件') == 1
     page.locator('#agentMonitorPause').click()

@@ -37,12 +37,17 @@
   async function select(id) {auditState.current=await call(`/audits/${id}`);render();}
   const formatTime = value => value ? new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'medium'}).format(new Date(value)) : '尚无记录';
   const formatBytes = value => value >= 1073741824 ? `${(value/1073741824).toFixed(1)} GB` : `${Math.round(value/1048576)} MB`;
+  function coverageText(snapshot) {
+    const labels={sampling:'快照采样',partial:'部分可见',unavailable:'暂不可用',not_connected:'未接入'};
+    const coverage=snapshot?.coverage||{};
+    return [['进程','processes'],['TCP','network'],['打开文件','open_files']].map(([name,key])=>`${name}：${labels[coverage[key]]||'未接入'}`).join(' · ')+' · 实际文件读写 / 浏览器内 AI / MCP：未接入';
+  }
   function renderDiscovery(snapshot) {
     if(!snapshot)return;
     const apps=new Map((snapshot.applications||[]).map(app=>[app.name,{...app,count:0}]));
     for(const process of Object.values(snapshot.processes||{})){if(!apps.has(process.app))apps.set(process.app,{name:process.app,count:0});apps.get(process.app).count++;}
     $('#agentDesktopDiscovery').innerHTML=Array.from(apps.values()).map(app=>`<div class="agent-list-row"><b>${esc(app.name)}</b><span>${app.count?`${app.count} 个可见进程`:'已安装 · 未发现运行进程'}</span></div>`).join('')||empty('未发现可识别的 AI 软件。未识别的软件和浏览器内 AI 服务仍需适配。');
-    $('#agentDesktopDiscovery').innerHTML+=`<p class="target-hint">进程与 TCP：快照采样 · 文件读写 / 浏览器内 AI / MCP：未接入</p>${(snapshot.errors||[]).map(error=>`<p class="inline-error">${esc(error)}</p>`).join('')}`;
+    $('#agentDesktopDiscovery').innerHTML+=`<p class="target-hint">${esc(coverageText(snapshot))}</p>${(snapshot.errors||[]).map(error=>`<p class="inline-error">${esc(error)}</p>`).join('')}`;
   }
   async function discover(){auditState.discovery=await call('/desktop/discovery');renderDiscovery(auditState.discovery);}
   function monitorLoop() {clearInterval(auditState.monitorTimer);if(['active','paused'].includes(auditState.current?.monitor?.status))auditState.monitorTimer=setInterval(async()=>{try{auditState.current=await call(`/audits/${auditState.current.id}`);render();}catch(e){$('#agentMonitorHealth').textContent='状态刷新失败，将自动重试';}},2000);}
@@ -88,7 +93,7 @@
       const paused=monitorStatus==='paused', health=monitor.health||{};
       $('#agentMonitorTitle').textContent=paused?'监控已暂停':'后台监控中';
       $('#agentMonitorMeta').textContent=`范围：${monitor.scope} · 最近采集：${formatTime(monitor.last_event_at||monitor.last_scan_at)}`;
-      $('#agentMonitorHealth').textContent=monitor.last_error||`${monitor.collector_kind==='desktop'?'系统快照采样 · 文件读写 / 浏览器 AI / MCP 尚未接入':'内部事件流'} · 可用空间 ${formatBytes(health.free_bytes||0)}`;
+      $('#agentMonitorHealth').textContent=[monitor.last_error,monitor.collector_kind==='desktop'?coverageText(monitor.desktop):'内部事件流',`可用空间 ${formatBytes(health.free_bytes||0)}`].filter(Boolean).join(' · ');
       $('#agentMonitorHealth').classList.toggle('inline-error',!!monitor.last_error||health.status==='critical');
       $('#agentMonitorPause').textContent=paused?'恢复监控':'暂停';
       $('#agentMonitorPause').dataset.action=paused?'resume':'pause';

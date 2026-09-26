@@ -78,6 +78,26 @@ def run(command):
     return result
 
 
+def parse_open_files(output, processes):
+    """Observe regular file descriptors; access mode is not proof of an I/O operation."""
+    files, pid, descriptor, access, kind = {}, None, None, None, None
+    for line in output.splitlines():
+        if line.startswith('p'):
+            pid, descriptor, access, kind = line[1:], None, None, None
+        elif line.startswith('f'):
+            descriptor, access, kind = line[1:], None, None
+        elif line.startswith('a'):
+            access = line[1:]
+        elif line.startswith('t'):
+            kind = line[1:]
+        elif line.startswith('n') and pid in processes and kind == 'REG' and descriptor and descriptor.isdigit() and line[1:].startswith('/'):
+            path = line[1:]
+            files[f'{pid}|{descriptor}|{path}'] = {
+                'pid': int(pid), 'app': processes[pid]['app'],
+                'path': path, 'access': access or 'unknown'}
+    return files
+
+
 def installed_apps():
     found = {}
     for root in (Path('/Applications'), Path.home() / 'Applications'):
@@ -97,10 +117,10 @@ def installed_apps():
 
 
 def snapshot():
-    result = {'platform': platform.system(), 'processes': {}, 'connections': {},
+    result = {'platform': platform.system(), 'processes': {}, 'connections': {}, 'open_files': {},
               'applications': [], 'errors': [], 'coverage': {
                   'processes': 'unavailable', 'network': 'unavailable',
-                  'file_io': 'not_connected', 'mcp': 'not_connected',
+                  'file_io': 'not_connected', 'open_files': 'unavailable', 'mcp': 'not_connected',
                   'browser_ai': 'not_connected', 'prompt_content': 'not_collected'}}
     if platform.system() != 'Darwin':
         result['errors'].append('本机采集器目前支持 macOS')
@@ -115,6 +135,7 @@ def snapshot():
         result['coverage']['processes'] = 'sampling'
         if not result['processes']:
             result['coverage']['network'] = 'sampling'
+            result['coverage']['open_files'] = 'sampling'
             return result
         sockets = run(['/usr/sbin/lsof', '-nP', '-a', '-p', ','.join(result['processes']), '-iTCP', '-FpnT'])
         if sockets.returncode not in (0, 1) or sockets.stderr.strip():
@@ -123,6 +144,11 @@ def snapshot():
         else:
             result['coverage']['network'] = 'sampling'
         result['connections'] = parse_connections(sockets.stdout, result['processes'])
+        files = run(['/usr/sbin/lsof', '-nP', '-a', '-p', ','.join(result['processes']), '-Fpfatn'])
+        result['coverage']['open_files'] = 'partial' if files.returncode not in (0, 1) or files.stderr.strip() else 'sampling'
+        if result['coverage']['open_files'] == 'partial':
+            result['errors'].append('部分打开文件不可见；仅记录当前用户可读取的描述符')
+        result['open_files'] = parse_open_files(files.stdout, result['processes'])
     except (OSError, subprocess.TimeoutExpired):
         result['errors'].append('本机采集暂时不可用，将在下一轮重试')
     return result
@@ -134,13 +160,13 @@ def events(previous, current, now, session):
         if previous.get('processes', {}).get(pid) == process:
             continue
         observations.append({'timestamp': now, 'actor': process['app'], 'session_id': session,
-            'source_type': 'system', 'action_type': 'unknown', 'status': 'observed',
+            'source_type': 'process', 'action_type': 'unknown', 'status': 'observed',
             'resource': f"发现运行进程：{process['app']} · {process['executable']} · PID {pid}",
             'command_category': 'process_observed'})
     for pid, process in previous.get('processes', {}).items():
         if current['coverage']['processes'] == 'sampling' and pid not in current['processes']:
             observations.append({'timestamp': now, 'actor': process['app'], 'session_id': session,
-                'source_type': 'system', 'action_type': 'unknown', 'status': 'observed',
+                'source_type': 'process', 'action_type': 'unknown', 'status': 'observed',
                 'resource': f"进程已不在快照中：{process['app']} · PID {pid}",
                 'command_category': 'process_disappeared'})
     for key, connection in current['connections'].items():
@@ -151,4 +177,13 @@ def events(previous, current, now, session):
             'network_host': connection['host'], 'network_port': connection['port'],
             'resource': f"{connection['app']} · PID {connection['pid']} · TCP {connection['host']}:{connection['port']}",
             'command_category': 'connection_observed'})
+    for key, item in current.get('open_files', {}).items():
+        if previous.get('open_files', {}).get(key) == item:
+            continue
+        access = {'r': '可读', 'w': '可写', 'u': '可读写'}.get(item['access'], '访问模式未知')
+        observations.append({'timestamp': now, 'actor': item['app'], 'session_id': session,
+            'source_type': 'filesystem', 'action_type': 'unknown', 'status': 'observed',
+            'filesystem_path': item['path'],
+            'resource': f"观察到打开文件：{item['app']} · PID {item['pid']} · {access} · {item['path']}",
+            'command_category': 'open_file_observed'})
     return observations

@@ -183,6 +183,22 @@ def test_desktop_failure_does_not_generate_false_exit_events(client, monkeypatch
     assert '42' in result['monitor']['desktop']['processes']
 
 
+def test_open_files_are_observations_not_read_write_claims():
+    monitor = audit.desktop_ai_monitor
+    processes = {'42': {'app': 'Cursor'}}
+    output = 'p42\nfcwd\ntDIR\nn/work\nf7\nau\ntREG\nn/work/example.py\nf8\nar\ntIPv4\nnlocalhost:443\np99\nf4\naw\ntREG\nn/other/file\n'
+    files = monitor.parse_open_files(output, processes)
+    assert list(files) == ['42|7|/work/example.py']
+    current = {'processes': {}, 'connections': {}, 'open_files': files, 'coverage': {'processes': 'sampling'}}
+    observed = monitor.events({}, current, core.utcnow(), 'session')
+    assert len(observed) == 1
+    assert observed[0]['source_type'] == 'filesystem'
+    assert observed[0]['action_type'] == 'unknown'
+    assert observed[0]['status'] == 'observed'
+    assert observed[0]['filesystem_path'] == '/work/example.py'
+    assert monitor.events(current, current, core.utcnow(), 'session') == []
+
+
 def test_monitor_auto_pauses_when_storage_is_critical(client, monkeypatch):
     started = client.post('/api/v1/agent-audit/monitor/start').json()
     monkeypatch.setattr(audit.shutil, 'disk_usage', lambda _: type('Usage', (), {'total': 1000, 'used': 995, 'free': 5})())

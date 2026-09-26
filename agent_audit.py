@@ -401,6 +401,9 @@ def scan_monitor(audit_id: str, allow_paused=False):
             else:
                 current['processes'] = previous.get('processes', {})
                 current['connections'] = previous.get('connections', {})
+            for key, coverage_key in [('connections', 'network'), ('open_files', 'open_files')]:
+                if current['coverage'].get(coverage_key, 'unavailable') == 'unavailable':
+                    current[key] = previous.get(key, {})
             with core.connect() as db:
                 db.execute('UPDATE agent_monitors SET collector_state=?,last_scan_at=?,last_event_at=COALESCE(?,last_event_at),last_error=? WHERE audit_id=?',
                            (core.dump(current), now, now if observed else None, '；'.join(current['errors']) or None, audit_id))
@@ -915,7 +918,7 @@ def get_audit(audit_id: str):
         monitor_view['health'] = storage_health()
         desktop = monitor_view['collector_kind'] == 'desktop'
         monitor_view['source'] = 'macOS 本机 AI 活动采集器' if desktop else 'Fieldwork 后台事件流'
-        monitor_view['scope'] = '本机可识别 AI 软件及其子进程、可见 TCP 连接' if desktop else '旧记录：Fieldwork 内部运行事件'
+        monitor_view['scope'] = '本机可识别 AI 软件及其子进程、可见 TCP 连接与打开文件' if desktop else '旧记录：Fieldwork 内部运行事件'
         monitor_view['desktop'] = core.load(monitor_view.pop('collector_state'), {}) if desktop else None
     live_anomalies = [{'event_id': event['id'], **live_evaluations[event['id']]} for event in events
                       if live_evaluations[event['id']]['decision'] == 'violation' and event['status'] in SUCCESS]

@@ -31,6 +31,7 @@ import final_core as core
 import reporting
 import desktop_ai_monitor
 import application_ai_monitor
+import browser_ai_bridge
 
 router = APIRouter(prefix='/api/v1/agent-audit', tags=['AI Agent Audit'])
 SOURCES = {'agent_trace', 'self_report', 'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
@@ -208,9 +209,11 @@ def init_agent_audit_db():
         columns = {row['name'] for row in db.execute('PRAGMA table_info(agent_monitors)')}
         for name, definition in {'paused_at': 'TEXT', 'last_error': 'TEXT', 'last_event_at': 'TEXT',
                                  'collector_kind': "TEXT NOT NULL DEFAULT 'fieldwork'",
-                                 'collector_state': "TEXT NOT NULL DEFAULT '{}'"}.items():
+                                 'collector_state': "TEXT NOT NULL DEFAULT '{}'",
+                                 'browser_accept_after': 'TEXT'}.items():
             if name not in columns:
                 db.execute(f'ALTER TABLE agent_monitors ADD COLUMN {name} {definition}')
+        browser_ai_bridge.init_db(db)
 
 
 def audit_row(db, audit_id):
@@ -497,6 +500,11 @@ def desktop_discovery():
     current['coverage']['tool_calls'] = 'application_log' if any(s['status'] == 'available' for s in current['application_logs']['sources']) else 'waiting'
     current['coverage']['mcp'] = current['coverage']['tool_calls']
     current['errors'].extend(current['application_logs']['errors'])
+    with core.connect() as db:
+        monitor = db.execute("SELECT audit_id FROM agent_monitors WHERE collector_kind='desktop' AND status IN ('active','paused') ORDER BY started_at DESC LIMIT 1").fetchone()
+        if monitor:
+            current['browser'] = browser_ai_bridge.view(db, monitor['audit_id'])
+            current['coverage']['browser_ai'] = 'browser_metadata' if current['browser']['status'] == 'connected' else 'not_connected'
     return current
 
 
@@ -529,7 +537,7 @@ def resume_monitor(audit_id: str):
         if monitor['status'] == 'paused':
             collector_state = core.load(monitor['collector_state'], {})
             collector_state['_reset_application_logs'] = True
-            db.execute("UPDATE agent_monitors SET status='active',paused_at=NULL,last_error=NULL,collector_state=? WHERE audit_id=?", (core.dump(collector_state), audit_id))
+            db.execute("UPDATE agent_monitors SET status='active',paused_at=NULL,last_error=NULL,collector_state=?,browser_accept_after=? WHERE audit_id=?", (core.dump(collector_state), core.utcnow(), audit_id))
     return scan_monitor(audit_id)
 
 
@@ -544,6 +552,7 @@ def stop_monitor(audit_id: str):
         if monitor['status'] in {'active', 'paused'}:
             now = core.utcnow()
             db.execute("UPDATE agent_monitors SET status='stopped',stopped_at=?,last_scan_at=? WHERE audit_id=?", (now, now, audit_id))
+            db.execute("UPDATE agent_browser_connections SET status='revoked' WHERE audit_id=?", (audit_id,))
     if not result['analysis']:
         result = analyze(audit_id)
     return result
@@ -958,6 +967,9 @@ def get_audit(audit_id: str):
         if desktop:
             monitor_view['desktop'].pop('application_log_state', None)
             monitor_view['desktop'].pop('_reset_application_logs', None)
+            with core.connect() as db:
+                monitor_view['browser'] = browser_ai_bridge.view(db, audit_id)
+            monitor_view['desktop'].setdefault('coverage', {})['browser_ai'] = 'browser_metadata' if monitor_view['browser']['status'] == 'connected' else 'not_connected'
     live_anomalies = [{'event_id': event['id'], **live_evaluations[event['id']]} for event in events
                       if live_evaluations[event['id']]['decision'] == 'violation' and event['status'] in SUCCESS]
     return reporting.redact_structure({'id': audit_id, 'run_id': audit['run_id'], 'identity': snapshot['identity'], 'policy': snapshot['policy'], 'policy_sha256': audit['policy_sha256'], 'demo': bool(audit['demo']), 'monitor': monitor_view, 'events': presented_events, 'claims': claims, 'self_report_complete': complete, 'analysis': result, 'live_evaluations': live_evaluations, 'live_anomalies': live_anomalies, 'reconciliation_record': dict(reconciliation_record) if reconciliation_record else None, 'candidates': candidates, 'findings': findings, 'imports': core.load(audit['input_manifest'])['imports'], 'collector_attestations': attestations, 'evidence_manifest': evidence_manifest, 'metrics': metrics(events, claims, result, findings)})

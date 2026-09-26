@@ -27,7 +27,7 @@ def client(tmp_path, monkeypatch):
         'platform': 'Darwin', 'applications': [{'name': 'Cursor', 'installed': True}],
         'processes': {'42': {'pid': 42, 'parent_pid': 1, 'uid': 501, 'executable': 'Cursor', 'app': 'Cursor'}},
         'connections': {}, 'errors': [], 'coverage': {'processes': 'sampling', 'network': 'sampling', 'file_io': 'not_connected'}})
-    with TestClient(app.app, base_url='http://127.0.0.1:8000') as client:
+    with TestClient(app.app, base_url='http://127.0.0.1:8000', client=('127.0.0.1',50000)) as client:
         yield client
 
 
@@ -255,6 +255,65 @@ def test_monitor_app_log_is_automatic_and_never_independent(client, tmp_path):
     assert len(resumed['events']) == len(result['events'])
     stopped = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/stop").json()
     assert not stopped['findings']
+
+
+def browser_pair(client, aid):
+    response = client.post(f'/api/v1/agent-audit/monitor/{aid}/browser/package')
+    assert response.status_code == 200, response.text
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        config = json.loads(archive.read('config.js').decode().split(' = ', 1)[1].rstrip(';'))
+        manifest = json.loads(archive.read('manifest.json'))
+        assert '<all_urls>' not in json.dumps(manifest)
+        assert not manifest.get('content_scripts')
+        assert 'webRequest' in manifest['optional_permissions']
+    return config
+
+
+def test_browser_pair_metadata_privacy_retry_and_revoke(client):
+    aid = client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    config = browser_pair(client, aid)
+    headers = {'Authorization': 'Bearer ' + config['token'], 'Origin': 'chrome-extension://' + 'a' * 32}
+    batch = {'sequence': 1, 'events': [{'timestamp': core.utcnow(), 'host': 'chatgpt.com',
+        'method': 'POST', 'kind': 'request', 'phase': 'completed', 'status_code': 200}]}
+    endpoint = '/api/v1/agent-audit/browser/events'
+    assert client.post(endpoint, json=batch).status_code == 401
+    accepted = client.post(endpoint, json=batch, headers=headers)
+    assert accepted.status_code == 200 and accepted.json()['accepted'] == 1
+    assert client.post(endpoint, json=batch, headers=headers).json()['duplicate'] is True
+    result = client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    event = next(e for e in result['events'] if e['source_type'] == 'browser')
+    assert event['actor'] == 'ChatGPT (Browser)' and not event['independent']
+    assert not event['authenticity_verified'] and event['status'] == 'observed'
+    assert result['monitor']['browser']['status'] == 'connected'
+    assert config['token'] not in json.dumps(result)
+    private = copy.deepcopy(batch)
+    private['sequence'] = 2
+    private['events'][0]['url'] = 'https://chatgpt.com/private?token=secret'
+    assert client.post(endpoint, json=private, headers=headers).status_code == 422
+    private['events'][0].pop('url')
+    private['events'][0]['host'] = 'private.example'
+    assert client.post(endpoint, json=private, headers=headers).status_code == 422
+    assert client.post(endpoint, json=batch, headers={**headers, 'Origin': 'https://evil.example'}).status_code == 403
+    revoked = client.post(f"/api/v1/agent-audit/monitor/{aid}/browser/{config['connectionId']}/revoke")
+    assert revoked.status_code == 200
+    assert client.post(endpoint, json=batch, headers=headers).status_code == 401
+
+
+def test_browser_pause_stop_and_package_origin_boundaries(client):
+    aid = client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/browser/package', headers={'Origin':'https://evil.example'}).status_code == 403
+    config = browser_pair(client, aid)
+    headers = {'Authorization': 'Bearer ' + config['token']}
+    client.post(f'/api/v1/agent-audit/monitor/{aid}/pause')
+    paused_event = {'timestamp': core.utcnow(), 'host':'claude.ai', 'method':'POST', 'kind':'request', 'phase':'started'}
+    assert client.post('/api/v1/agent-audit/browser/events', json={'sequence':1,'events':[]}, headers=headers).status_code == 409
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/browser/package').status_code == 409
+    client.post(f'/api/v1/agent-audit/monitor/{aid}/resume')
+    assert client.post('/api/v1/agent-audit/browser/events', json={'sequence':1,'events':[]}, headers=headers).status_code == 200
+    old = client.post('/api/v1/agent-audit/browser/events', json={'sequence':2,'events':[paused_event]}, headers=headers)
+    assert old.status_code == 200 and old.json()['dropped'] == 1 and old.json()['accepted'] == 0
+    client.post(f'/api/v1/agent-audit/monitor/{aid}/stop')
+    assert client.post('/api/v1/agent-audit/browser/events', json={'sequence':2,'events':[]}, headers=headers).status_code == 401
 
 
 def test_monitor_auto_pauses_when_storage_is_critical(client, monkeypatch):

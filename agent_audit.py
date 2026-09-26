@@ -701,6 +701,17 @@ def import_events(audit_id: str, body: ImportInput):
     return get_audit(audit_id)
 
 
+@router.get('/audits/{audit_id}/collectors/{collector_id}/receipts/{sequence}')
+def collector_receipt(audit_id: str, collector_id: str, sequence: int):
+    with core.connect() as db:
+        audit_row(db, audit_id)
+        row = db.execute('SELECT audit_id,collector_id,sequence,nonce,payload_sha256,signature FROM agent_signed_imports WHERE audit_id=? AND collector_id=? AND sequence=?',
+                         (audit_id, collector_id, sequence)).fetchone()
+        if not row:
+            raise HTTPException(404, '签名批次尚未提交')
+        return dict(row)
+
+
 def within(path, roots):
     path = posixpath.normpath(path)
     return path.startswith('/') and any(path == posixpath.normpath(root) or path.startswith(posixpath.normpath(root).rstrip('/') + '/') for root in roots if root.startswith('/'))

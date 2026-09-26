@@ -80,6 +80,23 @@ def signed_body(private, collector, aid, body, sequence=1, nonce='0123456789abcd
     return value
 
 
+def test_signed_receipt_confirms_commit_without_duplicate_import(client, fixture):
+    aid = create(client, fixture)
+    other = create(client, fixture)
+    private, collector = register_collector(client)
+    body = signed_body(private, collector, aid, fixture['imports'][0])
+    route = f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
+    assert client.get(route).status_code == 404
+    imported = upload(client, aid, body)
+    receipt = client.get(route)
+    assert receipt.status_code == 200
+    assert receipt.json() == dict(audit_id=aid,collector_id=collector['id'],sequence=1,
+        nonce=body['nonce'],signature=body['signature'],payload_sha256=hashlib.sha256(body['content'].encode()).hexdigest())
+    assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=body).status_code == 409
+    assert len(client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events']) == len(imported['events'])
+    assert client.get(route.replace(aid,other)).status_code == 404
+
+
 def test_demo_real_pipeline_and_capsule(client):
     response = client.post('/api/v1/agent-audit/demo')
     assert response.status_code == 201, response.text

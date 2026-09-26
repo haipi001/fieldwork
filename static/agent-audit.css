@@ -121,6 +121,10 @@ body[data-mode="agent_audit"] [data-workspace="new"] .truth-chain {font-size:11p
 #agent-new .agent-card h2 {font-size:19px;}
 #agentDesktopDiscovery .agent-list-row {padding:12px 0; font-size:14px;}
 #agentDesktopDiscovery .target-hint {font-size:12px; line-height:1.7; margin:12px 0 0;}
+.agent-timeline-filters {display:flex; flex-wrap:wrap; gap:8px; max-width:100%;}
+.agent-timeline-filters select {width:auto; max-width:100%; min-width:130px; padding:8px 10px;}
+#agentTimelineCount {font-size:12px; margin:0 0 8px;}
+#agentTimelineMore {margin-top:16px;}
 #agent-new .agent-demo-option {padding:12px 18px; margin-top:16px; font-size:13px;}
 @media(max-width:950px) {
   body[data-mode="agent_audit"] [data-workspace="new"] .hero-grid {grid-template-columns:1fr; gap:18px;}

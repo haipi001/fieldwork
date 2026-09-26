@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import html
 import json
+import logging
 import posixpath
 import re
 import shutil
@@ -379,8 +380,9 @@ def scan_monitor(audit_id: str, allow_paused=False):
             return get_audit(audit_id)
         audit = audit_row(db, audit_id)
         identity = core.load(audit['identity_json'])
-        rows = db.execute('SELECT * FROM run_events_v2 WHERE id>? AND run_id!=? ORDER BY id LIMIT 500',
-                          (monitor['event_cursor'], audit['run_id'])).fetchall()
+        rows = [] if monitor['collector_kind'] == 'desktop' else db.execute(
+            'SELECT * FROM run_events_v2 WHERE id>? AND run_id!=? ORDER BY id LIMIT 500',
+            (monitor['event_cursor'], audit['run_id'])).fetchall()
     health = storage_health()
     if health['status'] == 'critical':
         message = '存储空间不足，监控已自动暂停。请释放至少 512 MB 后恢复。'
@@ -404,6 +406,8 @@ def scan_monitor(audit_id: str, allow_paused=False):
             for key, coverage_key in [('connections', 'network'), ('open_files', 'open_files')]:
                 if current['coverage'].get(coverage_key, 'unavailable') == 'unavailable':
                     current[key] = previous.get(key, {})
+                elif current['coverage'].get(coverage_key) == 'partial':
+                    current[key] = {**previous.get(key, {}), **current.get(key, {})}
             with core.connect() as db:
                 db.execute('UPDATE agent_monitors SET collector_state=?,last_scan_at=?,last_event_at=COALESCE(?,last_event_at),last_error=? WHERE audit_id=?',
                            (core.dump(current), now, now if observed else None, '；'.join(current['errors']) or None, audit_id))
@@ -428,7 +432,14 @@ def scan_active_monitors():
     with core.connect() as db:
         ids = [row['audit_id'] for row in db.execute("SELECT audit_id FROM agent_monitors WHERE status='active'")]
     for audit_id in ids:
-        scan_monitor(audit_id)
+        try:
+            scan_monitor(audit_id)
+        except Exception as error:
+            # One failing session must not stop other collectors or fail silently.
+            logging.getLogger(__name__).error('Monitor %s failed: %s', audit_id, type(error).__name__)
+            with core.connect() as db:
+                db.execute("UPDATE agent_monitors SET status='paused',paused_at=?,last_error=? WHERE audit_id=? AND status='active'",
+                    (core.utcnow(), f'采集异常，监控已暂停：{type(error).__name__}。可恢复重试。', audit_id))
     return ids
 
 
@@ -436,8 +447,8 @@ async def monitor_worker():
     while True:
         try:
             await asyncio.to_thread(scan_active_monitors)
-        except Exception:
-            pass
+        except Exception as error:
+            logging.getLogger(__name__).error('Monitor scheduler failed: %s', type(error).__name__)
         await asyncio.sleep(2)
 
 
@@ -555,8 +566,13 @@ def normalize_event(raw, body, identity, signed=False):
             timestamp(time)
         except ValueError:
             raise HTTPException(422, '事件 timestamp 需要 ISO 8601 时区')
-    keys = ['actor', 'tool_name', 'command_category', 'resource', 'destination', 'filesystem_path', 'network_host', 'request_method', 'input_hash', 'output_hash', 'session_id', 'mcp_server', 'privilege']
+    keys = ['actor', 'tool_name', 'command_category', 'resource', 'destination', 'filesystem_path', 'network_host', 'request_method', 'input_hash', 'output_hash', 'session_id', 'mcp_server', 'privilege', 'process_started_at', 'process_executable', 'attribution_method']
     value = {key: str(raw.get(key) or '')[:5000] for key in keys}
+    for key in ('process_id', 'parent_process_id'):
+        number = raw.get(key)
+        if number is not None and (type(number) is not int or number < 0 or number > 2147483647):
+            raise HTTPException(422, f'{key} 必须是非负进程 ID')
+        value[key] = number
     if raw.get('network_port') is not None and (type(raw['network_port']) is not int or not 1 <= raw['network_port'] <= 65535):
         raise HTTPException(422, 'network_port 必须是 1–65535 的整数')
     value.update(id=core.uid('agent-event'), timestamp=time, source_type=source, action_type=action,

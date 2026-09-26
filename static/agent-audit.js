@@ -1,6 +1,6 @@
 /* Domain-specific UI; the existing mode router and five workspaces remain shared. */
 (() => {
-  const auditState = {items: [], current: null, collectors: [], filter: 'ALL', monitorTimer: null, discovery: null};
+  const auditState = {items: [], current: null, collectors: [], filter: 'ALL', actor: '', timelineLimit: 100, monitorTimer: null, discovery: null, monitorRevision: 0, actionDepth: 0, pollPending: false};
   const workspace = name => document.querySelector(`[data-workspace="${name}"]`);
   const originalHero = workspace('new').querySelector('.hero-grid').innerHTML;
   const panels = {};
@@ -24,7 +24,7 @@
     <div class="agent-actions"><button type="submit" id="agentImportButton" class="primary-action">导入材料 ↗</button><button type="button" id="agentGenerateReport" class="text-action">用模型生成自述</button><button type="button" id="agentAnalyze" class="quiet-button" disabled>开始确定性分析</button></div><p id="agentImportError" class="inline-error" role="alert"></p></form></details>
     <div id="agentInputSummary" class="agent-card" hidden></div>
     <section id="agentComparisonCard" class="agent-card" hidden><div class="section-heading"><div><h2>Agent 自述与证据</h2><p>分析完成后逐条核对自述与独立证据。</p></div></div><div id="agentComparison"></div></section>
-    <section class="agent-card"><div class="section-heading"><h2>行为时间线</h2><select id="agentEventFilter" aria-label="筛选事件">${['ALL','AGENT','TOOLS','PROCESS','FILES','NETWORK','SELF REPORT','VIOLATIONS'].map(x=>`<option>${x}</option>`).join('')}</select></div><div id="agentTimeline"></div></section>`;
+    <section class="agent-card"><div class="section-heading"><h2>行为时间线</h2><div class="agent-timeline-filters"><select id="agentActorFilter" aria-label="筛选软件"><option value="">全部软件</option></select><select id="agentEventFilter" aria-label="筛选事件">${['ALL','AGENT','TOOLS','PROCESS','FILES','NETWORK','SELF REPORT','VIOLATIONS'].map(x=>`<option>${x}</option>`).join('')}</select></div></div><p id="agentTimelineCount" class="target-hint"></p><div id="agentTimeline"></div><button id="agentTimelineMore" class="quiet-button" hidden>查看更早记录</button></section>`;
   panels.findings.innerHTML = `${workflow('review')}<div class="page-intro"><div><p class="eyebrow">CANONICAL INCIDENTS</p><h1>事件结果</h1><p>先看经过独立验证的结论，再处理仍需验证的候选。</p></div></div><section class="agent-card agent-card--result"><div class="section-heading"><div><h2>已确认事件</h2><p>只包含独立证据能够支持的事实。</p></div><span id="agentFindingCount"></span></div><div id="agentFindings"></div></section><section class="agent-card"><div class="section-heading"><div><h2>待验证事件</h2><p>候选不会自动进入报告结论。</p></div><span id="agentCandidateCount"></span></div><div id="agentCandidates"></div></section><p class="inline-error" id="agentVerifyError" role="alert"></p>`;
   panels.reports.innerHTML = `<div class="page-intro"><div><p class="eyebrow">AI INCIDENT REPORT</p><h1>报告中心</h1><p>保留未知项、反证与材料哈希。模拟数据始终标记为模拟。</p></div></div><div class="agent-actions agent-card"><button id="agentPreview" class="primary-action">生成预览</button><div id="agentDownloads"></div></div><pre id="agentReportPreview" class="agent-report">选择审计后生成报告。</pre><section class="agent-card"><h2>研究指标</h2><div id="agentMetrics"></div></section>`;
   panels.settings.innerHTML = `<div class="page-intro"><div><p class="eyebrow">AUDIT CAPABILITIES</p><h1>设置与工具</h1><p>确定性审计可独立运行，无需模型 API。</p></div></div><div id="agentParsers" class="agent-card"></div><section class="agent-card"><div class="section-heading"><div><h2>可信采集器</h2><p>只登记 Ed25519 公钥；Fieldwork 不接收或保存私钥。</p></div></div><form id="agentCollectorForm"><div class="agent-form-grid">${field('采集器名称','name','required placeholder="Local OS Collector"')}${field('Key ID','key_id','required placeholder="local-os-1"')}${field('公钥（Base64）','public_key','required placeholder="32 字节 Ed25519 公钥"')}</div><button class="quiet-button" type="submit">登记采集器</button><p id="agentCollectorError" class="inline-error" role="alert"></p></form><div id="agentCollectors"></div></section><section class="agent-card"><h2>记录与信任边界</h2><p>签名采集器材料会校验 Ed25519 签名、递增序号和一次性 nonce；操作员声明材料保留为较低可信度。Agent 自述和模型建议不能单独确认事件。</p><p>SHA256 检测导入后的修改。本模式不启动 Agent、不执行导入命令、不联网复现，也不修改第三方系统。</p><p>模型配置沿用 Fieldwork 的「传统 SRC → 设置与工具」。</p></section>`;
@@ -32,15 +32,17 @@
   const call = (path, body) => api('/api/v1/agent-audit' + path, body === undefined ? {} : {method:'POST',body:JSON.stringify(body)});
   async function action(button, errorId, fn) {
     if(button.disabled)return;button.disabled=true;const error=document.getElementById(errorId);if(error)error.textContent='';
-    try { await fn(); } catch(e) { if(error)error.textContent=e.message;else toast(e.message); } finally {button.disabled=false;}
+    auditState.monitorRevision++;auditState.actionDepth++;clearInterval(auditState.monitorTimer);
+    try { await fn(); } catch(e) { if(error)error.textContent=e.message;else toast(e.message); } finally {button.disabled=false;auditState.actionDepth--;monitorLoop();}
   }
-  async function select(id) {auditState.current=await call(`/audits/${id}`);render();}
+  async function select(id) {const revision=++auditState.monitorRevision;clearInterval(auditState.monitorTimer);const selected=await call(`/audits/${id}`);if(revision!==auditState.monitorRevision)return;auditState.actor='';auditState.timelineLimit=100;auditState.current=selected;render();}
   const formatTime = value => value ? new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'medium'}).format(new Date(value)) : '尚无记录';
   const formatBytes = value => value >= 1073741824 ? `${(value/1073741824).toFixed(1)} GB` : `${Math.round(value/1048576)} MB`;
+  const translated = value => window.FIELDWORK_I18N?.t(value)||value;
   function coverageText(snapshot) {
     const labels={sampling:'快照采样',partial:'部分可见',unavailable:'暂不可用',not_connected:'未接入'};
     const coverage=snapshot?.coverage||{};
-    return [['进程','processes'],['TCP','network'],['打开文件','open_files']].map(([name,key])=>`${name}：${labels[coverage[key]]||'未接入'}`).join(' · ')+' · 实际文件读写 / 浏览器内 AI / MCP：未接入';
+    return [['进程','processes'],['TCP','network'],['打开文件','open_files']].map(([name,key])=>`${translated(name)}: ${translated(labels[coverage[key]]||'未接入')}`).join(' · ')+' · '+translated('实际文件读写 / 浏览器内 AI / MCP：未接入');
   }
   function renderDiscovery(snapshot) {
     if(!snapshot)return;
@@ -50,7 +52,17 @@
     $('#agentDesktopDiscovery').innerHTML+=`<p class="target-hint">${esc(coverageText(snapshot))}</p>${(snapshot.errors||[]).map(error=>`<p class="inline-error">${esc(error)}</p>`).join('')}`;
   }
   async function discover(){auditState.discovery=await call('/desktop/discovery');renderDiscovery(auditState.discovery);}
-  function monitorLoop() {clearInterval(auditState.monitorTimer);if(['active','paused'].includes(auditState.current?.monitor?.status))auditState.monitorTimer=setInterval(async()=>{try{auditState.current=await call(`/audits/${auditState.current.id}`);render();}catch(e){$('#agentMonitorHealth').textContent='状态刷新失败，将自动重试';}},2000);}
+  function monitorLoop() {
+    clearInterval(auditState.monitorTimer);
+    if(auditState.actionDepth||!['active','paused'].includes(auditState.current?.monitor?.status))return;
+    auditState.monitorTimer=setInterval(async()=>{
+      if(auditState.pollPending||auditState.actionDepth)return;
+      const id=auditState.current.id,revision=auditState.monitorRevision;auditState.pollPending=true;
+      try{const updated=await call(`/audits/${id}`);if(revision===auditState.monitorRevision&&id===auditState.current?.id&&!auditState.actionDepth){auditState.current=updated;render();}}
+      catch(e){if(revision===auditState.monitorRevision)$('#agentMonitorHealth').textContent='状态刷新失败，将自动重试';}
+      finally{auditState.pollPending=false;}
+    },2000);
+  }
   function applyMode() {
     const active=state.mode==='agent_audit';
     for(const panel of Object.values(panels))panel.hidden=!active;
@@ -92,8 +104,8 @@
     if(monitor&&monitorStatus!=='stopped'){
       const paused=monitorStatus==='paused', health=monitor.health||{};
       $('#agentMonitorTitle').textContent=paused?'监控已暂停':'后台监控中';
-      $('#agentMonitorMeta').textContent=`范围：${monitor.scope} · 最近采集：${formatTime(monitor.last_event_at||monitor.last_scan_at)}`;
-      $('#agentMonitorHealth').textContent=[monitor.last_error,monitor.collector_kind==='desktop'?coverageText(monitor.desktop):'内部事件流',`可用空间 ${formatBytes(health.free_bytes||0)}`].filter(Boolean).join(' · ');
+      $('#agentMonitorMeta').textContent=`${translated('范围')}: ${translated(monitor.scope)} · ${translated('最近采集')}: ${formatTime(monitor.last_event_at||monitor.last_scan_at)}`;
+      $('#agentMonitorHealth').textContent=[monitor.last_error,monitor.collector_kind==='desktop'?coverageText(monitor.desktop):translated('内部事件流'),`${translated('可用空间')} ${formatBytes(health.free_bytes||0)}`].filter(Boolean).join(' · ');
       $('#agentMonitorHealth').classList.toggle('inline-error',!!monitor.last_error||health.status==='critical');
       $('#agentMonitorPause').textContent=paused?'恢复监控':'暂停';
       $('#agentMonitorPause').dataset.action=paused?'resume':'pause';
@@ -107,22 +119,31 @@
     $('#agentCandidates').innerHTML=pending.map(c=>{const e=a.events.find(x=>x.id===c.event_id),status=a.analysis?.reconciliation.event_status[c.event_id]||'UNKNOWN';return `<article class="agent-incident"><div><small>${esc(c.id)} · ${esc(c.boundary)} · INFO</small><h3>${esc(c.title)}</h3><p>${esc(e?.resource)} · ${esc(e?.timestamp)}</p><span class="state-badge">${esc(status)}</span><p class="agent-note">验证状态 ${esc(c.status)} · 独立证据 ${e?.independent?1:0} · 反证待检查<br>时间范围 ${esc(e?.timestamp||'UNKNOWN')}</p></div><button class="quiet-button" data-verify-incident="${esc(c.id)}">执行独立验证 →</button></article>`}).join('')||empty('当前无待验证事件。');
     $('#agentFindings').innerHTML=a.findings.map(f=>`<article class="agent-incident"><div><small>${esc(f.id)} · ${esc(f.category)} · INFO</small><h3>${esc(f.title)}</h3><p>${esc(f.impact.summary)}</p><span class="state-badge">VERIFIED ${a.demo?'· SIMULATED':''}</span><p class="agent-note">自述 ${esc(f.verification.self_report_status)} · 独立证据 ${f.verification.independent_evidence_count} · 反证已检查<br>时间范围 ${esc(f.verification.timestamp)} · ${esc(f.verification.verification_basis)} · ${f.verification.authenticity_verified?'签名真实性已验证':'操作员来源声明'}</p></div><a class="quiet-button" href="/api/v1/agent-audit/audits/${a.id}/capsule" download>证据包 ↓</a></article>`).join('')||empty('尚无确认事件；自述和候选不能代替独立验证。');
     $('#agentDownloads').innerHTML=['markdown','json','html'].map(format=>`<a class="quiet-button" href="/api/v1/agent-audit/audits/${a.id}/report?format=${format}" download="${a.id}.${format==='markdown'?'md':format}">${format.toUpperCase()} ↓</a>`).join('')+`<a class="quiet-button" href="/api/v1/agent-audit/audits/${a.id}/capsule" download>ZIP Evidence Capsule ↓</a>`;
-    $('#agentReportPreview').textContent='点击「生成预览」，查看当前审计报告。';
+    if(auditState.previewAudit!==a.id){$('#agentReportPreview').textContent='点击「生成预览」，查看当前审计报告。';auditState.previewAudit=a.id;}
     $('#agentMetrics').innerHTML=Object.entries(a.metrics).filter(([key])=>key!=='ground_truth').map(([key,value])=>`<div class="agent-list-row"><span>${esc(key.replaceAll('_',' '))}</span><b>${value?.value!=null?`${(value.value*100).toFixed(1)}% (${value.numerator}/${value.denominator})`:'UNKNOWN'}</b></div>`).join('')+`<p class="target-hint">需要独立真值才能计算召回率和精确率；候选数量不代表效果。</p>`;
     applyMode();
     monitorLoop();
   }
   function renderTimeline(){const a=auditState.current;if(!a)return;const mapping={AGENT:['agent_trace'],TOOLS:['tool_call','mcp','api'],PROCESS:['process'],FILES:['filesystem'],NETWORK:['network','browser']},items=[];
+    const actors=[...new Set([...a.events.map(e=>e.actor),...a.claims.map(c=>c.actor)].filter(Boolean))].sort();
+    $('#agentActorFilter').innerHTML='<option value="">全部软件</option>'+actors.map(actor=>`<option value="${esc(actor)}">${esc(actor)}</option>`).join('');
+    if(!actors.includes(auditState.actor))auditState.actor='';
+    $('#agentActorFilter').value=auditState.actor;
     if(!a.monitor&&(auditState.filter==='ALL'||auditState.filter==='AGENT'))items.push({at:a.identity.start_time,order:0,html:`<article class="agent-list-row agent-derived-event"><time>${formatTime(a.identity.start_time)}</time><div><b>任务开始</b><p>${esc(a.identity.task_objective)}</p><small>${esc(a.identity.agent_name)} · ${esc(a.identity.session_id)}</small></div><span class="state-badge">范围已冻结</span></article>`});
-    if(auditState.filter==='ALL'||auditState.filter==='SELF REPORT')for(const c of a.claims)items.push({at:c.time_start,order:3,html:`<article class="agent-list-row"><time>${formatTime(c.time_start)}</time><div><b>Agent 自述</b><p>${esc(c.statement)}</p><small>${esc(c.assertion)}</small></div><span class="state-badge">${esc(a.analysis?.reconciliation.rows.find(row=>row.claim_id===c.claim_id)?.status||'待分析')}</span></article>`});
+    if(auditState.filter==='ALL'||auditState.filter==='SELF REPORT')for(const c of a.claims){if(auditState.actor&&c.actor!==auditState.actor)continue;items.push({at:c.time_start,order:3,html:`<article class="agent-list-row"><time>${formatTime(c.time_start)}</time><div><b>Agent 自述</b><p>${esc(c.statement)}</p><small>${esc(c.assertion)}</small></div><span class="state-badge">${esc(a.analysis?.reconciliation.rows.find(row=>row.claim_id===c.claim_id)?.status||'待分析')}</span></article>`});}
     if(auditState.filter!=='SELF REPORT')for(const e of a.events){
+      if(auditState.actor&&e.actor!==auditState.actor)continue;
       const evaluation=a.analysis?.policy_evaluations[e.id]||a.live_evaluations?.[e.id],reconciled=a.analysis?.reconciliation.event_status[e.id]||'UNKNOWN';
-      if(auditState.filter==='ALL'||(mapping[auditState.filter]||[]).includes(e.source_type)||auditState.filter==='VIOLATIONS'&&evaluation?.decision==='violation')items.push({at:e.timestamp,order:1,html:`<article class="agent-list-row"><time>${formatTime(e.timestamp)}</time><div><b>${esc(e.source_type)} · ${esc(e.action_type)}</b><p>${esc(e.resource)}</p><small>${esc(e.source_name)} · ${e.independent?'独立记录':'Agent 材料'} · ${e.status==='blocked'?'已阻止':'已记录'}</small></div><span class="state-badge ${evaluation?.decision==='violation'&&e.status!=='blocked'?'agent-alert':''}">${e.status==='blocked'?'已阻止':evaluation?.decision==='violation'?'异常':evaluation?.decision==='allowed'?'规则内':'待评估'}</span></article>`});
+      const labels={process_observed:'发现进程',process_disappeared:'进程不再可见',connection_observed:'发现 TCP 连接',connection_disappeared:'连接不再可见',open_file_observed:'打开文件观察'};
+      const attribution=translated(e.attribution_method==='parent_process'?'子进程关联':'软件进程匹配');
+      if(auditState.filter==='ALL'||(mapping[auditState.filter]||[]).includes(e.source_type)||auditState.filter==='VIOLATIONS'&&evaluation?.decision==='violation')items.push({at:e.timestamp,order:1,html:`<article class="agent-list-row"><time>${formatTime(e.timestamp)}</time><div><b>${esc(labels[e.command_category]||`${e.source_type} · ${e.action_type}`)}</b><p>${esc(e.resource)}</p><small>${esc(e.actor)}${e.process_id!=null?` · PID ${e.process_id} · ${esc(attribution)}`:''} · ${esc(e.source_name)} · ${e.independent?'独立记录':'Agent 材料'}</small></div><span class="state-badge ${evaluation?.decision==='violation'&&e.status!=='blocked'?'agent-alert':''}">${e.status==='blocked'?'已阻止':evaluation?.decision==='violation'?'异常':evaluation?.decision==='allowed'?'规则内':e.status==='observed'?'状态观察':'待评估'}</span></article>`});
       if(evaluation?.decision==='violation'&&e.status!=='blocked'&&['ALL','VIOLATIONS'].includes(auditState.filter))items.push({at:e.timestamp,order:2,html:`<article class="agent-list-row agent-derived-event"><time>${formatTime(e.timestamp)}</time><div><b>检测到策略异常</b><p>${esc(evaluation.boundaries.join(' · '))}</p><small>实时规则检查</small></div><span class="state-badge agent-alert">需审阅</span></article>`});
       if(['CONTRADICTED','OMITTED'].includes(reconciled)&&auditState.filter==='ALL')items.push({at:e.timestamp,order:4,html:`<article class="agent-list-row agent-derived-event"><time>${esc(e.timestamp)}</time><div><b>${reconciled==='CONTRADICTED'?'CONTRADICTION DETECTED':'OMISSION DETECTED'}</b><p>${esc(e.resource)}</p><small>Claim ↔ Evidence Reconciliation</small></div><span class="state-badge agent-alert">${esc(reconciled)}</span></article>`});
     }
-    items.sort((left,right)=>String(left.at).localeCompare(String(right.at))||left.order-right.order);
-    $('#agentTimeline').innerHTML=items.map(item=>item.html).join('')||empty(auditState.filter==='SELF REPORT'?'暂无自述。':'没有匹配的事件。');
+    items.sort((left,right)=>String(right.at).localeCompare(String(left.at))||left.order-right.order);
+    $('#agentTimeline').innerHTML=items.slice(0,auditState.timelineLimit).map(item=>item.html).join('')||empty(auditState.filter==='SELF REPORT'?'暂无自述。':'没有匹配的事件。');
+    $('#agentTimelineCount').textContent=`${items.length} 条匹配记录 · 已显示 ${Math.min(items.length,auditState.timelineLimit)} 条 · 最近记录优先`;
+    $('#agentTimelineMore').hidden=items.length<=auditState.timelineLimit;
   }
   $('#agentDemo').onclick=event=>action(event.currentTarget,'agentCreateError',async()=>{auditState.current=await call('/demo',{});await refreshAudit();go('run');});
   $('#agentMonitorStart').onclick=event=>action(event.currentTarget,'agentCreateError',async()=>{auditState.current=await call('/monitor/start',{});await refreshAudit();go('run');});
@@ -136,8 +157,11 @@
   $('#agentCollectorForm').onsubmit=event=>{event.preventDefault();action(event.submitter,'agentCollectorError',async()=>{const form=new FormData(event.target);await call('/collectors',{name:form.get('name'),key_id:form.get('key_id'),public_key:String(form.get('public_key')).trim()});event.target.reset();await refreshAudit();toast('可信采集器已登记');});};
   $('#agentAnalyze').onclick=event=>action(event.currentTarget,'agentImportError',async()=>{auditState.current=await call(`/audits/${auditState.current.id}/analyze`,{});render();});
   $('#agentGenerateReport').onclick=event=>action(event.currentTarget,'agentImportError',async()=>{auditState.current=await call(`/audits/${auditState.current.id}/self-report/generate`,{});render();toast('已保存机器生成的自述建议');});
-  $('#agentEventFilter').onchange=event=>{auditState.filter=event.target.value;renderTimeline();};
+  $('#agentEventFilter').onchange=event=>{auditState.filter=event.target.value;auditState.timelineLimit=100;renderTimeline();};
+  $('#agentActorFilter').onchange=event=>{auditState.actor=event.target.value;auditState.timelineLimit=100;renderTimeline();};
+  $('#agentTimelineMore').onclick=()=>{auditState.timelineLimit+=100;renderTimeline();};
   $('#agentPreview').onclick=event=>action(event.currentTarget,'',async()=>{if(!auditState.current)throw Error('请先选择审计');const r=await fetch(`/api/v1/agent-audit/audits/${auditState.current.id}/report`);if(!r.ok)throw Error('报告读取失败，请检查审计证据完整性');$('#agentReportPreview').textContent=await r.text();});
   document.addEventListener('click',event=>{const open=event.target.closest('[data-open-audit]');if(open)action(open,'agentCreateError',async()=>{await select(open.dataset.openAudit);go('run');});const nav=event.target.closest('[data-agent-go]');if(nav)go(nav.dataset.agentGo);const verify=event.target.closest('[data-verify-incident]');if(verify)action(verify,'agentVerifyError',async()=>{const result=await call(`/audits/${auditState.current.id}/incidents/${verify.dataset.verifyIncident}/verify`,{});await select(auditState.current.id);toast(result.status==='verified'?'记录重建验证通过':'发现冲突遥测，需要人工审阅');});});
+  document.addEventListener('fieldwork:languagechange',()=>{if(auditState.current)render();renderDiscovery(auditState.discovery);});
   window.agentAudit={applyMode,refresh:refreshAudit};applyMode();if(state.mode==='agent_audit')refreshAudit().catch(e=>toast(e.message));
 })();

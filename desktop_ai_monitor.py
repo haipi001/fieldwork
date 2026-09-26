@@ -30,18 +30,20 @@ def identify(executable):
     return None
 
 
-def parse_processes(output):
+def parse_processes(output, with_start_time=False):
     processes = {}
     for line in output.splitlines():
-        fields = line.strip().split(None, 3)
-        if len(fields) != 4 or not all(field.isdigit() for field in fields[:3]):
+        fields = line.strip().split(None, 8 if with_start_time else 3)
+        if len(fields) != (9 if with_start_time else 4) or not all(field.isdigit() for field in fields[:3]):
             continue
         pid, parent, uid = map(int, fields[:3])
-        executable = fields[3]
+        executable = fields[8] if with_start_time else fields[3]
         # Process executable paths only; ps comm does not expose argument data.
         app = identify(executable)
         processes[pid] = {'pid': pid, 'parent_pid': parent, 'uid': uid,
-                          'executable': Path(executable).name, 'app': app}
+                          'executable': Path(executable).name, 'app': app,
+                          'attribution': 'executable_match' if app else 'parent_process',
+                          'started_at': ' '.join(fields[3:8]) if with_start_time else ''}
     changed = True
     while changed:
         changed = False
@@ -69,7 +71,8 @@ def parse_connections(output, processes):
                 host, port = match[1].strip('[]'), int(match[2])
                 key = f'{pid}|{endpoint}'
                 connections[key] = {'pid': int(pid), 'app': processes[pid]['app'],
-                                    'host': host, 'port': port}
+                                    'host': host, 'port': port,
+                                    'process_started_at': processes[pid].get('started_at', '')}
     return connections
 
 
@@ -94,7 +97,8 @@ def parse_open_files(output, processes):
             path = line[1:]
             files[f'{pid}|{descriptor}|{path}'] = {
                 'pid': int(pid), 'app': processes[pid]['app'],
-                'path': path, 'access': access or 'unknown'}
+                'path': path, 'access': access or 'unknown',
+                'process_started_at': processes[pid].get('started_at', '')}
     return files
 
 
@@ -127,11 +131,11 @@ def snapshot():
         return result
     result['applications'] = installed_apps()
     try:
-        ps = run(['/bin/ps', '-axo', 'pid=,ppid=,uid=,comm='])
+        ps = run(['/bin/ps', '-axo', 'pid=,ppid=,uid=,lstart=,comm='])
         if ps.returncode:
             result['errors'].append('进程读取失败')
             return result
-        result['processes'] = parse_processes(ps.stdout)
+        result['processes'] = parse_processes(ps.stdout, with_start_time=True)
         result['coverage']['processes'] = 'sampling'
         if not result['processes']:
             result['coverage']['network'] = 'sampling'
@@ -156,27 +160,42 @@ def snapshot():
 
 def events(previous, current, now, session):
     observations = []
+    def identity(pid, process=None, old=False):
+        process = process or (previous if old else current).get('processes', {}).get(str(pid), {})
+        return {'process_id': int(pid), 'parent_process_id': process.get('parent_pid'),
+                'process_started_at': process.get('started_at', ''),
+                'process_executable': process.get('executable', ''),
+                'attribution_method': process.get('attribution', 'executable_match')}
     for pid, process in current['processes'].items():
         if previous.get('processes', {}).get(pid) == process:
             continue
         observations.append({'timestamp': now, 'actor': process['app'], 'session_id': session,
             'source_type': 'process', 'action_type': 'unknown', 'status': 'observed',
             'resource': f"发现运行进程：{process['app']} · {process['executable']} · PID {pid}",
-            'command_category': 'process_observed'})
+            'command_category': 'process_observed', **identity(pid, process)})
     for pid, process in previous.get('processes', {}).items():
         if current['coverage']['processes'] == 'sampling' and pid not in current['processes']:
             observations.append({'timestamp': now, 'actor': process['app'], 'session_id': session,
                 'source_type': 'process', 'action_type': 'unknown', 'status': 'observed',
                 'resource': f"进程已不在快照中：{process['app']} · PID {pid}",
-                'command_category': 'process_disappeared'})
+                'command_category': 'process_disappeared', **identity(pid, process)})
     for key, connection in current['connections'].items():
-        if key in previous.get('connections', {}):
+        if previous.get('connections', {}).get(key) == connection:
             continue
         observations.append({'timestamp': now, 'actor': connection['app'], 'session_id': session,
             'source_type': 'network', 'action_type': 'connect', 'status': 'connected',
             'network_host': connection['host'], 'network_port': connection['port'],
             'resource': f"{connection['app']} · PID {connection['pid']} · TCP {connection['host']}:{connection['port']}",
-            'command_category': 'connection_observed'})
+            'command_category': 'connection_observed', **identity(connection['pid'])})
+    if current['coverage'].get('network') == 'sampling':
+        for key, connection in previous.get('connections', {}).items():
+            if key in current['connections']:
+                continue
+            observations.append({'timestamp': now, 'actor': connection['app'], 'session_id': session,
+                'source_type': 'network', 'action_type': 'unknown', 'status': 'observed',
+                'network_host': connection['host'], 'network_port': connection['port'],
+                'resource': f"连接已不在快照中：{connection['app']} · PID {connection['pid']} · TCP {connection['host']}:{connection['port']}",
+                'command_category': 'connection_disappeared', **identity(connection['pid'], old=True)})
     for key, item in current.get('open_files', {}).items():
         if previous.get('open_files', {}).get(key) == item:
             continue
@@ -185,5 +204,5 @@ def events(previous, current, now, session):
             'source_type': 'filesystem', 'action_type': 'unknown', 'status': 'observed',
             'filesystem_path': item['path'],
             'resource': f"观察到打开文件：{item['app']} · PID {item['pid']} · {access} · {item['path']}",
-            'command_category': 'open_file_observed'})
+            'command_category': 'open_file_observed', **identity(item['pid'])})
     return observations

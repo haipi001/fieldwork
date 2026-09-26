@@ -199,6 +199,37 @@ def test_open_files_are_observations_not_read_write_claims():
     assert monitor.events(current, current, core.utcnow(), 'session') == []
 
 
+def test_process_reuse_and_missing_network_visibility():
+    monitor = audit.desktop_ai_monitor
+    first = monitor.parse_processes('42 1 501 Sat Sep 26 12:00:00 2026 /Applications/Cursor.app/Contents/MacOS/Cursor', with_start_time=True)
+    reused = monitor.parse_processes('42 1 501 Sat Sep 26 12:01:00 2026 /Applications/Cursor.app/Contents/MacOS/Cursor', with_start_time=True)
+    assert first['42']['started_at'] != reused['42']['started_at']
+    sockets = 'p42\nf10\nn127.0.0.1:50000->example.test:443\nTST=ESTABLISHED\n'
+    old = {'processes': first, 'connections': monitor.parse_connections(sockets, first), 'coverage': {'processes': 'sampling', 'network': 'sampling'}}
+    new = {'processes': reused, 'connections': monitor.parse_connections(sockets, reused), 'coverage': old['coverage']}
+    events = monitor.events(old, new, core.utcnow(), 'session')
+    assert {e['command_category'] for e in events} == {'process_observed', 'connection_observed'}
+    assert all(e['process_id'] == 42 for e in events)
+    assert all(e['process_started_at'] == reused['42']['started_at'] for e in events)
+    new['connections'] = {}
+    new['coverage'] = {'processes': 'sampling', 'network': 'partial'}
+    assert not any(e['command_category'] == 'connection_disappeared' for e in monitor.events(old, new, core.utcnow(), 'session'))
+    new['coverage']['network'] = 'sampling'
+    assert any(e['command_category'] == 'connection_disappeared' for e in monitor.events(old, new, core.utcnow(), 'session'))
+
+
+def test_monitor_failure_pauses_visibly(client, monkeypatch):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    def fail():
+        raise RuntimeError('internal details should not be displayed')
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', fail)
+    audit.scan_active_monitors()
+    result = client.get(f"/api/v1/agent-audit/audits/{started['id']}").json()
+    assert result['monitor']['status'] == 'paused'
+    assert 'RuntimeError' in result['monitor']['last_error']
+    assert 'internal details' not in result['monitor']['last_error']
+
+
 def test_monitor_auto_pauses_when_storage_is_critical(client, monkeypatch):
     started = client.post('/api/v1/agent-audit/monitor/start').json()
     monkeypatch.setattr(audit.shutil, 'disk_usage', lambda _: type('Usage', (), {'total': 1000, 'used': 995, 'free': 5})())

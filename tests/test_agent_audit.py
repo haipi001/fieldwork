@@ -97,6 +97,63 @@ def test_signed_receipt_confirms_commit_without_duplicate_import(client, fixture
     assert client.get(route.replace(aid,other)).status_code == 404
 
 
+def native_record(at):
+    return dict(schema='fieldwork-native-es/1',synthetic=False,timestamp=at,actor='Cursor',
+        source_type='filesystem',action_type='unknown',status='observed',command_category='native_open',
+        process_id=42,parent_process_id=1,process_pid_version=7,process_started_at='1.000000',
+        process_executable='Cursor',attribution_method='executable_match',filesystem_path='/fixture',
+        resource='/fixture',destination='',modified=False,mapped_writable=False,native_sequence=2,
+        collector_dropped=0,kernel_dropped=0,native_authorization='allowed',path_truncated=False,
+        destination_truncated=False,executable_truncated=False)
+
+
+def test_native_live_import_obeys_pause_resume_and_signature(client):
+    monitor=client.post('/api/v1/agent-audit/monitor/start').json()
+    aid=monitor['id']; route=f'/api/v1/agent-audit/audits/{aid}/imports'
+    private,collector=register_collector(client)
+    def body(at,sequence=1,extra=None):
+        events=[native_record(at)]
+        if extra:events.append(extra)
+        return signed_body(private,collector,aid,dict(kind='generic_json',content=json.dumps({'events':events}),
+            provenance='operator_telemetry',source_name='native test contract',independent_attested=False),
+            sequence=sequence,nonce=f'{sequence:016d}')
+    first=body(core.utcnow())
+    assert client.post(route,json=first).status_code==200
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/pause').status_code==200
+    paused=body(core.utcnow(),2)
+    count=len(client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events'])
+    assert client.post(route,json=paused).status_code==409
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/resume').status_code==200
+    assert client.post(route,json=paused).status_code==409
+    assert len(client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events'])==count
+    resumed=body(core.utcnow(),2)
+    assert client.post(route,json=resumed).status_code==200
+    unsigned=dict(kind='generic_json',content=resumed['content'],provenance='agent_supplied')
+    assert client.post(route,json=unsigned).status_code==403
+    mixed=body(core.utcnow(),3,{'source_type':'process','action_type':'execute','actor':'fixture'})
+    assert client.post(route,json=mixed).status_code==422
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/stop').status_code==200
+    assert client.post(route,json=body(core.utcnow(),3)).status_code==409
+
+
+def test_native_live_time_and_storage_rejections_leave_no_receipt(client,monkeypatch):
+    monitor=client.post('/api/v1/agent-audit/monitor/start').json()
+    aid=monitor['id']; private,collector=register_collector(client)
+    route=f'/api/v1/agent-audit/audits/{aid}/imports'
+    def signed(at):
+        return signed_body(private,collector,aid,dict(kind='generic_json',
+            content=json.dumps({'events':[native_record(at)]}),provenance='operator_telemetry',
+            source_name='native test contract',independent_attested=False))
+    future=(audit.timestamp(core.utcnow())+audit.timedelta(minutes=2)).isoformat()
+    assert client.post(route,json=signed(future)).status_code==422
+    before=(audit.timestamp(monitor['monitor']['started_at'])-audit.timedelta(seconds=1)).isoformat()
+    assert client.post(route,json=signed(before)).status_code==409
+    monkeypatch.setattr(audit,'storage_health',lambda:{'status':'critical'})
+    assert client.post(route,json=signed(core.utcnow())).status_code==507
+    receipt=f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
+    assert client.get(receipt).status_code==404
+
+
 def test_demo_real_pipeline_and_capsule(client):
     response = client.post('/api/v1/agent-audit/demo')
     assert response.status_code == 201, response.text

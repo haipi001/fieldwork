@@ -662,6 +662,24 @@ def import_events(audit_id: str, body: ImportInput):
         collector = verify_collector_signature(db, audit_id, body, source_hash)
         identity = core.load(audit['identity_json'])
         normalized = [normalize_event(item, body, identity, bool(collector)) for item in events]
+        native = any(item.get('schema') == 'fieldwork-native-es/1' for item in normalized)
+        if native:
+            if claims or len(normalized) > 100 or len(body.content.encode()) > 1_000_000 or not all(item.get('schema') == 'fieldwork-native-es/1' for item in normalized):
+                raise HTTPException(422, '原生批次最多 100 条，不能混入其他来源或自述')
+            monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
+            if monitor:
+                if monitor['collector_kind'] != 'desktop' or monitor['status'] != 'active':
+                    raise HTTPException(409, '本机监控未运行，拒绝原生批次')
+                if not collector:
+                    raise HTTPException(403, '实时原生记录必须由已登记采集器签名')
+                if storage_health()['status'] == 'critical':
+                    raise HTTPException(507, '存储空间不足，拒绝原生批次')
+                start = timestamp(monitor['browser_accept_after'] or monitor['started_at'])
+                now = timestamp(core.utcnow())
+                if any(timestamp(item['timestamp']) < start for item in normalized):
+                    raise HTTPException(409, '原生记录早于监控启动或最近恢复，拒绝补录')
+                if any(timestamp(item['timestamp']) > now + timedelta(seconds=60) for item in normalized):
+                    raise HTTPException(422, '原生记录时间超出允许范围')
         normalized_claims = [normalize_claim(item, identity) for item in claims]
         total = db.execute('SELECT COUNT(*) FROM agent_events WHERE audit_id=?', (audit_id,)).fetchone()[0]
         if total + len(normalized) > 5000:

@@ -29,6 +29,8 @@ sh collectors/native-ai/build.sh /tmp/fieldwork-native-ai-collector
 
 ## 实时启用前尚需完成
 
+后端实时原生导入受当前本机监控约束：必须运行中且有登记采集器签名，批次不能混入其他来源或自述；早于启动/最近恢复、未来超过 60 秒、存储不足均拒绝。拒绝发生在事务写入前，不占用序列或留下半批记录。暂停期间记录不会在恢复后补录；已提交回执仍可查询以确认历史批次。
+
 Apple 批准的 Endpoint Security entitlement、有效签名、管理员权限和 Full Disk Access；仅放置 `entitlements.plist` 不会授予权限。本次预检没有发现可用代码签名身份，未申请权限或执行实时采集。
 
 还需受保护服务或 System Extension 打包、私钥与配对保护、可靠转发和重试，以及真实文件动作与实时停止流程验证。不要把此命令行原型当作已完成的保护服务，也不要用诊断用 eslogger 替代正式采集器。

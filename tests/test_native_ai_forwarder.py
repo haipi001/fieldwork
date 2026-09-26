@@ -34,6 +34,7 @@ def test_lost_ack_reconciles_exact_committed_receipt():
         raise TimeoutError()
     assert pending.deliver(lost,lambda *args:receipt(pending))['reconciled'] is True
     assert pending.request_bytes == original
+    assert not pending.matches_receipt({**receipt(pending),'sequence':True})
     for key in receipt(pending):
         mismatch=copy.deepcopy(receipt(pending));mismatch[key]='wrong'
         assert not pending.matches_receipt(mismatch)

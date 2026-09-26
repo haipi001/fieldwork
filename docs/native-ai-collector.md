@@ -25,7 +25,7 @@ sh collectors/native-ai/build.sh /tmp/fieldwork-native-ai-collector
 
 `native_ai_events.py` 校验事件类型、字段、授权状态及模拟标记。签名或导入不会自动把采集器声明升级为独立验证；现有来源信任规则仍适用。
 
-`native_ai_forwarder.PendingBatch` 提供最多 100 条、1 MB 的签名批次，签名前严格验证原生格式并拒绝模拟数据。批次内容、序列、nonce 和签名冻结；响应丢失时可查询 `/api/v1/agent-audit/audits/{audit_id}/collectors/{collector_id}/receipts/{sequence}`，仅全部匹配已提交回执才确认成功。查无回执仍保留原批次，不生成新序列重复导入。后端继续拒绝重放。本模块尚未绑定网络实现、磁盘队列或原生服务；调用方必须限制 loopback、重定向与超时，并负责受保护私钥、监控暂停和生命周期。单元测试的签名证明传输格式，不证明生产者具备系统完整性保护。
+`native_ai_forwarder.PendingBatch` 提供最多 100 条、1 MB 的签名批次，签名前严格验证原生格式并拒绝模拟数据。批次内容、序列、nonce 和签名冻结；响应丢失时可查询 `/api/v1/agent-audit/audits/{audit_id}/collectors/{collector_id}/receipts/{sequence}`，仅全部匹配已提交回执才确认成功。查无回执仍保留原批次，不生成新序列重复导入。后端继续拒绝重放。`LoopbackTransport` 已提供实际 HTTP 传输，只允许带显式端口的 127.0.0.1 或 ::1 根地址，禁用环境代理与重定向，限定超时和回执大小；可用 `pending.deliver(transport.post, transport.get_receipt)` 发送并核对提交。尚未连接磁盘队列或原生服务；调用方仍需负责受保护私钥、监控暂停和生命周期。单元测试的签名证明传输格式，不证明生产者具备系统完整性保护。
 
 ## 实时启用前尚需完成
 

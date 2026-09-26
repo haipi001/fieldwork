@@ -32,6 +32,7 @@ import reporting
 import desktop_ai_monitor
 import application_ai_monitor
 import browser_ai_bridge
+import native_ai_events
 
 router = APIRouter(prefix='/api/v1/agent-audit', tags=['AI Agent Audit'])
 SOURCES = {'agent_trace', 'self_report', 'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
@@ -584,6 +585,11 @@ def parse_import(body):
 def normalize_event(raw, body, identity, signed=False):
     if not isinstance(raw, dict):
         raise HTTPException(422, '每条事件必须为 JSON 对象')
+    if raw.get('schema') == 'fieldwork-native-es/1':
+        try:
+            raw = native_ai_events.normalize({key:value for key,value in raw.items() if key != 'session_id'}, identity['session_id'])
+        except ValueError as error:
+            raise HTTPException(422, str(error))
     source = raw.get('source_type', body.kind if body.kind in TELEMETRY else 'agent_trace')
     action = raw.get('action_type', 'unknown')
     if source not in SOURCES or action not in ACTIONS:
@@ -601,6 +607,10 @@ def normalize_event(raw, body, identity, signed=False):
         if number is not None and (type(number) is not int or number < 0 or number > 2147483647):
             raise HTTPException(422, f'{key} 必须是非负进程 ID')
         value[key] = number
+    if raw.get('schema') == 'fieldwork-native-es/1':
+        for key in ('schema', 'process_pid_version', 'native_sequence', 'native_authorization',
+                    'collector_dropped', 'kernel_dropped', 'modified', 'mapped_writable', 'synthetic'):
+            value[key] = raw.get(key)
     if raw.get('network_port') is not None and (type(raw['network_port']) is not int or not 1 <= raw['network_port'] <= 65535):
         raise HTTPException(422, 'network_port 必须是 1–65535 的整数')
     value.update(id=core.uid('agent-event'), timestamp=time, source_type=source, action_type=action,

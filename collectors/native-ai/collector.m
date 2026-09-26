@@ -120,6 +120,7 @@ static void event(const es_message_t *message) {
     const es_process_t *process = message->process;
     NSString *kind = nil, *action = @"unknown", *path = @"", *destination = @"";
     NSString *source = @"filesystem", *status = @"observed";
+    BOOL pathTruncated = NO, destinationTruncated = NO;
     BOOL modified = NO, mapped = NO;
     switch (message->event_type) {
         case ES_EVENT_TYPE_NOTIFY_EXEC: {
@@ -131,7 +132,7 @@ static void event(const es_message_t *message) {
                 next = lineage[@(audit_token_to_pid(target->audit_token))];
             }
             identity = next; process = target; kind = @"native_exec"; source = @"process"; action = @"execute";
-            path = text(target->executable->path); break;
+            path = text(target->executable->path); pathTruncated = target->executable->path_truncated; break;
         }
         case ES_EVENT_TYPE_NOTIFY_FORK: {
             const es_process_t *child = message->event.fork.child;
@@ -141,15 +142,19 @@ static void event(const es_message_t *message) {
             process = child; kind = @"native_fork"; source = @"process"; action = @"spawn"; break;
         }
         case ES_EVENT_TYPE_NOTIFY_EXIT: kind = @"native_exit"; source = @"process"; break;
-        case ES_EVENT_TYPE_NOTIFY_OPEN: kind = @"native_open"; path = text(message->event.open.file->path); break;
-        case ES_EVENT_TYPE_NOTIFY_WRITE: kind = @"native_write"; path = text(message->event.write.target->path); action = @"write"; break;
+        case ES_EVENT_TYPE_NOTIFY_OPEN: kind = @"native_open"; path = text(message->event.open.file->path); pathTruncated = message->event.open.file->path_truncated; break;
+        case ES_EVENT_TYPE_NOTIFY_WRITE: kind = @"native_write"; path = text(message->event.write.target->path); pathTruncated = message->event.write.target->path_truncated; action = @"write"; break;
         case ES_EVENT_TYPE_NOTIFY_CLOSE:
             kind = @"native_close"; path = text(message->event.close.target->path); modified = message->event.close.modified;
+            pathTruncated = message->event.close.target->path_truncated;
             mapped = message->version >= 6 && message->event.close.was_mapped_writable;
             break; // modified describes the file, not which process caused the modification.
-        case ES_EVENT_TYPE_NOTIFY_UNLINK: kind = @"native_unlink"; path = text(message->event.unlink.target->path); action = @"modify"; break;
+        case ES_EVENT_TYPE_NOTIFY_UNLINK: kind = @"native_unlink"; path = text(message->event.unlink.target->path); pathTruncated = message->event.unlink.target->path_truncated; action = @"modify"; break;
         case ES_EVENT_TYPE_NOTIFY_RENAME:
             kind = @"native_rename"; path = text(message->event.rename.source->path); action = @"modify";
+            pathTruncated = message->event.rename.source->path_truncated;
+            destinationTruncated = message->event.rename.destination_type == ES_DESTINATION_TYPE_EXISTING_FILE
+                ? message->event.rename.destination.existing_file->path_truncated : message->event.rename.destination.new_path.dir->path_truncated;
             destination = message->event.rename.destination_type == ES_DESTINATION_TYPE_EXISTING_FILE ? text(message->event.rename.destination.existing_file->path)
                 : [text(message->event.rename.destination.new_path.dir->path) stringByAppendingPathComponent:text(message->event.rename.destination.new_path.filename)]; break;
         default: break;
@@ -159,6 +164,8 @@ static void event(const es_message_t *message) {
             @"timestamp":[clockFormat stringFromDate:[NSDate dateWithTimeIntervalSince1970:message->time.tv_sec + message->time.tv_nsec / 1e9]],
             @"actor":identity[@"actor"], @"action_type":action, @"status":status, @"command_category":kind,
             @"synthetic":@(syntheticMode),
+            @"path_truncated":@(pathTruncated), @"destination_truncated":@(destinationTruncated),
+            @"executable_truncated":@(process->executable->path_truncated),
             @"process_id":@(audit_token_to_pid(process->audit_token)), @"parent_process_id":@(process->ppid),
             @"process_pid_version":@(audit_token_to_pidversion(process->audit_token)), @"process_started_at":identity[@"birth"],
             @"process_executable":text(process->executable->path).lastPathComponent,
@@ -186,7 +193,7 @@ static int selfTest(void) {
     message.event_type = ES_EVENT_TYPE_NOTIFY_CLOSE; message.event.close.target = &file;
     message.event.close.modified = false; message.event.close.was_mapped_writable = true; message.global_seq_num = 1;
     event(&message);
-    message.event.close.modified = true; message.global_seq_num = 3; event(&message);
+    message.event.close.modified = true; file.path_truncated = true; message.global_seq_num = 3; event(&message);
     fprintf(stderr,"SYNTHETIC SELF TEST: no live Endpoint Security collection\n");
     dispatch_sync(writer,^{}); return 0;
 }

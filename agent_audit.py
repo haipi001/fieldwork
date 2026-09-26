@@ -609,7 +609,8 @@ def normalize_event(raw, body, identity, signed=False):
         value[key] = number
     if raw.get('schema') == 'fieldwork-native-es/1':
         for key in ('schema', 'process_pid_version', 'native_sequence', 'native_authorization',
-                    'collector_dropped', 'kernel_dropped', 'modified', 'mapped_writable', 'synthetic'):
+                    'collector_dropped', 'kernel_dropped', 'modified', 'mapped_writable', 'synthetic',
+                    'path_truncated', 'destination_truncated', 'executable_truncated'):
             value[key] = raw.get(key)
     if raw.get('network_port') is not None and (type(raw['network_port']) is not int or not 1 <= raw['network_port'] <= 65535):
         raise HTTPException(422, 'network_port 必须是 1–65535 的整数')

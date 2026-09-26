@@ -8,7 +8,8 @@ KINDS = {'native_exec': ('process', 'execute'), 'native_fork': ('process', 'spaw
 FIELDS = {'schema', 'timestamp', 'actor', 'source_type', 'action_type', 'status', 'command_category',
     'process_id', 'parent_process_id', 'process_pid_version', 'process_started_at', 'process_executable',
     'attribution_method', 'filesystem_path', 'resource', 'destination', 'modified', 'mapped_writable',
-    'native_sequence', 'collector_dropped', 'kernel_dropped', 'synthetic', 'native_authorization'}
+    'native_sequence', 'collector_dropped', 'kernel_dropped', 'synthetic', 'native_authorization',
+    'path_truncated', 'destination_truncated', 'executable_truncated'}
 
 
 def normalize(record, session_id):
@@ -34,7 +35,7 @@ def normalize(record, session_id):
             continue
         if type(number) is not int or not 0 <= number <= 9223372036854775807:
             raise ValueError('系统事件进程/序列字段无效')
-    for key in ('modified', 'mapped_writable'):
+    for key in ('modified', 'mapped_writable', 'path_truncated', 'destination_truncated', 'executable_truncated'):
         if type(record.get(key)) is not bool:
             raise ValueError('文件状态标志必须是布尔值')
     for key in ('actor','process_executable','process_started_at','attribution_method','filesystem_path','resource','destination'):

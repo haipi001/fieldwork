@@ -29,6 +29,8 @@ def test_native_close_mapping_does_not_claim_read_or_write_success(emitted):
     assert all(event['synthetic'] is True for event in emitted)
     assert emitted[0]['modified'] is False and emitted[0]['mapped_writable'] is True
     assert emitted[1]['modified'] is True
+    assert emitted[0]['path_truncated'] is False
+    assert emitted[1]['path_truncated'] is True
     assert all(event['action_type'] == 'unknown' for event in emitted)
     assert all(event['status'] == 'observed' for event in emitted)
     assert emitted[1]['kernel_dropped'] == 1
@@ -43,6 +45,9 @@ def test_native_contract_rejects_simulation_private_fields_and_false_success(emi
     normalized = native.normalize(record,'session')
     assert normalized['session_id'] == 'session'
     assert normalized['mapped_writable'] is True
+    assert normalized['path_truncated'] is False
+    with pytest.raises(ValueError,match='布尔值'):
+        native.normalize({**record,'path_truncated':'false'},'session')
     private = {**record,'argv':['secret']}
     with pytest.raises(ValueError,match='未知字段'):
         native.normalize(private,'session')

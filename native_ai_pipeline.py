@@ -29,14 +29,18 @@ class NativePipeline:
         self.records.append(dict(record))
         self.buffer_bytes+=size
 
-    def flush(self):
+    def persist(self):
         if self.pending is None:
-            if not self.records:return {'acknowledged':True,'empty':True}
+            if not self.records:return
             pending=PendingBatch(self.records,audit_id=self.audit_id,collector_id=self.collector_id,
                 sequence=self.queue.next_sequence(),private_key=self.private_key,session_id=self.session_id)
             # Persist before sending. A disk failure retains the original in-memory records.
             self.queue.save(pending.request_bytes)
             self.pending=pending;self.records=[];self.buffer_bytes=len(canonical({'events':[]}))
+
+    def flush(self):
+        self.persist()
+        if self.pending is None:return {'acknowledged':True,'empty':True}
         result=self.pending.deliver(self.transport.post,self.transport.get_receipt)
         if not isinstance(result,dict) or result.get('acknowledged') is not True:
             raise ValueError('未获得明确提交确认，保留待提交批次')

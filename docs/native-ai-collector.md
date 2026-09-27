@@ -29,11 +29,13 @@ sh collectors/native-ai/build.sh /tmp/fieldwork-native-ai-collector
 
 ## 实时启用前尚需完成
 
+`NativeCollectorSession` 已连接可信启动门禁、读取和批转发，限制重试间隔并保留同一待确认批次；采集器激活失败与网络故障分开报告，不因进程存在而宣称采集完整。停止只处理本会话持有的子进程，限时退出后必要时强制终止，停止期间不请求网络，先持久保存已接受记录；报告未持久保存数量、剩余缓冲、stdout 是否排空及是否强制退出。停止不等于所有输出已收全，未接收尾部明确保留为缺口。测试使用独立测试进程与网络替身，尚未接入已授权的实际 ES 进程、受保护服务安装或网页一键控制。
+
 `native_ai_launcher` 提供固定安装位置的启动门禁：文件及所有父目录必须由 root 持有、不能组/全局可写、不能经过符号链接；签名必须满足 Apple 证书链、固定代码 identifier 与已配置 Team ID，同时带真实布尔 ES entitlement，不能启用调试权限。检查前后核对文件实例，签名超时或失败时不启动。启动函数只允许已授权管理员服务调用，固定可执行文件且不接受任意命令参数。门禁通过不证明 ES 权限已可用；生产采集进程仍可能因授权不足退出。本机未安装此受保护采集器、未配置生产 Team ID，未提升权限或执行该启动函数。真正的受保护服务安装、签名身份和系统授权仍待完成。
 
 签名 requirement 依据 [Apple TN3127](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)；测试用替身验证门禁行为，不宣称签名安装验证完成。
 
-`NativeProcessReader` 已提供进程管道读取：非阻塞、单次等待最多一秒、分段 JSONL 重组、单行 256 KiB 上限，遇到管线背压保留未接受的原始行并暂停读取。格式错误、模拟标记、超长行与退出时半行明确拒绝；stderr 只统计字节，不转发或保存任意诊断正文。状态报告 EOF、已读取数量与退出码，不把进程活着当作已具备系统采集权限。它只接收已经由可信服务启动的 Popen 句柄；受保护安装、签名检查、启动和暂停停止监督尚需完成。当前测试使用明确的独立测试生产者，不证明 Endpoint Security 实时采集已启用。
+`NativeProcessReader` 已提供进程管道读取：非阻塞、单次等待最多一秒、分段 JSONL 重组、单行 256 KiB 上限，遇到管线背压保留未接受的原始行并暂停读取。格式错误、模拟标记、超长行与退出时半行明确拒绝；stderr 只统计字节，不转发或保存任意诊断正文。状态报告 EOF、已读取数量与退出码，不把进程活着当作已具备系统采集权限。它只接收已经由可信服务启动的 Popen 句柄；代码级签名门禁与会话启动停止已提供；实际受保护安装、签名实测与网页暂停控制仍待完成。当前测试使用明确的独立测试生产者，不证明 Endpoint Security 实时采集已启用。
 
 `NativePipeline` 已把验证、签名、加密队列、HTTP 发送与回执恢复连为一条可调用管线：`accept(record)` 接收元数据，`flush()` 先保存再发送，未明确确认不清队列；最多缓存 100 条且不超过 1 MB，未确认时向进程读取方返回背压。确认后的下一序列独立加密持久化，先保存序列再清除批次；在清理前重启时仍核对原批次回执，不回退序列。本次通过模块级组合验证，尚未连接实际 Endpoint Security 进程或用户的一键监控入口。
 
@@ -43,6 +45,6 @@ sh collectors/native-ai/build.sh /tmp/fieldwork-native-ai-collector
 
 Apple 批准的 Endpoint Security entitlement、有效签名、管理员权限和 Full Disk Access；仅放置 `entitlements.plist` 不会授予权限。本次预检没有发现可用代码签名身份，未申请权限或执行实时采集。
 
-还需受保护服务或 System Extension 打包、私钥与配对保护、可靠转发和重试，以及真实文件动作与实时停止流程验证。不要把此命令行原型当作已完成的保护服务，也不要用诊断用 eslogger 替代正式采集器。
+还需受保护服务或 System Extension 打包和签名安装、生产密钥保管与网页配对控制，以及真实文件动作、转发和停止流程的系统级验证。不要把此命令行原型当作已完成的保护服务，也不要用诊断用 eslogger 替代正式采集器。
 
 依据：[Apple entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.endpoint-security.client)、[Endpoint Security client](https://developer.apple.com/documentation/endpointsecurity/client)、[close event](https://developer.apple.com/documentation/endpointsecurity/es_event_close_t)。

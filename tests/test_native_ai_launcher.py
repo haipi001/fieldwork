@@ -79,3 +79,11 @@ def test_verified_launch_has_fixed_executable_no_shell_and_clean_environment(mon
     assert options['close_fds'] is True and options['start_new_session'] is True
     assert options['env']=={'PATH':'/usr/bin:/bin','LANG':'C'}
     assert not options.get('shell')
+
+
+def test_os_launch_failure_is_a_clear_unavailable_state(monkeypatch):
+    configure_gate(monkeypatch,{'com.apple.developer.endpoint-security.client':True})
+    monkeypatch.setattr(launcher.os,'geteuid',lambda:0)
+    def failed(*args,**kwargs):raise OSError('fixture permission error')
+    monkeypatch.setattr(launcher.subprocess,'Popen',failed)
+    with pytest.raises(launcher.NativeLaunchError,match='未能启动'):launcher.launch_installed_collector('ABCDEFGHIJ')

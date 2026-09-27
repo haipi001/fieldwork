@@ -67,5 +67,8 @@ def launch_installed_collector(team_id):
     if os.geteuid()!=0:raise NativeLaunchError('采集器需要已授权的管理员服务，不能直接从网页提升权限')
     identity=verify_installed_collector(team_id)
     if protected_binary(INSTALL_PATH)!=identity:raise NativeLaunchError('采集器安装状态发生变化')
-    return subprocess.Popen([str(INSTALL_PATH)],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,close_fds=True,start_new_session=True,env={'PATH':'/usr/bin:/bin','LANG':'C'})
+    try:
+        return subprocess.Popen([str(INSTALL_PATH)],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,close_fds=True,start_new_session=True,env={'PATH':'/usr/bin:/bin','LANG':'C'})
+    except OSError:
+        raise NativeLaunchError('操作系统未能启动已验证的采集器') from None

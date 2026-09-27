@@ -71,6 +71,36 @@ def test_stop_failure_preserves_runtime_for_retry(service):
     assert agent.handle(request('stop'),peer_uid=501)['ok'] and agent.runtime is None
 
 
+@pytest.mark.parametrize('command',['status','stop'])
+@pytest.mark.parametrize('field',['audit_id','collector_id','session_id'])
+def test_scoped_operations_cannot_inspect_or_stop_other_pairing(service,command,field):
+    agent,prepared=service;agent.handle(request('start'),peer_uid=501)
+    scope=dict(audit_id='audit',collector_id='collector',session_id='session');scope[field]='other'
+    assert agent.handle(request(command,**scope),peer_uid=501)=={'ok':False,'error_code':'another_pairing_active'}
+    assert prepared[0][0].stops==0 and agent.runtime is prepared[0][0]
+
+
+def test_scoped_stop_is_idempotent_without_affecting_later_pairing(service):
+    agent,prepared=service
+    scope=dict(audit_id='audit',collector_id='collector',session_id='session')
+    assert agent.handle(request('stop',**scope),peer_uid=501)['status']=='inactive'
+    agent.handle(request('start'),peer_uid=501)
+    assert agent.handle(request('status',**scope),peer_uid=501)['status']=='running'
+    assert agent.handle(request('stop',**scope),peer_uid=501)['status']=='stopped'
+    assert agent.handle(request('stop',**scope),peer_uid=501)['idempotent']
+    agent.handle(request('start',audit_id='later'),peer_uid=501)
+    assert not agent.handle(request('stop',**scope),peer_uid=501)['ok']
+    assert prepared[-1][0].stops==0
+
+
+@pytest.mark.parametrize('scope',[{'audit_id':'audit'},{'audit_id':'audit','collector_id':'collector'},
+    {'audit_id':'../escape','collector_id':'collector','session_id':'session'}])
+def test_partial_or_invalid_scope_rejected(service,scope):
+    agent,prepared=service
+    assert agent.handle(request('stop',**scope),peer_uid=501)['error_code']=='invalid_request'
+    assert not prepared
+
+
 def test_concurrent_start_launches_only_once(service):
     agent,prepared=service
     with ThreadPoolExecutor(max_workers=4) as pool:

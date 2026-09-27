@@ -32,14 +32,17 @@ def decode_request(raw):
         raise ValueError('未知控制命令')
     fields={'version','command'}
     if command=='start':fields|={'audit_id','collector_id','session_id','public_key'}
+    elif set(value)&{'audit_id','collector_id','session_id'}:
+        fields|={'audit_id','collector_id','session_id'}
     if set(value)!=fields:raise ValueError('控制请求字段无效')
-    if command=='start':
+    if 'audit_id' in fields:
         for key in ('audit_id','collector_id'):
             if not isinstance(value[key],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',value[key]):
                 raise ValueError('配对标识无效')
         session=value['session_id']
         if not isinstance(session,str) or not 1<=len(session)<=256 or any(ord(char)<32 for char in session):
             raise ValueError('配对会话无效')
+    if command=='start':
         public=value['public_key']
         if not isinstance(public,str):raise ValueError('配对公钥无效')
         decoded=base64.b64decode(public,validate=True)
@@ -74,6 +77,12 @@ class NativeControl:
         except (ValueError,TypeError):return {'ok':False,'error_code':'invalid_request'}
         with self.lock:
             command=request['command']
+            if command in {'status','stop'} and 'audit_id' in request:
+                scope={key:request[key] for key in ('audit_id','collector_id','session_id')}
+                if self.pairing is None:
+                    return {'ok':True,'status':'inactive','producer_alive':False,'idempotent':True}
+                if any(scope[key]!=self.pairing[key] for key in scope):
+                    return {'ok':False,'error_code':'another_pairing_active'}
             if command=='status':return {'ok':True,**self._health()}
             if command=='stop':
                 return self.shutdown()

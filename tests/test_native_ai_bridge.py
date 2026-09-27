@@ -68,3 +68,14 @@ def test_existing_same_key_is_reused_in_another_audit(db):
     db.execute('INSERT INTO agent_monitors VALUES(?,?,?)',('second','active','desktop'))
     value=json.loads(bridge.prepare_pairing(db,'second',new_id=lambda:pytest.fail('identity must be reused'),now='fixture'))
     assert value['collector_id']=='collector' and value['session_id']=='second-session'
+
+
+@pytest.mark.parametrize('command',['status','stop'])
+def test_control_request_keeps_pairing_scope_and_omits_key(db,command):
+    value=json.loads(bridge.scoped_request(command,pair(db)))
+    assert value=={'version':1,'command':command,'audit_id':'audit','collector_id':'collector','session_id':'server-session'}
+
+
+def test_control_request_rejects_non_start_pairing_and_unknown_command(db):
+    with pytest.raises(ValueError):bridge.scoped_request('shell',pair(db))
+    with pytest.raises(ValueError):bridge.scoped_request('stop',b'{"version":1,"command":"status"}')

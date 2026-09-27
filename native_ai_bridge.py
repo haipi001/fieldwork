@@ -11,6 +11,18 @@ class PairingUnavailable(ValueError):
     pass
 
 
+def scoped_request(command,pairing):
+    """Status/stop requests for exactly the audit that was paired by the backend."""
+    if command not in {'status','stop'}:raise ValueError('未知的配对控制操作')
+    value=decode_request(pairing)
+    if value['command']!='start':raise ValueError('控制操作需要完整启动配对')
+    value={key:value[key] for key in ('audit_id','collector_id','session_id')}
+    value.update(version=1,command=command)
+    raw=json.dumps(value,separators=(',',':')).encode()
+    decode_request(raw)
+    return raw
+
+
 def prepare_pairing(db,audit_id,*,new_id,now):
     """Use protected installed identity and server-owned audit session only.
 

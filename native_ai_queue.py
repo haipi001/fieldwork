@@ -84,8 +84,45 @@ class EncryptedPendingQueue:
             except FileNotFoundError:pass
 
     @locked
-    def acknowledge(self,request_bytes):
+    def acknowledge(self,request_bytes,next_sequence=None):
         if self._load()!=request_bytes:
             raise ValueError('确认批次与持久队列不一致')
+        if next_sequence is not None:
+            if type(next_sequence) is not int or not 1<=next_sequence<=9223372036854775807:
+                raise ValueError('无效的持久序列')
+            if next_sequence<self._next_sequence():
+                raise ValueError('持久序列不能回滚')
+            nonce=secrets.token_bytes(12)
+            blob=nonce+self.cipher.encrypt(nonce,str(next_sequence).encode(),self.context+b'\0sequence')
+            temporary='sequence-'+secrets.token_hex(12)+'.tmp'
+            try:
+                fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=self.fd)
+                with os.fdopen(fd,'wb') as target:
+                    target.write(blob);target.flush();os.fsync(target.fileno())
+                os.replace(temporary,'sequence.enc',src_dir_fd=self.fd,dst_dir_fd=self.fd)
+                os.fsync(self.fd)
+            finally:
+                try:os.unlink(temporary,dir_fd=self.fd)
+                except FileNotFoundError:pass
         os.unlink('pending.enc',dir_fd=self.fd)
         os.fsync(self.fd)
+
+    @locked
+    def next_sequence(self):return self._next_sequence()
+
+    def _next_sequence(self):
+        try:fd=os.open('sequence.enc',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self.fd)
+        except FileNotFoundError:return 1
+        with os.fdopen(fd,'rb') as source:
+            info=os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:
+                raise ValueError('持久序列文件无效')
+            blob=source.read(129)
+            if not 28<=len(blob)<=128:raise ValueError('持久序列大小无效')
+        try:
+            value=self.cipher.decrypt(blob[:12],blob[12:],self.context+b'\0sequence').decode()
+            if not value.isascii() or not value.isdecimal() or not 1<=int(value)<=9223372036854775807:
+                raise ValueError('持久序列格式无效')
+            return int(value)
+        except (InvalidTag,UnicodeDecodeError):
+            raise ValueError('持久序列校验失败') from None

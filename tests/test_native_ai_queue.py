@@ -59,3 +59,15 @@ def test_nonregular_queue_file_does_not_block_reader(tmp_path):
     with queue(path) as reader:
         os.mkfifo(path/'pending.enc',0o600)
         with pytest.raises(ValueError,match='类型无效'):reader.load()
+
+
+def test_sequence_is_persistent_authenticated_and_cannot_roll_back(tmp_path):
+    path=tmp_path/'queue'
+    with queue(path) as writer:
+        writer.save(b'fixture');writer.acknowledge(b'fixture',next_sequence=3)
+        assert writer.next_sequence()==3
+        writer.save(b'next')
+        with pytest.raises(ValueError,match='回滚'):writer.acknowledge(b'next',next_sequence=2)
+        assert writer.load()==b'next'
+    with queue(path,key=b'x'*32) as wrong:
+        with pytest.raises(ValueError,match='校验失败'):wrong.next_sequence()

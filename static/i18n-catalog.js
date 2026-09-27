@@ -564,6 +564,8 @@ window.FIELDWORK_EN = Object.freeze({
   "浏览器元数据（部分）": "Browser metadata (partial)",
   "实际文件读写：未接入": "Actual file I/O: not connected",
   "系统路径已截断，不能确认完整位置": "System path truncated; full location is unconfirmed",
+  "无法确认": "Unconfirmed",
+  "系统已拒绝": "Denied by the system",
   "执行通知": "Execution notification",
   "子进程创建通知": "Child process creation notification",
   "退出通知": "Exit notification",

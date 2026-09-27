@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core, 'DB', tmp_path / 'test.db')
     monkeypatch.setattr(core, 'LOCAL_DATA_ROOT', tmp_path)
     monkeypatch.setattr(reporting, 'EXPORTS', tmp_path / 'exports')
+    monkeypatch.setattr(audit.shutil,'disk_usage',lambda path:SimpleNamespace(total=100*1024**3,used=80*1024**3,free=20*1024**3))
     monkeypatch.setattr(audit.application_ai_monitor, 'roots', lambda: {'Codex': tmp_path / 'codex-logs', 'Claude Code': tmp_path / 'claude-logs'})
     monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: {
         'platform': 'Darwin', 'applications': [{'name': 'Cursor', 'installed': True}],
@@ -171,6 +173,43 @@ def test_unbound_signed_key_cannot_claim_live_native_source(client,monkeypatch):
     assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=forged_body).status_code==422
     receipt=f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
     assert client.get(receipt).status_code==404
+
+
+def native_policy_event(fixture,**changes):
+    identity=fixture['audit']
+    body=audit.ImportInput(kind='generic_json',content='{}')
+    return audit.normalize_event({**native_record(core.utcnow()),**changes},body,identity)
+
+
+def test_truncated_file_path_cannot_decide_filesystem_boundary(fixture):
+    policy=audit.Policy.model_validate(fixture['audit']['policy']).model_dump()
+    policy.update(allowed_filesystem_paths=['/workspace'],denied_filesystem_paths=[],state_change_allowed=True)
+    for path in ['/workspace/fixture','/outside/fixture']:
+        event=native_policy_event(fixture,filesystem_path=path,path_truncated=True)
+        result=audit.evaluate_policy(event,policy)
+        assert result['decision']=='uncertain' and 'FILESYSTEM_BOUNDARY' not in result['boundaries']
+
+
+def test_rename_checks_both_source_and_destination(fixture):
+    policy=audit.Policy.model_validate(fixture['audit']['policy']).model_dump()
+    policy.update(allowed_filesystem_paths=['/workspace'],denied_filesystem_paths=['/workspace/private'],state_change_allowed=True)
+    event=native_policy_event(fixture,command_category='native_rename',action_type='modify',
+        filesystem_path='/workspace/old',destination='/outside/new')
+    assert 'FILESYSTEM_BOUNDARY' in audit.evaluate_policy(event,policy)['boundaries']
+    event['destination']='/workspace/private/new'
+    assert 'FILESYSTEM_BOUNDARY' in audit.evaluate_policy(event,policy)['boundaries']
+    event['destination']='/workspace/new';event['destination_truncated']=True
+    assert audit.evaluate_policy(event,policy)['decision']=='uncertain'
+    event['destination_truncated']=False
+    assert audit.evaluate_policy(event,policy)['decision']=='allowed'
+
+
+def test_incomplete_path_does_not_hide_other_known_policy_violations(fixture):
+    policy=audit.Policy.model_validate(fixture['audit']['policy']).model_dump()
+    policy.update(allowed_filesystem_paths=['/workspace'],state_change_allowed=False)
+    event=native_policy_event(fixture,command_category='native_write',action_type='write',path_truncated=True)
+    result=audit.evaluate_policy(event,policy)
+    assert result['decision']=='violation' and result['boundaries']==['STATE_CHANGE']
 
 
 def test_demo_real_pipeline_and_capsule(client):

@@ -746,6 +746,7 @@ def evaluate_policy(event, policy):
     if not policy:
         return {'decision': 'uncertain', 'boundaries': [], 'reason': '缺少 PolicySnapshot'}
     violations, uncertain, applicable = [], False, False
+    location_incomplete = False
     def check(allowed, boundary):
         nonlocal applicable
         applicable = True
@@ -765,10 +766,18 @@ def evaluate_policy(event, policy):
     path = event['filesystem_path']
     if path or source == 'filesystem':
         applicable = True
-        if not path or not path.startswith('/'):
+        if not path or not path.startswith('/') or event.get('path_truncated') is True:
             uncertain = True
+            location_incomplete = True
         else:
             check(within(path, policy['allowed_filesystem_paths']) and not within(path, policy['denied_filesystem_paths']), 'FILESYSTEM_BOUNDARY')
+        if event.get('command_category') == 'native_rename':
+            destination = event.get('destination','')
+            if not destination or not destination.startswith('/') or event.get('destination_truncated') is True:
+                uncertain = True
+                location_incomplete = True
+            else:
+                check(within(destination, policy['allowed_filesystem_paths']) and not within(destination, policy['denied_filesystem_paths']), 'FILESYSTEM_BOUNDARY')
     if source in {'tool_call', 'mcp'} or action == 'invoke_tool' or event['tool_name']:
         applicable = True
         if not event['tool_name']:
@@ -791,7 +800,7 @@ def evaluate_policy(event, policy):
         check(policy['persistence_allowed'], 'PERSISTENCE')
     if event['external_side_effect']:
         check(policy['external_side_effect_allowed'], 'EXTERNAL_SIDE_EFFECT')
-    return {'decision': 'violation' if violations else 'uncertain' if uncertain else 'allowed' if applicable else 'not_applicable', 'boundaries': sorted(set(violations)), 'reason': '确定性规则；未观察到不等于不存在'}
+    return {'decision': 'violation' if violations else 'uncertain' if uncertain else 'allowed' if applicable else 'not_applicable', 'boundaries': sorted(set(violations)), 'reason': '文件位置不完整，文件边界无法确认；其他规则按可见证据判断' if location_incomplete else '确定性规则；未观察到不等于不存在'}
 
 
 def attributed(event, identity):

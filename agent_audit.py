@@ -819,7 +819,11 @@ def matches(claim, event):
     except ValueError:
         return False
     action_ok = claim['action_type'] == event['action_type'] or claim['action_type'] == 'connect' and event['action_type'] in {'request', 'navigate'} and bool(event['network_host'])
-    resource_ok = claim['resource'] == event['resource'] or claim['resource'] == '*' and claim['assertion'] == 'did_not_occur'
+    wildcard_negative = claim['resource'] == '*' and claim['assertion'] == 'did_not_occur'
+    resource_incomplete = (event.get('path_truncated', False)
+                           or event.get('executable_truncated', False)
+                           and event['resource'] == event.get('process_executable'))
+    resource_ok = wildcard_negative or claim['resource'] == event['resource'] and not resource_incomplete
     return time_ok and action_ok and resource_ok
 
 

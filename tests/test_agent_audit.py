@@ -212,6 +212,39 @@ def test_incomplete_path_does_not_hide_other_known_policy_violations(fixture):
     assert result['decision']=='violation' and result['boundaries']==['STATE_CHANGE']
 
 
+def test_claim_matching_requires_complete_exact_resource():
+    event=dict(actor='Cursor',session_id='session',timestamp='2026-09-27T00:00:00Z',
+        action_type='write',resource='/workspace/file',network_host='',path_truncated=True)
+    claim=dict(actor='Cursor',session_id='session',time_start='2026-09-26T00:00:00Z',
+        time_end='2026-09-28T00:00:00Z',action_type='write',resource='/workspace/file',assertion='did_occur')
+    assert not audit.matches(claim,event)
+    claim['assertion']='did_not_occur'
+    assert not audit.matches(claim,event)
+    claim['resource']='*'
+    assert audit.matches(claim,event)
+    claim['resource']='/workspace/file';event['path_truncated']=False
+    assert audit.matches(claim,event)
+    event.update(executable_truncated=True,process_executable='/workspace/file')
+    assert not audit.matches(claim,event)
+
+
+def test_reconciliation_does_not_confirm_truncated_file_claim():
+    event=dict(id='event',actor='Cursor',session_id='session',timestamp='2026-09-27T00:00:00Z',
+        action_type='write',resource='/workspace/file',network_host='',path_truncated=True,
+        independent=True,status='success')
+    claim=dict(claim_id='claim',statement='fixture',actor='Cursor',session_id='session',
+        time_start='2026-09-26T00:00:00Z',time_end='2026-09-28T00:00:00Z',
+        action_type='write',resource='/workspace/file',assertion='did_occur')
+    identity=dict(agent_name='Cursor',session_id='session',start_time=claim['time_start'],end_time=claim['time_end'])
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='UNSUPPORTED'
+    claim['assertion']='did_not_occur'
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='UNKNOWN'
+    claim['resource']='*'
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='CONTRADICTED'
+    event['status']='observed'
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='UNKNOWN'
+
+
 def test_demo_real_pipeline_and_capsule(client):
     response = client.post('/api/v1/agent-audit/demo')
     assert response.status_code == 201, response.text

@@ -70,6 +70,8 @@ Apple 批准的 Endpoint Security entitlement、有效签名、管理员权限�
 依据：[Apple entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.endpoint-security.client)、[Endpoint Security client](https://developer.apple.com/documentation/endpointsecurity/client)、[close event](https://developer.apple.com/documentation/endpointsecurity/es_event_close_t)。
 # 后台服务生命周期
 
+暂停或最终停止前，应向仍接受记录的审计发送带完整配对范围的 `drain`。服务停止生产，分批交付全部 stdout 记录，获得确认且没有残留读取缓冲后才关闭会话。网络、存储、协议或超时错误返回 delivery_pending，并保留服务会话、读取器及冻结批次供重试；成功前不能更新暂停时间边界或冻结分析。该命令尚未接入网页生命周期；普通 stop 和服务退出仍以本地保存为主，不等价于交付完成。
+
 后端通过 `native_ai_bridge.scoped_request` 从原始启动配对生成状态或停止请求，携带完整审计、采集器及会话范围。原生服务拒绝范围不匹配的查询与停止；已无活动会话时返回 inactive，不把上一次会话的状态当成当前状态。网页集成必须使用这种带范围的请求。服务账户的原有无范围控制仍供受授权的本机管理客户端使用，服务退出直接调用内部 shutdown。
 
 `native_ai_bridge.prepare_pairing` 是后端自动配对准备器：只接受正在运行的本机审计，从受保护安装读取已验证公钥，并从数据库读取审计会话；同一公钥复用采集器登记，被撤销的身份不会自动恢复。调用者持有监控生命周期锁与数据库事务；准备成功不代表服务已连接，尚不能替代 IPC 启动确认或实际记录验证。该准备器尚未接入网页启动、暂停与停止流程。

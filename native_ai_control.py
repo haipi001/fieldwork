@@ -28,11 +28,11 @@ def decode_request(raw):
     if not isinstance(value,dict) or type(value.get('version')) is not int or value['version']!=1:
         raise ValueError('控制请求版本无效')
     command=value.get('command')
-    if not isinstance(command,str) or command not in {'start','stop','status'}:
+    if not isinstance(command,str) or command not in {'start','stop','status','drain'}:
         raise ValueError('未知控制命令')
     fields={'version','command'}
     if command=='start':fields|={'audit_id','collector_id','session_id','public_key'}
-    elif set(value)&{'audit_id','collector_id','session_id'}:
+    elif command=='drain' or set(value)&{'audit_id','collector_id','session_id'}:
         fields|={'audit_id','collector_id','session_id'}
     if set(value)!=fields:raise ValueError('控制请求字段无效')
     if 'audit_id' in fields:
@@ -77,13 +77,21 @@ class NativeControl:
         except (ValueError,TypeError):return {'ok':False,'error_code':'invalid_request'}
         with self.lock:
             command=request['command']
-            if command in {'status','stop'} and 'audit_id' in request:
+            if command in {'status','stop','drain'} and 'audit_id' in request:
                 scope={key:request[key] for key in ('audit_id','collector_id','session_id')}
                 if self.pairing is None:
                     return {'ok':True,'status':'inactive','producer_alive':False,'idempotent':True}
                 if any(scope[key]!=self.pairing[key] for key in scope):
                     return {'ok':False,'error_code':'another_pairing_active'}
             if command=='status':return {'ok':True,**self._health()}
+            if command=='drain':
+                try:report=self.runtime.drain()
+                except Exception:
+                    self.control_error='delivery_pending'
+                    return {'ok':False,**self._health(),'error_code':self.control_error}
+                self.last_report={key:value for key,value in report.items() if key in PUBLIC_FIELDS}
+                self.runtime=None;self.pairing=None;self.control_error=None
+                return {'ok':True,**self.last_report}
             if command=='stop':
                 return self.shutdown()
             pairing={key:request[key] for key in ('audit_id','collector_id','session_id','public_key')}

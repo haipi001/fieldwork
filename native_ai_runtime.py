@@ -51,6 +51,11 @@ class NativeServiceRuntime:
         if self.closed:raise ValueError('原生服务会话已关闭')
         return self.session.tick()
 
+    def drain(self,grace=3):
+        if self.closed:return self.session.health()
+        self.session.quiesce(grace)
+        return self.close(grace)
+
     def close(self,grace=3):
         if self.closed:return self.session.health()
         result=self.session.stop(grace)

@@ -70,7 +70,7 @@ def test_existing_same_key_is_reused_in_another_audit(db):
     assert value['collector_id']=='collector' and value['session_id']=='second-session'
 
 
-@pytest.mark.parametrize('command',['status','stop'])
+@pytest.mark.parametrize('command',['status','stop','drain'])
 def test_control_request_keeps_pairing_scope_and_omits_key(db,command):
     value=json.loads(bridge.scoped_request(command,pair(db)))
     assert value=={'version':1,'command':command,'audit_id':'audit','collector_id':'collector','session_id':'server-session'}

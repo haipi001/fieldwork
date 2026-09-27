@@ -21,6 +21,7 @@ class Service:
         if self.fail_stop:raise OSError('private fixture error')
         self.status='stopped';return self.health()
     def tick(self):return self.health()
+    def drain(self):return self.close()
 
 
 @pytest.fixture
@@ -71,7 +72,7 @@ def test_stop_failure_preserves_runtime_for_retry(service):
     assert agent.handle(request('stop'),peer_uid=501)['ok'] and agent.runtime is None
 
 
-@pytest.mark.parametrize('command',['status','stop'])
+@pytest.mark.parametrize('command',['status','stop','drain'])
 @pytest.mark.parametrize('field',['audit_id','collector_id','session_id'])
 def test_scoped_operations_cannot_inspect_or_stop_other_pairing(service,command,field):
     agent,prepared=service;agent.handle(request('start'),peer_uid=501)
@@ -99,6 +100,19 @@ def test_partial_or_invalid_scope_rejected(service,scope):
     agent,prepared=service
     assert agent.handle(request('stop',**scope),peer_uid=501)['error_code']=='invalid_request'
     assert not prepared
+
+
+def test_drain_requires_scope_and_failure_retains_pairing(service):
+    agent,prepared=service
+    assert agent.handle(request('drain'),peer_uid=501)['error_code']=='invalid_request'
+    agent.handle(request('start'),peer_uid=501)
+    scope=dict(audit_id='audit',collector_id='collector',session_id='session')
+    instance=prepared[0][0];instance.fail_stop=True
+    assert agent.handle(request('drain',**scope),peer_uid=501)['error_code']=='delivery_pending'
+    assert agent.runtime is instance and agent.pairing['audit_id']=='audit'
+    instance.fail_stop=False
+    assert agent.handle(request('drain',**scope),peer_uid=501)['ok']
+    assert agent.runtime is None
 
 
 def test_concurrent_start_launches_only_once(service):

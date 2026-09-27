@@ -49,6 +49,33 @@ class NativeCollectorSession:
             if self.process.poll() is None:self.process.terminate()
         return self.health()
 
+    def quiesce(self,grace=3):
+        """Stop producing and deliver the full stream before a monitor changes epoch.
+
+        Delivery errors retain the reader and frozen queue for another attempt.
+        The backend must keep this audit accepting records until success.
+        """
+        if type(grace) not in {int,float} or not 0<grace<=5:raise ValueError('交付等待必须在 0–5 秒之间')
+        if self.reader is None:
+            self.pipeline.flush();return self.health()
+        if self.status=='stopped':
+            if self.stop_report.get('unpersisted_buffer_bytes') or self.stop_report.get('protocol_incomplete'):
+                raise NativeProtocolError('已关闭采集器仍有未完成记录')
+            self.pipeline.flush();return self.health()
+        if self.process.poll() is None:self.process.terminate()
+        self.status='draining'
+        deadline=time.monotonic()+grace
+        while True:
+            if self.pipeline.pending is not None:self.pipeline.flush()
+            remaining=deadline-time.monotonic()
+            if remaining<=0:
+                if self.process.poll() is None:self.process.kill()
+                raise TimeoutError('采集器停止交付尚未完成')
+            state=self.reader.poll(min(.05,remaining))
+            if self.pipeline.records or self.pipeline.pending is not None:self.pipeline.flush()
+            if state['exit_code'] is not None and self.reader.eof and not self.reader.buffer:
+                return self.health()
+
     def stop(self,grace=3):
         if type(grace) not in {int,float} or not 0<=grace<=5:raise ValueError('停止等待必须在 0–5 秒之间')
         if self.reader is None:self.status='stopped';return self.health()

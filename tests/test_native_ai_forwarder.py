@@ -44,6 +44,8 @@ def test_lost_ack_reconciles_exact_committed_receipt():
 def test_reject_simulation_and_overlarge_batches_before_signing():
     with pytest.raises(ValueError):batch([{**record(),'synthetic':True}])
     with pytest.raises(ValueError):batch([record()]*101)
+    for field in ('command_category','status','native_authorization'):
+        with pytest.raises(ValueError):batch([{**record(),field:[]}])
 
 
 def test_http_rejection_is_not_treated_as_lost_ack():

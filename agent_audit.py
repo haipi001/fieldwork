@@ -33,6 +33,7 @@ import desktop_ai_monitor
 import application_ai_monitor
 import browser_ai_bridge
 import native_ai_events
+import native_ai_binding
 
 router = APIRouter(prefix='/api/v1/agent-audit', tags=['AI Agent Audit'])
 SOURCES = {'agent_trace', 'self_report', 'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
@@ -585,6 +586,10 @@ def parse_import(body):
 def normalize_event(raw, body, identity, signed=False):
     if not isinstance(raw, dict):
         raise HTTPException(422, '每条事件必须为 JSON 对象')
+    category, method = raw.get('command_category'), raw.get('attribution_method')
+    reserved = isinstance(category,str) and category in native_ai_events.KINDS or isinstance(method,str) and method in {'native_parent_chain','native_exec_chain','snapshot_lineage_bootstrap'}
+    if reserved and raw.get('schema') != 'fieldwork-native-es/1':
+        raise HTTPException(422, '系统事件标识必须使用原生元数据结构')
     if raw.get('schema') == 'fieldwork-native-es/1':
         try:
             raw = native_ai_events.normalize({key:value for key,value in raw.items() if key != 'session_id'}, identity['session_id'])
@@ -592,7 +597,7 @@ def normalize_event(raw, body, identity, signed=False):
             raise HTTPException(422, str(error))
     source = raw.get('source_type', body.kind if body.kind in TELEMETRY else 'agent_trace')
     action = raw.get('action_type', 'unknown')
-    if source not in SOURCES or action not in ACTIONS:
+    if not isinstance(source,str) or not isinstance(action,str) or source not in SOURCES or action not in ACTIONS:
         raise HTTPException(422, '未知 source_type / action_type')
     time = str(raw.get('timestamp', ''))
     if time:
@@ -672,6 +677,8 @@ def import_events(audit_id: str, body: ImportInput):
                     raise HTTPException(409, '本机监控未运行，拒绝原生批次')
                 if not collector:
                     raise HTTPException(403, '实时原生记录必须由已登记采集器签名')
+                if not native_ai_binding.authorized(collector):
+                    raise HTTPException(403, '实时原生采集器未绑定受保护安装')
                 if storage_health()['status'] == 'critical':
                     raise HTTPException(507, '存储空间不足，拒绝原生批次')
                 start = timestamp(monitor['browser_accept_after'] or monitor['started_at'])

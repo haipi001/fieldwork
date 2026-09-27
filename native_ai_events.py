@@ -18,11 +18,11 @@ def normalize(record, session_id):
     if record.get('schema') != 'fieldwork-native-es/1' or record.get('synthetic') is not False:
         raise ValueError('不接受模拟或未知结构作为真实系统事件')
     kind = record.get('command_category')
-    if kind not in KINDS or (record.get('source_type'), record.get('action_type')) != KINDS[kind]:
+    if not isinstance(kind,str) or kind not in KINDS or (record.get('source_type'), record.get('action_type')) != KINDS[kind]:
         raise ValueError('系统事件类型与动作不一致')
-    if record.get('status') not in {'observed', 'blocked'}:
+    if not isinstance(record.get('status'),str) or record.get('status') not in {'observed', 'blocked'}:
         raise ValueError('系统通知不能直接声明操作副作用成功')
-    if record.get('native_authorization') not in {'allowed','denied','flags'}:
+    if not isinstance(record.get('native_authorization'),str) or record.get('native_authorization') not in {'allowed','denied','flags'}:
         raise ValueError('缺少原生授权结果元数据')
     if (record['status'] == 'blocked') != (record['native_authorization'] == 'denied'):
         raise ValueError('原生授权结果与状态不一致')

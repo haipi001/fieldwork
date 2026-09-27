@@ -107,10 +107,11 @@ def native_record(at):
         destination_truncated=False,executable_truncated=False)
 
 
-def test_native_live_import_obeys_pause_resume_and_signature(client):
+def test_native_live_import_obeys_pause_resume_and_signature(client,monkeypatch):
     monitor=client.post('/api/v1/agent-audit/monitor/start').json()
     aid=monitor['id']; route=f'/api/v1/agent-audit/audits/{aid}/imports'
     private,collector=register_collector(client)
+    monkeypatch.setattr(audit.native_ai_binding,'authorized',lambda row:row['fingerprint']==collector['fingerprint'])
     def body(at,sequence=1,extra=None):
         events=[native_record(at)]
         if extra:events.append(extra)
@@ -139,6 +140,7 @@ def test_native_live_import_obeys_pause_resume_and_signature(client):
 def test_native_live_time_and_storage_rejections_leave_no_receipt(client,monkeypatch):
     monitor=client.post('/api/v1/agent-audit/monitor/start').json()
     aid=monitor['id']; private,collector=register_collector(client)
+    monkeypatch.setattr(audit.native_ai_binding,'authorized',lambda row:row['fingerprint']==collector['fingerprint'])
     route=f'/api/v1/agent-audit/audits/{aid}/imports'
     def signed(at):
         return signed_body(private,collector,aid,dict(kind='generic_json',
@@ -150,6 +152,23 @@ def test_native_live_time_and_storage_rejections_leave_no_receipt(client,monkeyp
     assert client.post(route,json=signed(before)).status_code==409
     monkeypatch.setattr(audit,'storage_health',lambda:{'status':'critical'})
     assert client.post(route,json=signed(core.utcnow())).status_code==507
+    receipt=f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
+    assert client.get(receipt).status_code==404
+
+
+def test_unbound_signed_key_cannot_claim_live_native_source(client,monkeypatch):
+    monitor=client.post('/api/v1/agent-audit/monitor/start').json();aid=monitor['id']
+    private,collector=register_collector(client)
+    monkeypatch.setattr(audit.native_ai_binding,'authorized',lambda row:False)
+    body=signed_body(private,collector,aid,dict(kind='generic_json',
+        content=json.dumps({'events':[native_record(core.utcnow())]}),provenance='operator_telemetry',
+        source_name='native claim',independent_attested=False))
+    response=client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=body)
+    assert response.status_code==403 and '受保护安装' in response.json()['detail']
+    forged=json.loads(body['content'])
+    del forged['events'][0]['schema']
+    forged_body=signed_body(private,collector,aid,{**body,'content':json.dumps(forged)})
+    assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=forged_body).status_code==422
     receipt=f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
     assert client.get(receipt).status_code==404
 

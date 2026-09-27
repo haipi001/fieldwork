@@ -16,7 +16,7 @@ class NativeLaunchError(ValueError):
     pass
 
 
-def protected_binary(path):
+def protected_file(path,*,executable=False):
     path=Path(path)
     if not path.is_absolute() or '..' in path.parts:
         raise NativeLaunchError('采集器路径必须为绝对安装路径')
@@ -26,12 +26,15 @@ def protected_binary(path):
         if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:
             raise NativeLaunchError('采集器或安装目录不受管理员权限保护')
         if item==path:
-            if not stat.S_ISREG(info.st_mode) or not info.st_mode&0o111:
-                raise NativeLaunchError('采集器不是可执行普通文件')
+            if not stat.S_ISREG(info.st_mode) or executable and not info.st_mode&0o111:
+                raise NativeLaunchError('受保护文件的类型或执行权限无效')
             identity=(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
         elif not stat.S_ISDIR(info.st_mode):
             raise NativeLaunchError('采集器父路径不是目录')
     return identity
+
+
+def protected_binary(path):return protected_file(path,executable=True)
 
 
 def verify_signature(path,team_id):

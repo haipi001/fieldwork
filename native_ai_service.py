@@ -8,6 +8,8 @@ import pwd
 import select
 import socket
 import stat
+import threading
+import signal
 from pathlib import Path
 
 import native_ai_ipc as ipc
@@ -133,3 +135,29 @@ class NativeListener:
 
     def __enter__(self):return self
     def __exit__(self,*args):self.close()
+
+
+def run_service():
+    """Installed-service entry point; packaging must protect this code and Python.
+
+    Signal handlers only request shutdown. Collection and queue persistence stay
+    on the service thread, outside the asynchronous signal handler.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        raise ValueError('服务入口必须在主线程运行')
+    control=load_control()
+    stopping=threading.Event()
+    previous={}
+    listener=None
+    try:
+        for number in (signal.SIGTERM,signal.SIGINT):
+            previous[number]=signal.getsignal(number)
+            signal.signal(number,lambda *_:stopping.set())
+        listener=NativeListener(control)
+        while not stopping.is_set():
+            listener.serve_once(timeout=.25)
+    finally:
+        try:
+            if listener is not None:listener.close()
+        finally:
+            for number,handler in previous.items():signal.signal(number,handler)

@@ -4,9 +4,54 @@ import socket
 import struct
 import tempfile
 import time
+import signal
+import threading
 from pathlib import Path
 import pytest
 import native_ai_service as service
+
+
+def test_service_signal_stops_loop_and_restores_handlers(monkeypatch):
+    calls=[];handlers={};original={n:signal.getsignal(n) for n in (signal.SIGTERM,signal.SIGINT)}
+    monkeypatch.setattr(service,'load_control',lambda:object())
+    def install(number,handler):handlers[number]=handler;calls.append(('signal',number,handler))
+    monkeypatch.setattr(service.signal,'signal',install)
+    class Listener:
+        def __init__(self,control):calls.append('created')
+        def serve_once(self,timeout):
+            assert timeout==.25
+            calls.append('tick');handlers[signal.SIGTERM](signal.SIGTERM,None)
+        def close(self):calls.append('closed')
+    monkeypatch.setattr(service,'NativeListener',Listener)
+    service.run_service()
+    assert calls.count('tick')==1 and 'closed' in calls
+    assert all(handlers[n] is original[n] for n in original)
+
+
+@pytest.mark.parametrize('failure',['tick','close','create'])
+def test_service_failure_restores_signal_handlers(monkeypatch,failure):
+    original={n:signal.getsignal(n) for n in (signal.SIGTERM,signal.SIGINT)};handlers={};closed=[]
+    monkeypatch.setattr(service,'load_control',lambda:object())
+    monkeypatch.setattr(service.signal,'signal',lambda n,h:handlers.update({n:h}))
+    class Listener:
+        def __init__(self,control):
+            if failure=='create':raise OSError('fixture')
+        def serve_once(self,timeout):
+            if failure=='tick':raise OSError('fixture')
+            handlers[signal.SIGINT](signal.SIGINT,None)
+        def close(self):
+            closed.append(True)
+            if failure=='close':raise OSError('fixture')
+    monkeypatch.setattr(service,'NativeListener',Listener)
+    with pytest.raises(OSError):service.run_service()
+    assert bool(closed)==(failure!='create')
+    assert all(handlers[n] is original[n] for n in original)
+
+
+def test_service_refuses_worker_thread_before_loading(monkeypatch):
+    monkeypatch.setattr(service.threading,'current_thread',lambda:object())
+    monkeypatch.setattr(service,'load_control',lambda:pytest.fail('must not load'))
+    with pytest.raises(ValueError,match='主线程'):service.run_service()
 
 
 @pytest.fixture

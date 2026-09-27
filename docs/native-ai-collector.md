@@ -68,3 +68,8 @@ Apple 批准的 Endpoint Security entitlement、有效签名、管理员权限�
 还需受保护服务或 System Extension 打包和签名安装、生产密钥保管与网页配对控制，以及真实文件动作、转发和停止流程的系统级验证。不要把此命令行原型当作已完成的保护服务，也不要用诊断用 eslogger 替代正式采集器。
 
 依据：[Apple entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.endpoint-security.client)、[Endpoint Security client](https://developer.apple.com/documentation/endpointsecurity/client)、[close event](https://developer.apple.com/documentation/endpointsecurity/es_event_close_t)。
+# 后台服务生命周期
+
+`native_ai_service.run_service()` 提供安装后的服务入口：从受保护配置构建监听器，持续采集并处理控制请求；SIGTERM/SIGINT 只设置停止标志，由主线程保存待发送队列并关闭监听器。运行、创建或关闭失败均恢复原有信号处理器；保存失败向服务管理器报错，不宣称正常退出。入口要求主线程运行。
+
+这不是安装命令。正式发布仍须保护 Python 解释器、模块与依赖，并提供受保护的服务打包和安装流程；不能以管理员身份直接运行用户可修改的源码目录。真实安装、网页控制联调和 Endpoint Security 实机采集尚未完成。

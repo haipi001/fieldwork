@@ -76,15 +76,7 @@ class NativeControl:
             command=request['command']
             if command=='status':return {'ok':True,**self._health()}
             if command=='stop':
-                if self.runtime is None:return {'ok':True,**self._health(),'idempotent':True}
-                try:report=self.runtime.close()
-                except Exception:
-                    self.control_error='stop_persistence_pending'
-                    return {'ok':False,**self._health(),'error_code':self.control_error}
-                self.last_report={key:value for key,value in report.items() if key in PUBLIC_FIELDS}
-                self.runtime=None;self.pairing=None
-                self.control_error=None
-                return {'ok':True,**self.last_report}
+                return self.shutdown()
             pairing={key:request[key] for key in ('audit_id','collector_id','session_id','public_key')}
             if self.runtime is not None:
                 if pairing!=self.pairing:return {'ok':False,'error_code':'another_pairing_active'}
@@ -115,3 +107,15 @@ class NativeControl:
             report={key:value for key,value in state.items() if key in PUBLIC_FIELDS}
             if self.control_error:report['control_error_code']=self.control_error
             return report
+
+    def shutdown(self):
+        """Service-owned cleanup, separate from external peer authentication."""
+        with self.lock:
+            if self.runtime is None:return {'ok':True,**self._health(),'idempotent':True}
+            try:report=self.runtime.close()
+            except Exception:
+                self.control_error='stop_persistence_pending'
+                return {'ok':False,**self._health(),'error_code':self.control_error}
+            self.last_report={key:value for key,value in report.items() if key in PUBLIC_FIELDS}
+            self.runtime=None;self.pairing=None;self.control_error=None
+            return {'ok':True,**self.last_report}

@@ -130,8 +130,15 @@ body[data-mode="agent_audit"] [data-workspace="new"] .truth-chain {font-size:11p
 #agentTimelineMore {margin-top:16px;}
 #agent-new .agent-demo-option {padding:12px 18px; margin-top:16px; font-size:13px;}
 @media(max-width:950px) {
+  body[data-mode="agent_audit"] .topbar {min-height:124px;}
+  body[data-mode="agent_audit"] .workspace-context {top:124px;}
+  body[data-mode="agent_audit"] .workspace-nav {position:static; inset:auto; height:auto; min-height:0; padding:0; border-top:0; background:transparent; justify-content:flex-start; overflow-x:auto; max-width:100%;}
+  body[data-mode="agent_audit"] .workspace-nav .nav-link {flex:0 0 auto;}
   body[data-mode="agent_audit"] [data-workspace="new"] .hero-grid {grid-template-columns:1fr; gap:18px;}
   body[data-mode="agent_audit"] [data-workspace="new"] .truth-panel {padding:14px 18px;}
+}
+@media(max-width:360px) {
+  body[data-mode="agent_audit"] .brand strong {display:none;}
 }
 @media(max-width:600px) {
   #agent-new .agent-scanner {grid-template-columns:minmax(0,1fr); padding:22px; gap:12px;}

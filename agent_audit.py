@@ -34,6 +34,7 @@ import application_ai_monitor
 import browser_ai_bridge
 import native_ai_events
 import native_ai_binding
+import native_ai_bridge
 
 router = APIRouter(prefix='/api/v1/agent-audit', tags=['AI Agent Audit'])
 SOURCES = {'agent_trace', 'self_report', 'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
@@ -216,6 +217,7 @@ def init_agent_audit_db():
             if name not in columns:
                 db.execute(f'ALTER TABLE agent_monitors ADD COLUMN {name} {definition}')
         browser_ai_bridge.init_db(db)
+        native_ai_bridge.init_db(db)
 
 
 def audit_row(db, audit_id):
@@ -521,6 +523,11 @@ def poll_monitor(audit_id: str):
 def pause_monitor(audit_id: str):
     with core.connect() as db:
         monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
+        if not monitor:raise HTTPException(404, '自动监控不存在')
+    if monitor['status']=='active' and not native_ai_bridge.drain(core.connect,audit_id):
+        raise HTTPException(503, '本机采集器的记录尚未完成交付，请重试暂停。')
+    with core.connect() as db:
+        monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
         if not monitor:
             raise HTTPException(404, '自动监控不存在')
         if monitor['status'] == 'active':
@@ -547,6 +554,11 @@ def resume_monitor(audit_id: str):
 @router.post('/monitor/{audit_id}/stop')
 @serialized_monitor
 def stop_monitor(audit_id: str):
+    with core.connect() as db:
+        monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
+        if not monitor:raise HTTPException(404, '自动监控不存在')
+    if monitor['status'] in {'active','paused'} and not native_ai_bridge.drain(core.connect,audit_id):
+        raise HTTPException(503, '本机采集器的记录尚未完成交付，请重试停止。')
     result = scan_monitor(audit_id, allow_paused=True)
     with core.connect() as db:
         monitor = db.execute('SELECT * FROM agent_monitors WHERE audit_id=?', (audit_id,)).fetchone()
@@ -1030,6 +1042,7 @@ def get_audit(audit_id: str):
             monitor_view['desktop'].pop('_reset_application_logs', None)
             with core.connect() as db:
                 monitor_view['browser'] = browser_ai_bridge.view(db, audit_id)
+                monitor_view['native'] = native_ai_bridge.view(db, audit_id)
             monitor_view['desktop'].setdefault('coverage', {})['browser_ai'] = 'browser_metadata' if monitor_view['browser']['status'] == 'connected' else 'not_connected'
     live_anomalies = [{'event_id': event['id'], **live_evaluations[event['id']]} for event in events
                       if live_evaluations[event['id']]['decision'] == 'violation' and event['status'] in SUCCESS]

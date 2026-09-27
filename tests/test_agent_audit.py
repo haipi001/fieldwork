@@ -82,6 +82,26 @@ def signed_body(private, collector, aid, body, sequence=1, nonce='0123456789abcd
     return value
 
 
+@pytest.mark.parametrize('operation',['pause','stop'])
+def test_monitor_does_not_change_lifecycle_before_native_delivery(client,monkeypatch,operation):
+    aid=client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    def pending(database,audit_id):
+        assert audit_id==aid
+        with database() as db:
+            assert db.execute('SELECT status FROM agent_monitors WHERE audit_id=?',(aid,)).fetchone()[0]=='active'
+        return False
+    monkeypatch.setattr(audit.native_ai_bridge,'drain',pending)
+    response=client.post(f'/api/v1/agent-audit/monitor/{aid}/{operation}')
+    assert response.status_code==503
+    state=client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    assert state['monitor']['status']=='active' and state['analysis'] is None
+    monkeypatch.setattr(audit.native_ai_bridge,'drain',lambda *_:True)
+    response=client.post(f'/api/v1/agent-audit/monitor/{aid}/{operation}')
+    assert response.status_code==200
+    state=client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    assert state['monitor']['status']==('paused' if operation=='pause' else 'stopped')
+
+
 def test_signed_receipt_confirms_commit_without_duplicate_import(client, fixture):
     aid = create(client, fixture)
     other = create(client, fixture)

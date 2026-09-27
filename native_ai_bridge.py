@@ -1,14 +1,69 @@
-"""Backend pairing preparation. Never installs, elevates, or starts a collector."""
+"""Backend pairing and installed-service control; never installs or elevates."""
 import base64
 import hashlib
 import json
 
 import native_ai_binding
 from native_ai_control import decode_request
+import native_ai_ipc
 
 
 class PairingUnavailable(ValueError):
     pass
+
+
+def init_db(db):
+    db.execute('''CREATE TABLE IF NOT EXISTS agent_native_connections (
+        audit_id TEXT PRIMARY KEY REFERENCES agent_audits(id) ON DELETE CASCADE,
+        pairing BLOB, status TEXT NOT NULL, error_code TEXT)''')
+
+
+def view(db,audit_id):
+    row=db.execute('SELECT status,error_code FROM agent_native_connections WHERE audit_id=?',(audit_id,)).fetchone()
+    return dict(row) if row else {'status':'not_connected','error_code':None}
+
+
+def connect(database,audit_id,*,new_id,now):
+    """Caller holds lifecycle lock. Commit pairing before any ambiguous IPC send."""
+    with database() as db:
+        previous=db.execute('SELECT pairing FROM agent_native_connections WHERE audit_id=?',(audit_id,)).fetchone()
+        try:pairing=prepare_pairing(db,audit_id,new_id=new_id,now=now)
+        except (OSError,ValueError):
+            # Never discard a previously attempted pairing when installation changes.
+            if previous and previous['pairing'] is not None:
+                db.execute("UPDATE agent_native_connections SET status='connection_uncertain',error_code='installation_unavailable' WHERE audit_id=?",(audit_id,))
+            else:
+                db.execute("INSERT OR REPLACE INTO agent_native_connections VALUES(?,NULL,'not_connected','installation_unavailable')",(audit_id,))
+            return view(db,audit_id)
+        if previous and previous['pairing'] is not None and previous['pairing']!=pairing:
+            raise PairingUnavailable('旧配对尚未完成交付，不能替换')
+        db.execute("INSERT OR REPLACE INTO agent_native_connections VALUES(?,?,'starting',NULL)",(audit_id,pairing))
+    try:result=native_ai_ipc.request(pairing)
+    except (OSError,ValueError):result={'ok':False,'error_code':'service_unavailable'}
+    with database() as db:
+        # Ready describes IPC startup, never independently verified collection.
+        db.execute('UPDATE agent_native_connections SET status=?,error_code=? WHERE audit_id=?',
+            ('service_ready' if result.get('ok') is True else 'connection_uncertain',
+             None if result.get('ok') is True else result.get('error_code','service_unavailable'),audit_id))
+        return view(db,audit_id)
+
+
+def drain(database,audit_id):
+    """Keep the audit accepting records until this returns success.
+
+    A missing response is not proof of shutdown; preserve pairing for retry.
+    """
+    with database() as db:
+        row=db.execute('SELECT pairing FROM agent_native_connections WHERE audit_id=?',(audit_id,)).fetchone()
+        if row is None or row['pairing'] is None:return True
+        pairing=row['pairing']
+    try:result=native_ai_ipc.request(scoped_request('drain',pairing))
+    except (OSError,ValueError):result={'ok':False}
+    complete=result.get('ok') is True
+    with database() as db:
+        db.execute('UPDATE agent_native_connections SET status=?,error_code=? WHERE audit_id=?',
+            ('inactive' if complete else 'delivery_pending',None if complete else 'delivery_pending',audit_id))
+    return complete
 
 
 def scoped_request(command,pairing):

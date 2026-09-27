@@ -70,6 +70,8 @@ Apple 批准的 Endpoint Security entitlement、有效签名、管理员权限�
 依据：[Apple entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.endpoint-security.client)、[Endpoint Security client](https://developer.apple.com/documentation/endpointsecurity/client)、[close event](https://developer.apple.com/documentation/endpointsecurity/es_event_close_t)。
 # 后台服务生命周期
 
+后端已持久记录原生配对控制状态，并在发送 IPC 前提交配对信息。超时或安装变化不会抹去可能已启动的会话；暂停与停止接口已调用带范围的交付确认，失败返回 503 并保持原监控状态和未冻结分析。审计接口只展示连接状态和错误类别，不展示配对载荷。自动启动仍未接入，需先补齐存储不足自动暂停及恢复时的旧批次交付流程。
+
 暂停或最终停止前，应向仍接受记录的审计发送带完整配对范围的 `drain`。服务停止生产，分批交付全部 stdout 记录，获得确认且没有残留读取缓冲后才关闭会话。网络、存储、协议或超时错误返回 delivery_pending，并保留服务会话、读取器及冻结批次供重试；成功前不能更新暂停时间边界或冻结分析。该命令尚未接入网页生命周期；普通 stop 和服务退出仍以本地保存为主，不等价于交付完成。
 
 后端通过 `native_ai_bridge.scoped_request` 从原始启动配对生成状态或停止请求，携带完整审计、采集器及会话范围。原生服务拒绝范围不匹配的查询与停止；已无活动会话时返回 inactive，不把上一次会话的状态当成当前状态。网页集成必须使用这种带范围的请求。服务账户的原有无范围控制仍供受授权的本机管理客户端使用，服务退出直接调用内部 shutdown。

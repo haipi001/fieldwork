@@ -14,6 +14,7 @@ def db(monkeypatch):
         public_key TEXT,fingerprint TEXT UNIQUE,status TEXT,created_at TEXT,revoked_at TEXT);''')
     connection.execute('INSERT INTO agent_audits VALUES(?,?)',('audit',json.dumps({'session_id':'server-session'})))
     connection.execute('INSERT INTO agent_monitors VALUES(?,?,?)',('audit','active','desktop'))
+    bridge.init_db(connection)
     monkeypatch.setattr(bridge.native_ai_binding,'read_registration',lambda:{'public_key':base64.b64encode(b'x'*32).decode()})
     yield connection
     connection.close()
@@ -79,3 +80,45 @@ def test_control_request_keeps_pairing_scope_and_omits_key(db,command):
 def test_control_request_rejects_non_start_pairing_and_unknown_command(db):
     with pytest.raises(ValueError):bridge.scoped_request('shell',pair(db))
     with pytest.raises(ValueError):bridge.scoped_request('stop',b'{"version":1,"command":"status"}')
+
+
+def test_connect_persists_pairing_before_send_and_drain_scopes_retry(db,monkeypatch):
+    requests=[];offline=[False]
+    def send(raw):
+        requests.append(json.loads(raw))
+        assert db.execute('SELECT pairing FROM agent_native_connections').fetchone()[0] is not None
+        if offline[0]:raise TimeoutError('fixture')
+        return {'ok':True}
+    monkeypatch.setattr(bridge.native_ai_ipc,'request',send)
+    options=dict(new_id=lambda:'collector',now='fixture')
+    assert bridge.connect(lambda:db,'audit',**options)['status']=='service_ready'
+    offline[0]=True
+    assert not bridge.drain(lambda:db,'audit')
+    assert bridge.view(db,'audit')['status']=='delivery_pending'
+    offline[0]=False
+    assert bridge.drain(lambda:db,'audit')
+    assert requests[-1]=={'version':1,'command':'drain','audit_id':'audit','collector_id':'collector','session_id':'server-session'}
+    assert bridge.view(db,'audit')['status']=='inactive'
+
+
+def test_connect_timeout_and_later_installation_failure_keep_original_pairing(db,monkeypatch):
+    def failed(raw):raise TimeoutError('private fixture details')
+    monkeypatch.setattr(bridge.native_ai_ipc,'request',failed)
+    options=dict(new_id=lambda:'collector',now='fixture')
+    state=bridge.connect(lambda:db,'audit',**options)
+    assert state=={'status':'connection_uncertain','error_code':'service_unavailable'}
+    original=db.execute('SELECT pairing FROM agent_native_connections').fetchone()[0]
+    def absent():raise FileNotFoundError('fixture')
+    monkeypatch.setattr(bridge.native_ai_binding,'read_registration',absent)
+    bridge.connect(lambda:db,'audit',**options)
+    assert db.execute('SELECT pairing FROM agent_native_connections').fetchone()[0]==original
+    assert not bridge.drain(lambda:db,'audit')
+
+
+def test_absent_installation_never_sends_and_needs_no_drain(db,monkeypatch):
+    def absent():raise FileNotFoundError('fixture')
+    monkeypatch.setattr(bridge.native_ai_binding,'read_registration',absent)
+    monkeypatch.setattr(bridge.native_ai_ipc,'request',lambda *_:pytest.fail('must not send'))
+    assert bridge.connect(lambda:db,'audit',new_id=lambda:'collector',now='fixture')['status']=='not_connected'
+    assert bridge.drain(lambda:db,'audit')
+    assert 'pairing' not in bridge.view(db,'audit')

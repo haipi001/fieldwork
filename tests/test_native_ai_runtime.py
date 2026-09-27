@@ -1,5 +1,6 @@
 import base64
 import os
+import json
 import pytest
 import native_ai_runtime as runtime
 from test_native_ai_forwarder import record
@@ -59,8 +60,31 @@ def test_active_runtime_excludes_second_consumer(installed):
     first=runtime.prepare(**installed)
     try:
         with pytest.raises(ValueError,match='已有服务'):runtime.prepare(**installed)
+        with pytest.raises(ValueError,match='已有服务'):runtime.prepare(**{**installed,'audit_id':'another-audit'})
     finally:first.close()
     runtime.prepare(**installed).close()
+
+
+def test_new_audit_keeps_collector_sequence_increasing(installed):
+    transport=Transport()
+    for index in range(3):
+        with runtime.prepare(**{**installed,'audit_id':f'audit-{index}','session_id':f'session-{index}'}) as service:
+            service.pipeline.transport=transport
+            service.pipeline.accept(record());service.pipeline.flush()
+            assert json.loads(transport.bodies[-1])['sequence']==index+1
+            assert json.loads(transport.bodies[-1])['collector_id']==installed['collector_id']
+
+
+def test_failed_batch_storage_consumes_reservation_without_dropping_records(installed,monkeypatch):
+    with runtime.prepare(**installed) as service:
+        service.pipeline.accept(record())
+        save=service.queue.save
+        monkeypatch.setattr(service.queue,'save',lambda *_:(_ for _ in ()).throw(OSError('fixture')))
+        with pytest.raises(OSError):service.pipeline.persist()
+        assert len(service.pipeline.records)==1 and service.pipeline.pending is None
+        monkeypatch.setattr(service.queue,'save',save)
+        service.pipeline.persist()
+        assert json.loads(service.pipeline.pending.request_bytes)['sequence']==2
 
 
 def test_close_persistence_failure_retains_queue_and_can_retry(installed,monkeypatch):

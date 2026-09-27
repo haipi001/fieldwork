@@ -70,6 +70,8 @@ Apple 批准的 Endpoint Security entitlement、有效签名、管理员权限�
 依据：[Apple entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.endpoint-security.client)、[Endpoint Security client](https://developer.apple.com/documentation/endpointsecurity/client)、[close event](https://developer.apple.com/documentation/endpointsecurity/es_event_close_t)。
 # 后台服务生命周期
 
+采集器序号使用独立于审计会话的加密持久计数器。批次保存前先持久保留序号，崩溃或保存失败允许留下空号，不能重用已保留序号；恢复待提交批次保持原签名和序号。同一采集器跨审计共用服务锁，避免并行会话乱序提交触发服务端的防回滚检查。停止后仍未确认的旧批次继续保留，不能重新签名归入新审计；其后续恢复处理仍需与审计生命周期接通。
+
 `native_ai_service.run_service()` 提供安装后的服务入口：从受保护配置构建监听器，持续采集并处理控制请求；SIGTERM/SIGINT 只设置停止标志，由主线程保存待发送队列并关闭监听器。运行、创建或关闭失败均恢复原有信号处理器；保存失败向服务管理器报错，不宣称正常退出。入口要求主线程运行。
 
 这不是安装命令。正式发布仍须保护 Python 解释器、模块与依赖，并提供受保护的服务打包和安装流程；不能以管理员身份直接运行用户可修改的源码目录。真实安装、网页控制联调和 Endpoint Security 实机采集尚未完成。

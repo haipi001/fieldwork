@@ -110,6 +110,27 @@ class EncryptedPendingQueue:
     @locked
     def next_sequence(self):return self._next_sequence()
 
+    @locked
+    def reserve_sequence(self,minimum=1):
+        """Persist a reservation before publishing a batch; crashes may leave gaps."""
+        if type(minimum) is not int or not 1<=minimum<9223372036854775807:
+            raise ValueError('无效的序列下限')
+        value=max(minimum,self._next_sequence())
+        if value>=9223372036854775807:raise ValueError('采集器序列已耗尽')
+        nonce=secrets.token_bytes(12)
+        blob=nonce+self.cipher.encrypt(nonce,str(value+1).encode(),self.context+b'\0sequence')
+        temporary='sequence-'+secrets.token_hex(12)+'.tmp'
+        try:
+            fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=self.fd)
+            with os.fdopen(fd,'wb') as target:
+                target.write(blob);target.flush();os.fsync(target.fileno())
+            os.replace(temporary,'sequence.enc',src_dir_fd=self.fd,dst_dir_fd=self.fd)
+            os.fsync(self.fd)
+        finally:
+            try:os.unlink(temporary,dir_fd=self.fd)
+            except FileNotFoundError:pass
+        return value
+
     def _next_sequence(self):
         try:fd=os.open('sequence.enc',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self.fd)
         except FileNotFoundError:return 1

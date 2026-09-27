@@ -8,15 +8,18 @@ import native_ai_events
 
 
 class NativePipeline:
-    def __init__(self, *, queue, transport, private_key, audit_id, collector_id, session_id):
+    def __init__(self, *, queue, transport, private_key, audit_id, collector_id, session_id, sequence_queue=None):
         self.queue=queue;self.transport=transport;self.private_key=private_key
         self.audit_id=audit_id;self.collector_id=collector_id;self.session_id=session_id
+        self.sequence_queue=sequence_queue
         self.records=[];self.pending=None
         self.buffer_bytes=len(canonical({'events':[]}))
         saved=queue.load()
         if saved is not None:
             self.pending=PendingBatch.restore(saved,audit_id=audit_id,collector_id=collector_id,
                 session_id=session_id,public_key=private_key.public_key())
+            if sequence_queue is not None:
+                sequence_queue.reserve_sequence(json.loads(self.pending.request_bytes)['sequence']+1)
 
     def accept(self, record):
         # Caller must apply backpressure instead of reading unbounded process output.
@@ -33,7 +36,7 @@ class NativePipeline:
         if self.pending is None:
             if not self.records:return
             pending=PendingBatch(self.records,audit_id=self.audit_id,collector_id=self.collector_id,
-                sequence=self.queue.next_sequence(),private_key=self.private_key,session_id=self.session_id)
+                sequence=self.sequence_queue.reserve_sequence(self.queue.next_sequence()) if self.sequence_queue is not None else self.queue.next_sequence(),private_key=self.private_key,session_id=self.session_id)
             # Persist before sending. A disk failure retains the original in-memory records.
             self.queue.save(pending.request_bytes)
             self.pending=pending;self.records=[];self.buffer_bytes=len(canonical({'events':[]}))

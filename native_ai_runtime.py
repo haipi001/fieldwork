@@ -39,8 +39,9 @@ def _queue_directory(scope):
 
 
 class NativeServiceRuntime:
-    def __init__(self,queue,pipeline,session,lease):
+    def __init__(self,queue,pipeline,session,lease,sequence_queue=None):
         self.queue=queue;self.pipeline=pipeline;self.session=session;self.lease=lease;self.closed=False
+        self.sequence_queue=sequence_queue
 
     def start(self):
         if self.closed:raise ValueError('原生服务会话已关闭')
@@ -58,6 +59,7 @@ class NativeServiceRuntime:
         if self.session.error=='stop_persistence_failure':self.session.error=None
         result={**result,**self.session.health(),'unsaved_records':len(self.pipeline.records)}
         self.queue.close();os.close(self.lease);self.lease=None;self.closed=True
+        if self.sequence_queue is not None:self.sequence_queue.close()
         return result
 
     def __enter__(self):return self
@@ -89,17 +91,20 @@ def prepare(*,team_id,audit_id,collector_id,session_id,public_key,base_url='http
     scope=hashlib.sha256((audit_id+'\0'+collector_id+'\0'+session_id).encode()).hexdigest()
     directory=_queue_directory(scope)
     queue=EncryptedPendingQueue(directory,keys.queue_key,audit_id=audit_id,collector_id=collector_id)
-    lease=None
+    lease=None;sequence_queue=None
     try:
-        lease=os.open('service.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=queue.fd)
+        counter_directory=_queue_directory('sequence-'+hashlib.sha256(collector_id.encode()).hexdigest())
+        sequence_queue=EncryptedPendingQueue(counter_directory,keys.queue_key,audit_id='collector-sequence',collector_id=collector_id)
+        lease=os.open('service.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=sequence_queue.fd)
         info=os.fstat(lease)
         if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o600 or info.st_nlink!=1:
             raise PermissionError('原生服务锁文件无效')
         try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:raise ValueError('该原生审计会话已有服务正在使用') from None
+        except BlockingIOError:raise ValueError('该原生采集器已有服务正在使用') from None
         pipeline=NativePipeline(queue=queue,transport=transport,private_key=keys.signing_key,
-            audit_id=audit_id,collector_id=collector_id,session_id=session_id)
-        return NativeServiceRuntime(queue,pipeline,NativeCollectorSession(pipeline,team_id),lease)
+            audit_id=audit_id,collector_id=collector_id,session_id=session_id,sequence_queue=sequence_queue)
+        return NativeServiceRuntime(queue,pipeline,NativeCollectorSession(pipeline,team_id),lease,sequence_queue)
     except BaseException:
         if lease is not None:os.close(lease)
+        if sequence_queue is not None:sequence_queue.close()
         queue.close();raise

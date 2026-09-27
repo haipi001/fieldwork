@@ -70,6 +70,8 @@ Apple 批准的 Endpoint Security entitlement、有效签名、管理员权限�
 依据：[Apple entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.endpoint-security.client)、[Endpoint Security client](https://developer.apple.com/documentation/endpointsecurity/client)、[close event](https://developer.apple.com/documentation/endpointsecurity/es_event_close_t)。
 # 后台服务生命周期
 
+`native_ai_bridge.prepare_pairing` 是后端自动配对准备器：只接受正在运行的本机审计，从受保护安装读取已验证公钥，并从数据库读取审计会话；同一公钥复用采集器登记，被撤销的身份不会自动恢复。调用者持有监控生命周期锁与数据库事务；准备成功不代表服务已连接，尚不能替代 IPC 启动确认或实际记录验证。该准备器尚未接入网页启动、暂停与停止流程。
+
 采集器序号使用独立于审计会话的加密持久计数器。批次保存前先持久保留序号，崩溃或保存失败允许留下空号，不能重用已保留序号；恢复待提交批次保持原签名和序号。同一采集器跨审计共用服务锁，避免并行会话乱序提交触发服务端的防回滚检查。停止后仍未确认的旧批次继续保留，不能重新签名归入新审计；其后续恢复处理仍需与审计生命周期接通。
 
 `native_ai_service.run_service()` 提供安装后的服务入口：从受保护配置构建监听器，持续采集并处理控制请求；SIGTERM/SIGINT 只设置停止标志，由主线程保存待发送队列并关闭监听器。运行、创建或关闭失败均恢复原有信号处理器；保存失败向服务管理器报错，不宣称正常退出。入口要求主线程运行。

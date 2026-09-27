@@ -498,6 +498,7 @@ def start_monitor():
 @router.get('/desktop/discovery')
 def desktop_discovery():
     current = desktop_ai_monitor.snapshot()
+    current['native_installation'] = native_ai_binding.installation_status()
     current['application_logs'] = application_ai_monitor.summary()
     current['coverage']['tool_calls'] = 'application_log' if any(s['status'] == 'available' for s in current['application_logs']['sources']) else 'waiting'
     current['coverage']['mcp'] = current['coverage']['tool_calls']

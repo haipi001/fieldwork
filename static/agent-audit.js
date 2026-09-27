@@ -52,6 +52,8 @@
     $('#agentDesktopDiscovery').innerHTML=Array.from(apps.values()).map(app=>`<div class="agent-list-row"><b>${esc(app.name)}</b><span>${app.count?`${app.count} 个可见进程`:'已安装 · 未发现运行进程'}</span></div>`).join('')||empty('未发现可识别的 AI 软件。未识别的软件和浏览器内 AI 服务仍需适配。');
     $('#agentDesktopDiscovery').innerHTML+=`<p class="target-hint">${esc(coverageText(snapshot))}</p>${(snapshot.errors||[]).map(error=>`<p class="inline-error">${esc(error)}</p>`).join('')}`;
     if(snapshot.application_logs)$('#agentDesktopDiscovery').innerHTML+=`<div class="agent-log-sources"><p class="target-hint">${esc(translated('工具日志来源（非独立证据）'))}</p>${snapshot.application_logs.sources.map(source=>`<div class="agent-list-row"><b>${esc(source.app)}</b><span>${esc(translated(source.status==='available'?'可读取应用日志':source.status==='waiting'?'等待软件产生工具日志':'日志暂不可读'))}</span></div>`).join('')}</div>`;
+    const nativeLabels={not_installed:'文件动作采集器尚未安装',unsupported_platform:'文件动作采集器暂不支持当前系统',installation_check_failed:'文件动作采集器安装检查未通过',installed_not_connected:'文件动作采集器已安装，实时服务尚未连接'};
+    if(snapshot.native_installation)$('#agentDesktopDiscovery').innerHTML+=`<p class="target-hint">${esc(translated(nativeLabels[snapshot.native_installation.status]||nativeLabels.installation_check_failed))}</p>`;
   }
   async function discover(){auditState.discovery=await call('/desktop/discovery');renderDiscovery(auditState.discovery);}
   function monitorLoop() {

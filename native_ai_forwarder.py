@@ -111,6 +111,43 @@ class PendingBatch:
         # Immutable bytes, not a dictionary that a caller could mutate between retries.
         self.request_bytes = canonical(envelope)
 
+    @classmethod
+    def restore(cls,request_bytes,*,audit_id,collector_id,session_id,public_key):
+        """Verify encrypted queue contents again against the paired signing key."""
+        if not isinstance(request_bytes,bytes) or len(request_bytes)>2_000_000:
+            raise ValueError('恢复批次大小无效')
+        envelope=json.loads(request_bytes)
+        expected={'kind','content','provenance','source_name','independent_attested',
+            'self_report_complete','collector_id','sequence','nonce','signed_at','signature'}
+        if not isinstance(envelope,dict) or set(envelope)!=expected:
+            raise ValueError('恢复批次结构无效')
+        if (envelope['collector_id']!=collector_id or envelope['kind']!='generic_json'
+            or envelope['provenance']!='operator_telemetry'
+            or envelope['source_name']!='native Endpoint Security metadata'
+            or envelope['independent_attested'] is not False or envelope['self_report_complete'] is not False
+            or type(envelope['sequence']) is not int or envelope['sequence']<1):
+            raise ValueError('恢复批次范围或来源无效')
+        content=envelope['content']
+        if not isinstance(content,str) or len(content.encode())>1_000_000:
+            raise ValueError('恢复内容大小无效')
+        document=json.loads(content)
+        if not isinstance(document,dict) or set(document)!={'events'} or not isinstance(document['events'],list) or not 1<=len(document['events'])<=100:
+            raise ValueError('恢复内容结构无效')
+        events=[]
+        for event in document['events']:
+            if not isinstance(event,dict) or event.get('session_id')!=session_id:
+                raise ValueError('恢复记录会话范围无效')
+            events.append(native_ai_events.normalize({key:value for key,value in event.items() if key!='session_id'},session_id))
+        if canonical({'events':events}).decode()!=content:
+            raise ValueError('恢复内容不是规范原生批次')
+        payload_hash=hashlib.sha256(content.encode()).hexdigest()
+        payload={key:envelope[key] for key in ('collector_id','sequence','nonce','signed_at','kind','provenance','source_name')}
+        payload.update(schema='fieldwork-agent-telemetry-signature/1',audit_id=audit_id,input_sha256=payload_hash)
+        public_key.verify(base64.b64decode(envelope['signature'],validate=True),canonical(payload))
+        value=cls.__new__(cls)
+        value.audit_id=audit_id;value.payload_hash=payload_hash;value.request_bytes=request_bytes
+        return value
+
     def matches_receipt(self, receipt):
         envelope = json.loads(self.request_bytes)
         return isinstance(receipt, dict) and all(type(receipt.get(key)) is type(expected) and receipt.get(key) == expected for key, expected in {

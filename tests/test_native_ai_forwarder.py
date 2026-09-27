@@ -58,3 +58,35 @@ def test_replayed_retry_only_succeeds_with_matching_receipt():
     def conflict(*args):raise ImportConflict()
     assert pending.deliver(conflict,lambda *args:receipt(pending))['acknowledged'] is True
     with pytest.raises(ImportConflict):pending.deliver(conflict,lambda *args:None)
+
+
+def test_restored_batch_must_match_key_audit_and_session():
+    from cryptography.exceptions import InvalidSignature
+    key=Ed25519PrivateKey.generate()
+    pending=PendingBatch([record()],audit_id='audit',collector_id='collector',sequence=1,
+        private_key=key,session_id='session')
+    kwargs=dict(audit_id='audit',collector_id='collector',session_id='session',public_key=key.public_key())
+    restored=PendingBatch.restore(pending.request_bytes,**kwargs)
+    assert restored.request_bytes==pending.request_bytes
+    assert restored.matches_receipt(receipt(pending))
+    with pytest.raises(InvalidSignature):PendingBatch.restore(pending.request_bytes,**{**kwargs,'audit_id':'other'})
+    with pytest.raises(InvalidSignature):PendingBatch.restore(pending.request_bytes,**{**kwargs,'public_key':Ed25519PrivateKey.generate().public_key()})
+    with pytest.raises(ValueError):PendingBatch.restore(pending.request_bytes,**{**kwargs,'session_id':'other'})
+
+
+def test_restart_retries_same_encrypted_signed_batch_until_receipt(tmp_path):
+    from native_ai_queue import EncryptedPendingQueue
+    key=Ed25519PrivateKey.generate(); encryption=b'e'*32; path=tmp_path/'queue'
+    pending=PendingBatch([record()],audit_id='audit',collector_id='collector',sequence=1,
+        private_key=key,session_id='session')
+    def open_queue():return EncryptedPendingQueue(path,encryption,audit_id='audit',collector_id='collector')
+    with open_queue() as queue:queue.save(pending.request_bytes)
+    with open_queue() as restarted:
+        recovered=PendingBatch.restore(restarted.load(),audit_id='audit',collector_id='collector',
+            session_id='session',public_key=key.public_key())
+        def unavailable(*args):raise ConnectionError()
+        with pytest.raises(ConnectionError):recovered.deliver(unavailable,lambda *args:None)
+        assert restarted.load()==pending.request_bytes
+        assert recovered.deliver(unavailable,lambda *args:receipt(pending))['acknowledged']
+        restarted.acknowledge(recovered.request_bytes)
+        assert restarted.load() is None

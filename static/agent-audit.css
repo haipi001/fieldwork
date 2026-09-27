@@ -105,17 +105,20 @@ body[data-mode="agent_audit"] [data-workspace="new"] .truth-panel p {
 body[data-mode="agent_audit"] [data-workspace="new"] .truth-index,
 body[data-mode="agent_audit"] [data-workspace="new"] .truth-chain {font-size:11px;}
 #agent-new .agent-scanner {
-  grid-template-columns:110px minmax(0,1fr); gap:26px; min-height:0; padding:26px 30px;
+  grid-template-columns:64px minmax(0,1fr); gap:22px; min-height:0; padding:22px 26px;
   border-radius:12px; background:linear-gradient(110deg,#edf3e9,#f8faf6);
 }
-#agent-new .agent-scanner-signal {width:100px; max-width:100px; margin:0;}
-#agent-new .agent-scanner h1 {font-size:clamp(25px,2.2vw,32px); line-height:1.25; margin:6px 0 10px;}
+#agent-new .agent-scanner-signal {width:64px; max-width:64px; margin:0;}
+#agent-new .agent-scanner-content {display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:12px 24px;}
+#agent-new .agent-scanner h2 {font-size:clamp(24px,2vw,30px); line-height:1.25; margin:6px 0 8px;}
 #agent-new .agent-scanner p {font-size:14px; line-height:1.7; max-width:850px; margin:0 0 10px;}
 #agent-new .agent-scanner .eyebrow {font-size:10px; letter-spacing:.08em; margin-bottom:6px;}
 #agent-new .agent-scanner-facts {gap:8px; margin:14px 0;}
 #agent-new .agent-scanner-facts span {padding:4px 8px; font-size:11px;}
-#agent-new .agent-scanner .primary-action {min-width:180px; padding:12px 16px; margin-bottom:10px;}
-#agent-new .agent-scanner .target-hint {font-size:12px; color:var(--muted); margin:0;}
+#agent-new .agent-scanner .primary-action {min-width:180px; padding:12px 16px; margin:0;}
+#agent-new .agent-scanner .target-hint {grid-column:1/-1; font-size:12px; color:var(--muted); margin:0;}
+#agent-new .agent-scanner .inline-error {grid-column:1/-1; margin:0;}
+#agent-new .agent-scanner .inline-error:empty {display:none;}
 #agent-new .agent-card {margin-top:20px; padding:20px 24px;}
 #agent-new .agent-card .section-heading {margin-bottom:8px;}
 #agent-new .agent-card h2 {font-size:19px;}
@@ -133,7 +136,8 @@ body[data-mode="agent_audit"] [data-workspace="new"] .truth-chain {font-size:11p
 @media(max-width:600px) {
   #agent-new .agent-scanner {grid-template-columns:minmax(0,1fr); padding:22px; gap:12px;}
   #agent-new .agent-scanner-signal {display:none;}
-  #agent-new .agent-scanner h1 {font-size:26px;}
+  #agent-new .agent-scanner-content {grid-template-columns:1fr; gap:12px;}
+  #agent-new .agent-scanner h2 {font-size:26px;}
   #agent-new .agent-card {padding:18px;}
   #agentDesktopDiscovery .agent-list-row {gap:8px;}
 }

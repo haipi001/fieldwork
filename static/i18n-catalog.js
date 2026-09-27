@@ -567,6 +567,7 @@ window.FIELDWORK_EN = Object.freeze({
   "无法确认": "Unconfirmed",
   "系统已拒绝": "Denied by the system",
   "文件动作采集器尚未安装": "File activity collector is not installed",
+  "正在检测本机 AI 软件…": "Detecting desktop AI apps…",
   "文件动作采集器暂不支持当前系统": "File activity collector does not support this system yet",
   "文件动作采集器安装检查未通过": "File activity collector installation check failed",
   "文件动作采集器已安装，实时服务尚未连接": "File activity collector is installed; live service is not connected",

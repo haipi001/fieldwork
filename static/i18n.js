@@ -15,6 +15,7 @@
     [/^(\d+) 个运行中 · 上限 (\d+)$/, '$1 running · limit $2'],
     [/^(\d+) 个项目$/, '$1 projects'],
     [/^(\d+) 个审计$/, '$1 audits'],
+    [/^(\d+) 个记录$/, '$1 recordings'],
     [/^(\d+) 个行为 · (\d+) 条自述 · (\d+) 次导入$/, '$1 actions · $2 claims · $3 imports'],
     [/^剩余 (\d+) 阶段：(.+)$/, '$1 stages remaining: $2'],
     [/^(\d+) 个阶段已结束$/, '$1 stages completed'],

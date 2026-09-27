@@ -29,6 +29,10 @@ sh collectors/native-ai/build.sh /tmp/fieldwork-native-ai-collector
 
 ## 实时启用前尚需完成
 
+`native_ai_launcher` 提供固定安装位置的启动门禁：文件及所有父目录必须由 root 持有、不能组/全局可写、不能经过符号链接；签名必须满足 Apple 证书链、固定代码 identifier 与已配置 Team ID，同时带真实布尔 ES entitlement，不能启用调试权限。检查前后核对文件实例，签名超时或失败时不启动。启动函数只允许已授权管理员服务调用，固定可执行文件且不接受任意命令参数。门禁通过不证明 ES 权限已可用；生产采集进程仍可能因授权不足退出。本机未安装此受保护采集器、未配置生产 Team ID，未提升权限或执行该启动函数。真正的受保护服务安装、签名身份和系统授权仍待完成。
+
+签名 requirement 依据 [Apple TN3127](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)；测试用替身验证门禁行为，不宣称签名安装验证完成。
+
 `NativeProcessReader` 已提供进程管道读取：非阻塞、单次等待最多一秒、分段 JSONL 重组、单行 256 KiB 上限，遇到管线背压保留未接受的原始行并暂停读取。格式错误、模拟标记、超长行与退出时半行明确拒绝；stderr 只统计字节，不转发或保存任意诊断正文。状态报告 EOF、已读取数量与退出码，不把进程活着当作已具备系统采集权限。它只接收已经由可信服务启动的 Popen 句柄；受保护安装、签名检查、启动和暂停停止监督尚需完成。当前测试使用明确的独立测试生产者，不证明 Endpoint Security 实时采集已启用。
 
 `NativePipeline` 已把验证、签名、加密队列、HTTP 发送与回执恢复连为一条可调用管线：`accept(record)` 接收元数据，`flush()` 先保存再发送，未明确确认不清队列；最多缓存 100 条且不超过 1 MB，未确认时向进程读取方返回背压。确认后的下一序列独立加密持久化，先保存序列再清除批次；在清理前重启时仍核对原批次回执，不回退序列。本次通过模块级组合验证，尚未连接实际 Endpoint Security 进程或用户的一键监控入口。

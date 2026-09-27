@@ -34,15 +34,14 @@ def protected_binary(path):
     return identity
 
 
-def verify_installed_collector(team_id):
+def verify_signature(path,team_id):
     if platform.system()!='Darwin':raise NativeLaunchError('原生采集器仅支持 macOS')
     if not isinstance(team_id,str) or not re.fullmatch(r'[A-Z0-9]{10}',team_id):
         raise NativeLaunchError('尚未配置可信签名团队')
-    before=protected_binary(INSTALL_PATH)
     requirement=f'anchor apple generic and identifier "{IDENTIFIER}" and certificate leaf[subject.OU] = "{team_id}"'
     def run(arguments):
         try:
-            result=subprocess.run(['/usr/bin/codesign',*arguments,str(INSTALL_PATH)],
+            result=subprocess.run(['/usr/bin/codesign',*arguments,str(path)],
                 stdin=subprocess.DEVNULL,capture_output=True,timeout=10,check=False,
                 env={'PATH':'/usr/bin:/bin','LANG':'C'})
         except (OSError,subprocess.TimeoutExpired):
@@ -58,6 +57,12 @@ def verify_installed_collector(team_id):
         raise NativeLaunchError('签名缺少 Endpoint Security entitlement')
     if entitlements.get('com.apple.security.get-task-allow') is True:
         raise NativeLaunchError('生产采集器不能启用调试权限')
+    return True
+
+
+def verify_installed_collector(team_id):
+    before=protected_binary(INSTALL_PATH)
+    verify_signature(INSTALL_PATH,team_id)
     if protected_binary(INSTALL_PATH)!=before:
         raise NativeLaunchError('签名检查期间采集器发生变化')
     return before

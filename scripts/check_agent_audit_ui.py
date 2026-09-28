@@ -60,9 +60,12 @@ with sync_playwright() as p:
     assert page.locator('#agentInputSummary').is_visible()
     assert page.locator('#agentImport').is_hidden()
     assert '模拟示例' in page.locator('#agentAuditBadge').inner_text()
+    assert '0 条待审阅 · 1 条已确认' in page.locator('#agentResultBrief').inner_text()
+    assert page.locator('#agentKpis').inner_text().count('待审阅事件') == 1
     assert 'CONTRADICTED' in page.locator('#agentComparison').inner_text()
     timeline = page.locator('#agentTimeline').inner_text()
-    assert 'Agent 自述' in timeline and '检测到策略异常' in timeline and 'CONTRADICTION DETECTED' in timeline
+    assert 'Agent 自述' in timeline and '已确认' in timeline and 'CONTRADICTION DETECTED' in timeline
+    assert '需审阅' not in timeline
     page.wait_for_timeout(250)
     page.screenshot(path=str(OUT/'02-comparison.png'),full_page=True)
     page.locator('.nav-link[data-go="findings"]').click()

@@ -47,10 +47,14 @@
     const coverage=snapshot?.coverage||{};
     return [['进程','processes'],['TCP','network'],['打开文件','open_files'],['工具 / MCP','tool_calls'],['浏览器 AI','browser_ai']].map(([name,key])=>`${translated(name)}: ${translated(labels[coverage[key]]||'未接入')}`).join(' · ')+' · '+translated('实际文件读写：未接入');
   }
-  function resultBrief(a) {
-    const events=a.events||[], anomalies=a.live_anomalies||[], confirmed=a.findings||[];
+  function reviewEventIds(a) {
+    const confirmed=new Set((a.findings||[]).map(item=>item.verification?.event_id).filter(Boolean));
     const pending=(a.candidates||[]).filter(item=>item.status!=='verified');
-    const reviewCount=new Set([...anomalies.map(item=>item.event_id),...pending.map(item=>item.event_id)].filter(Boolean)).size;
+    return new Set([...(a.live_anomalies||[]).map(item=>item.event_id),...pending.map(item=>item.event_id)].filter(id=>id&&!confirmed.has(id)));
+  }
+  function resultBrief(a) {
+    const events=a.events||[], confirmed=a.findings||[];
+    const reviewCount=reviewEventIds(a).size;
     const nativeFile=events.some(item=>item.schema==='fieldwork-native-es/1'&&item.source_type==='filesystem'&&(item.authenticity_verified===true||item.trust_level==='signed_collector'));
     const coverage=a.monitor?.desktop?.coverage||{};
     const browser=a.monitor?.browser?.status||'not_connected';
@@ -125,7 +129,7 @@
     const blocked=a.events.filter(x=>x.status==='blocked').length;
     $('#agentResultBrief').innerHTML=resultBrief(a);
     $('#agentFindingBrief').innerHTML=resultBrief(a);
-    $('#agentKpis').innerHTML=[['已记录事件',a.events.length],['实时异常',a.live_anomalies?.length||0],['已阻止',blocked],['已确认事件',a.findings.length]].map(([label,n])=>`<div class="metric"><small>${label}</small><strong>${n}</strong></div>`).join('');
+    $('#agentKpis').innerHTML=[['已记录事件',a.events.length],['待审阅事件',reviewEventIds(a).size],['已阻止',blocked],['已确认事件',a.findings.length]].map(([label,n])=>`<div class="metric"><small>${label}</small><strong>${n}</strong></div>`).join('');
     panels.run.querySelectorAll('.agent-workflow span').forEach(step=>step.classList.toggle('active',step.dataset.step===(a.analysis?'review':monitorStatus==='active'||monitorStatus==='paused'?'record':'monitor')));
     const hasInputs=a.imports.length>0, analyze=$('#agentAnalyze'), generate=$('#agentGenerateReport');
     if(analyze){analyze.disabled=!hasInputs;analyze.className=hasInputs?'primary-action':'quiet-button';analyze.textContent=hasInputs?'分析已导入材料 ↗':'开始确定性分析';}
@@ -155,6 +159,7 @@
     monitorLoop();
   }
   function renderTimeline(){const a=auditState.current;if(!a)return;const mapping={AGENT:['agent_trace'],TOOLS:['tool_call','mcp','api'],PROCESS:['process'],FILES:['filesystem'],NETWORK:['network','browser']},items=[];
+    const confirmedEventIds=new Set((a.findings||[]).map(f=>f.verification?.event_id).filter(Boolean));
     const actors=[...new Set([...a.events.map(e=>e.actor),...a.claims.map(c=>c.actor)].filter(Boolean))].sort();
     $('#agentActorFilter').innerHTML='<option value="">全部软件</option>'+actors.map(actor=>`<option value="${esc(actor)}">${esc(actor)}</option>`).join('');
     if(!actors.includes(auditState.actor))auditState.actor='';
@@ -163,14 +168,14 @@
     if(auditState.filter==='ALL'||auditState.filter==='SELF REPORT')for(const c of a.claims){if(auditState.actor&&c.actor!==auditState.actor)continue;items.push({at:c.time_start,order:3,html:`<article class="agent-list-row"><time>${formatTime(c.time_start)}</time><div><b>Agent 自述</b><p>${esc(c.statement)}</p><small>${esc(c.assertion)}</small></div><span class="state-badge">${esc(a.analysis?.reconciliation.rows.find(row=>row.claim_id===c.claim_id)?.status||'待分析')}</span></article>`});}
     if(auditState.filter!=='SELF REPORT')for(const e of a.events){
       if(auditState.actor&&e.actor!==auditState.actor)continue;
-      const evaluation=a.analysis?.policy_evaluations[e.id]||a.live_evaluations?.[e.id],reconciled=a.analysis?.reconciliation.event_status[e.id]||'UNKNOWN';
+      const evaluation=a.analysis?.policy_evaluations[e.id]||a.live_evaluations?.[e.id],reconciled=a.analysis?.reconciliation.event_status[e.id]||'UNKNOWN',confirmed=confirmedEventIds.has(e.id);
       const labels={process_observed:'发现进程',process_disappeared:'进程不再可见',connection_observed:'发现 TCP 连接',connection_disappeared:'连接不再可见',open_file_observed:'打开文件观察',application_tool_request:'应用记录工具请求',application_tool_result:'应用记录工具结果',browser_request_observed:'浏览器请求观察',native_exec:'执行通知',native_fork:'子进程创建通知',native_exit:'退出通知',native_open:'文件打开通知',native_write:'文件写入通知',native_close:'文件关闭通知',native_unlink:'文件删除通知',native_rename:'文件重命名通知'};
       const attribution=translated(({parent_process:'子进程关联',native_parent_chain:'系统父子进程关联',native_exec_chain:'系统执行链关联',snapshot_lineage_bootstrap:'启动时进程关联推断',application_log:'应用日志关联',browser_metadata:'浏览器元数据关联'})[e.attribution_method]||'软件进程匹配');
       const incompletePath=e.path_truncated||e.destination_truncated||e.executable_truncated;
       const resourceText=e.command_category==='native_rename'&&e.destination?`${e.resource} → ${e.destination}`:e.resource;
       const pathNote=incompletePath?`<small class="agent-note">${esc(translated('系统路径已截断，不能确认完整位置'))}</small>`:'';
-      if(auditState.filter==='ALL'||(mapping[auditState.filter]||[]).includes(e.source_type)||auditState.filter==='VIOLATIONS'&&evaluation?.decision==='violation')items.push({at:e.timestamp,order:1,html:`<article class="agent-list-row"><time>${formatTime(e.timestamp)}</time><div><b>${esc(labels[e.command_category]||`${e.source_type} · ${e.action_type}`)}</b><p>${esc(resourceText)}</p>${pathNote}<small>${esc(e.actor)}${e.process_id!=null?` · PID ${e.process_id} · ${esc(attribution)}`:''} · ${esc(translated(e.source_name))} · ${esc(translated(e.independent?'独立记录':e.attribution_method==='application_log'?'应用日志 · 非独立证据':e.attribution_method==='browser_metadata'?'浏览器元数据 · 未签名':'Agent 材料'))}</small></div><span class="state-badge ${evaluation?.decision==='violation'&&e.status!=='blocked'?'agent-alert':''}">${e.status==='blocked'?(e.schema==='fieldwork-native-es/1'?'系统已拒绝':'已阻止'):evaluation?.decision==='violation'?'异常':evaluation?.decision==='allowed'?'规则内':evaluation?.decision==='uncertain'&&a.policy?'无法确认':e.attribution_method==='application_log'?'应用记录':e.status==='observed'?'状态观察':'待评估'}</span></article>`});
-      if(evaluation?.decision==='violation'&&e.status!=='blocked'&&['ALL','VIOLATIONS'].includes(auditState.filter))items.push({at:e.timestamp,order:2,html:`<article class="agent-list-row agent-derived-event"><time>${formatTime(e.timestamp)}</time><div><b>检测到策略异常</b><p>${esc(evaluation.boundaries.join(' · '))}</p><small>实时规则检查</small></div><span class="state-badge agent-alert">需审阅</span></article>`});
+      if(auditState.filter==='ALL'||(mapping[auditState.filter]||[]).includes(e.source_type)||auditState.filter==='VIOLATIONS'&&evaluation?.decision==='violation')items.push({at:e.timestamp,order:1,html:`<article class="agent-list-row"><time>${formatTime(e.timestamp)}</time><div><b>${esc(labels[e.command_category]||`${e.source_type} · ${e.action_type}`)}</b><p>${esc(resourceText)}</p>${pathNote}<small>${esc(e.actor)}${e.process_id!=null?` · PID ${e.process_id} · ${esc(attribution)}`:''} · ${esc(translated(e.source_name))} · ${esc(translated(e.independent?'独立记录':e.attribution_method==='application_log'?'应用日志 · 非独立证据':e.attribution_method==='browser_metadata'?'浏览器元数据 · 未签名':'Agent 材料'))}</small></div><span class="state-badge ${evaluation?.decision==='violation'&&e.status!=='blocked'&&!confirmed?'agent-alert':''}">${confirmed?'已确认':e.status==='blocked'?(e.schema==='fieldwork-native-es/1'?'系统已拒绝':'已阻止'):evaluation?.decision==='violation'?'异常':evaluation?.decision==='allowed'?'规则内':evaluation?.decision==='uncertain'&&a.policy?'无法确认':e.attribution_method==='application_log'?'应用记录':e.status==='observed'?'状态观察':'待评估'}</span></article>`});
+      if(evaluation?.decision==='violation'&&e.status!=='blocked'&&!confirmed&&['ALL','VIOLATIONS'].includes(auditState.filter))items.push({at:e.timestamp,order:2,html:`<article class="agent-list-row agent-derived-event"><time>${formatTime(e.timestamp)}</time><div><b>检测到策略异常</b><p>${esc(evaluation.boundaries.join(' · '))}</p><small>实时规则检查</small></div><span class="state-badge agent-alert">需审阅</span></article>`});
       if(['CONTRADICTED','OMITTED'].includes(reconciled)&&auditState.filter==='ALL')items.push({at:e.timestamp,order:4,html:`<article class="agent-list-row agent-derived-event"><time>${esc(e.timestamp)}</time><div><b>${reconciled==='CONTRADICTED'?'CONTRADICTION DETECTED':'OMISSION DETECTED'}</b><p>${esc(resourceText)}</p>${pathNote}<small>Claim ↔ Evidence Reconciliation</small></div><span class="state-badge agent-alert">${esc(reconciled)}</span></article>`});
     }
     items.sort((left,right)=>String(right.at).localeCompare(String(left.at))||left.order-right.order);

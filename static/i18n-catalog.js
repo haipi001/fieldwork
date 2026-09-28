@@ -603,6 +603,7 @@ window.FIELDWORK_EN = Object.freeze({
   "个行为主体": "actors",
   "已记录事件": "Recorded events",
   "实时异常": "Live alerts",
+  "待审阅事件": "Events to review",
   "已阻止": "Blocked",
   "下方只展示经过独立验证的结论；其余候选仍需检查。": "Only independently verified conclusions appear below; other candidates still need review.",
   "异常提示和候选不是已确认结论，请打开事件结果逐条核查。": "Alerts and candidates are not confirmed conclusions. Review each event in the results.",

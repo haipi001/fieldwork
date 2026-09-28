@@ -1,6 +1,7 @@
 """Real browser smoke against an isolated running Fieldwork test service."""
 import json
 import os
+import re
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -38,8 +39,8 @@ with sync_playwright() as p:
     page.locator('#agentMonitorStart').click()
     page.locator('#agentMonitorControl').wait_for(state='visible')
     assert '后台监控中' in page.locator('#agentMonitorControl').inner_text()
-    assert '系统快照采样' in page.locator('#agentMonitorControl').inner_text()
-    assert '自动监控已启动' in page.locator('#agentTimeline').inner_text()
+    assert '进程: 快照采样' in page.locator('#agentMonitorControl').inner_text()
+    assert page.locator('#agentTimeline .agent-list-row').count() > 0
     assert page.locator('#agentKpis').inner_text().count('已记录事件') == 1
     assert '打开文件 ·' in page.locator('#agentResultBrief').inner_text()
     assert '文件动作 · 未接入' in page.locator('#agentResultBrief').inner_text()
@@ -68,6 +69,34 @@ with sync_playwright() as p:
     timeline = page.locator('#agentTimeline').inner_text()
     assert 'Agent 自述' in timeline and '已确认' in timeline and 'CONTRADICTION DETECTED' in timeline
     assert '需审阅' not in timeline
+    def add_unconfirmed_alert(route):
+        response = route.fetch()
+        payload = response.json()
+        if payload.get('demo'):
+            confirmed_ids = {finding['verification']['event_id'] for finding in payload['findings']}
+            target = next(event for event in payload['events'] if event['id'] not in confirmed_ids)
+            alert = {'event_id': target['id'], 'decision': 'violation', 'boundaries': ['TEST_REVIEW_BOUNDARY']}
+            payload['live_anomalies'] = [*payload['live_anomalies'], alert]
+            payload['analysis']['policy_evaluations'][target['id']] = {'decision': 'violation', 'boundaries': alert['boundaries']}
+        route.fulfill(response=response, json=payload)
+    alert_route = re.compile(r'/api/v1/agent-audit/audits/[^/?]+$')
+    page.route(alert_route, add_unconfirmed_alert)
+    demo_id = page.locator('#agentAuditSelect').input_value()
+    other_id = next(option.get_attribute('value') for option in page.locator('#agentAuditSelect option').all()
+                    if option.get_attribute('value') not in ('', demo_id))
+    page.locator('#agentAuditSelect').select_option(value=other_id)
+    page.wait_for_function("document.querySelector('#agentAuditBadge').textContent !== '模拟示例'")
+    page.locator('#agentAuditSelect').select_option(value=demo_id)
+    page.wait_for_function("document.querySelector('#agentResultBrief').textContent.includes('1 条待审阅')")
+    page.locator('.nav-link[data-go="findings"]').click()
+    assert page.locator('#agentCandidateCount').inner_text() == '1'
+    assert '实时规则提示 · 尚未形成验证候选' in page.locator('#agentCandidates').inner_text()
+    assert '尚非已确认事件' in page.locator('#agentCandidates').inner_text()
+    page.unroute(alert_route, add_unconfirmed_alert)
+    page.locator('.nav-link[data-go="run"]').click()
+    page.locator('#agentAuditSelect').select_option(value=other_id)
+    page.locator('#agentAuditSelect').select_option(value=demo_id)
+    page.wait_for_function("document.querySelector('#agentResultBrief').textContent.includes('0 条待审阅')")
     page.wait_for_timeout(250)
     page.screenshot(path=str(OUT/'02-comparison.png'),full_page=True)
     page.locator('.nav-link[data-go="findings"]').click()

@@ -333,6 +333,19 @@ def test_start_monitor_reuses_active_session(client):
     assert resumed['monitor']['status'] == 'active'
 
 
+def test_monitor_scan_state_exposes_stalled_collector(client):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    aid = started['id']
+    assert started['monitor']['scan_state'] == 'current'
+    with core.connect() as db:
+        db.execute("UPDATE agent_monitors SET last_scan_at=? WHERE audit_id=?", ('2000-01-01T00:00:00+00:00', aid))
+    stale = client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    assert stale['monitor']['status'] == 'active'
+    assert stale['monitor']['scan_state'] == 'delayed'
+    paused = client.post(f'/api/v1/agent-audit/monitor/{aid}/pause').json()
+    assert paused['monitor']['scan_state'] == 'paused'
+
+
 def test_monitor_pause_resume_health_and_live_anomalies(client, monkeypatch):
     started = client.post('/api/v1/agent-audit/monitor/start').json()
     aid = started['id']

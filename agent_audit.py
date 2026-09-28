@@ -1035,6 +1035,13 @@ def get_audit(audit_id: str):
     monitor_view = dict(monitor) if monitor else None
     if monitor_view:
         monitor_view['health'] = storage_health()
+        monitor_view['scan_state'] = monitor_view['status']
+        if monitor_view['status'] == 'active':
+            try:
+                scan_age = (datetime.now().astimezone() - timestamp(monitor_view['last_scan_at'])).total_seconds()
+                monitor_view['scan_state'] = 'current' if -5 <= scan_age <= 15 else 'delayed'
+            except (TypeError, ValueError):
+                monitor_view['scan_state'] = 'delayed'
         desktop = monitor_view['collector_kind'] == 'desktop'
         monitor_view['source'] = 'macOS 本机 AI 活动采集器' if desktop else 'Fieldwork 后台事件流'
         monitor_view['scope'] = '本机 AI 进程、TCP 连接、打开文件与已适配的应用工具日志' if desktop else '旧记录：Fieldwork 内部运行事件'

@@ -87,7 +87,7 @@
       if(auditState.pollPending||auditState.actionDepth)return;
       const id=auditState.current.id,revision=auditState.monitorRevision;auditState.pollPending=true;
       try{const updated=await call(`/audits/${id}`);if(revision===auditState.monitorRevision&&id===auditState.current?.id&&!auditState.actionDepth){auditState.current=updated;render();}}
-      catch(e){if(revision===auditState.monitorRevision)$('#agentMonitorHealth').textContent='状态刷新失败，将自动重试';}
+      catch(e){if(revision===auditState.monitorRevision){$('#agentMonitorTitle').textContent='无法确认监控状态';$('#agentMonitorControl').classList.add('agent-monitor-control--delayed');$('#agentMonitorHealth').textContent='状态刷新失败，将自动重试';}}
       finally{auditState.pollPending=false;}
     },2000);
   }
@@ -142,10 +142,12 @@
     $('#agentMonitorControl').hidden=!monitor||monitorStatus==='stopped';
     if(monitor&&monitorStatus!=='stopped'){
       const paused=monitorStatus==='paused', health=monitor.health||{};
-      $('#agentMonitorTitle').textContent=paused?'监控已暂停':'后台监控中';
-      $('#agentMonitorMeta').textContent=`${translated('范围')}: ${translated(monitor.scope)} · ${translated('最近采集')}: ${formatTime(monitor.last_event_at||monitor.last_scan_at)}`;
-      $('#agentMonitorHealth').textContent=[monitor.last_error,monitor.collector_kind==='desktop'?coverageText(monitor.desktop):translated('内部事件流'),`${translated('可用空间')} ${formatBytes(health.free_bytes||0)}`].filter(Boolean).join(' · ');
-      $('#agentMonitorHealth').classList.toggle('inline-error',!!monitor.last_error||health.status==='critical');
+      const delayed=!paused&&monitor.scan_state==='delayed';
+      $('#agentMonitorTitle').textContent=paused?'监控已暂停':delayed?'采集延迟，状态待确认':'后台监控中';
+      $('#agentMonitorControl').classList.toggle('agent-monitor-control--delayed',delayed);
+      $('#agentMonitorMeta').textContent=`${translated('范围')}: ${translated(monitor.scope)} · ${translated('最近采集')}: ${formatTime(monitor.last_scan_at)}`;
+      $('#agentMonitorHealth').textContent=[delayed?'最近扫描已超过 15 秒':null,monitor.last_error,monitor.collector_kind==='desktop'?coverageText(monitor.desktop):translated('内部事件流'),`${translated('可用空间')} ${formatBytes(health.free_bytes||0)}`].filter(Boolean).join(' · ');
+      $('#agentMonitorHealth').classList.toggle('inline-error',delayed||!!monitor.last_error||health.status==='critical');
       $('#agentMonitorPause').textContent=paused?'恢复监控':'暂停';
       $('#agentMonitorPause').dataset.action=paused?'resume':'pause';
       if(monitor.desktop)renderDiscovery(monitor.desktop);

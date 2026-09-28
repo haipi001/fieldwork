@@ -64,6 +64,22 @@ body[data-mode="agent_audit"] [data-workspace]:not([data-workspace="new"]) > :no
 .agent-live-dot { width:10px; height:10px; border-radius:50%; background:#67923f; box-shadow:0 0 0 5px rgba(103,146,63,.12); }
 .agent-manual-tools > summary { margin-bottom:18px; }
 .agent-card--result { border-color:#cbd8c3; }
+.agent-result-brief {margin:18px 0 20px;padding:20px 24px;border:1px solid #ccd8c6;border-radius:12px;background:#f6f9f3;color:var(--ink);}
+.agent-result-head {display:flex;align-items:flex-start;gap:14px;}
+.agent-result-head > div {flex:1;min-width:0;}
+.agent-result-action {flex:0 0 auto;white-space:nowrap;}
+.agent-result-mark {width:12px;height:12px;flex:0 0 12px;margin-top:8px;border-radius:50%;background:#91a05f;box-shadow:0 0 0 5px #e7eddc;}
+.agent-result-mark--confirmed {background:#ad563e;box-shadow:0 0 0 5px #f7e4dd;}
+.agent-result-mark--review {background:#bf8841;box-shadow:0 0 0 5px #f7ead5;}
+.agent-result-brief h2 {margin:2px 0 5px;font-size:clamp(19px,2vw,24px);line-height:1.2;}
+.agent-result-brief p {margin:0;color:var(--reading);font-size:13px;line-height:1.6;}
+.agent-result-brief .agent-result-kicker {font:700 10px ui-monospace,monospace;letter-spacing:.08em;color:#547052;}
+.agent-result-bottom {display:flex;justify-content:space-between;gap:8px 20px;flex-wrap:wrap;margin:16px 0 0;padding-top:13px;border-top:1px solid #dce6d8;font-size:12px;line-height:1.5;}
+.agent-result-bottom strong {color:var(--ink);font-weight:700;}
+.agent-result-bottom span {color:var(--muted);}
+.agent-coverage-chips {display:flex;flex-wrap:wrap;gap:6px;margin-top:12px;}
+.agent-coverage-chips span {border:1px solid #d4dfcf;border-radius:5px;padding:4px 7px;color:#425a49;background:#fff;font-size:11px;}
+@media(max-width:600px){.agent-result-brief{padding:16px 18px}.agent-result-head{flex-wrap:wrap}.agent-result-action{margin-left:26px}.agent-result-bottom{display:block}.agent-result-bottom span{display:block;margin-top:5px}}
 .agent-audit-panel button:disabled { cursor:not-allowed; opacity:.48; }
 .agent-comparison { display:grid; grid-template-columns:1fr 1fr; margin-top:18px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
 .agent-comparison > div { padding:24px; }

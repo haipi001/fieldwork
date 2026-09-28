@@ -1,6 +1,6 @@
 /* Domain-specific UI; the existing mode router and five workspaces remain shared. */
 (() => {
-  const auditState = {items: [], current: null, collectors: [], filter: 'ALL', actor: '', timelineLimit: 100, monitorTimer: null, discovery: null, monitorRevision: 0, actionDepth: 0, pollPending: false};
+  const auditState = {items: [], current: null, collectors: [], filter: 'ALL', actor: '', timelineLimit: 20, monitorTimer: null, discovery: null, monitorRevision: 0, actionDepth: 0, pollPending: false};
   const workspace = name => document.querySelector(`[data-workspace="${name}"]`);
   const originalHero = workspace('new').querySelector('.hero-grid').innerHTML;
   const panels = {};
@@ -29,6 +29,8 @@
   panels.findings.innerHTML = `${workflow('review')}<div class="page-intro"><div><p class="eyebrow">CANONICAL INCIDENTS</p><h1>事件结果</h1><p>先看经过独立验证的结论，再处理仍需验证的候选。</p></div></div><section class="agent-card agent-card--result"><div class="section-heading"><div><h2>已确认事件</h2><p>只包含独立证据能够支持的事实。</p></div><span id="agentFindingCount"></span></div><div id="agentFindings"></div></section><section class="agent-card"><div class="section-heading"><div><h2>待验证事件</h2><p>候选不会自动进入报告结论。</p></div><span id="agentCandidateCount"></span></div><div id="agentCandidates"></div></section><p class="inline-error" id="agentVerifyError" role="alert"></p>`;
   panels.reports.innerHTML = `<div class="page-intro"><div><p class="eyebrow">AI INCIDENT REPORT</p><h1>报告中心</h1><p>保留未知项、反证与材料哈希。模拟数据始终标记为模拟。</p></div></div><div class="agent-actions agent-card"><button id="agentPreview" class="primary-action">生成预览</button><div id="agentDownloads"></div></div><pre id="agentReportPreview" class="agent-report">选择审计后生成报告。</pre><section class="agent-card"><h2>研究指标</h2><div id="agentMetrics"></div></section>`;
   panels.settings.innerHTML = `<div class="page-intro"><div><p class="eyebrow">AUDIT CAPABILITIES</p><h1>设置与工具</h1><p>确定性审计可独立运行，无需模型 API。</p></div></div><div id="agentParsers" class="agent-card"></div><section class="agent-card"><div class="section-heading"><div><h2>可信采集器</h2><p>只登记 Ed25519 公钥；Fieldwork 不接收或保存私钥。</p></div></div><form id="agentCollectorForm"><div class="agent-form-grid">${field('采集器名称','name','required placeholder="Local OS Collector"')}${field('Key ID','key_id','required placeholder="local-os-1"')}${field('公钥（Base64）','public_key','required placeholder="32 字节 Ed25519 公钥"')}</div><button class="quiet-button" type="submit">登记采集器</button><p id="agentCollectorError" class="inline-error" role="alert"></p></form><div id="agentCollectors"></div></section><section class="agent-card"><h2>记录与信任边界</h2><p>签名采集器材料会校验 Ed25519 签名、递增序号和一次性 nonce；操作员声明材料保留为较低可信度。Agent 自述和模型建议不能单独确认事件。</p><p>SHA256 检测导入后的修改。本模式不启动 Agent、不执行导入命令、不联网复现，也不修改第三方系统。</p><p>模型配置沿用 Fieldwork 的「传统 SRC → 设置与工具」。</p></section>`;
+  panels.run.querySelector('#agentKpis').insertAdjacentHTML('beforebegin','<section id="agentResultBrief" class="agent-result-brief" aria-live="polite"></section>');
+  panels.findings.querySelector('.agent-card--result').insertAdjacentHTML('beforebegin','<section id="agentFindingBrief" class="agent-result-brief" aria-live="polite"></section>');
   const empty = message => `<div class="empty-state">${esc(message)}</div>`;
   const call = (path, body) => api('/api/v1/agent-audit' + path, body === undefined ? {} : {method:'POST',body:JSON.stringify(body)});
   async function action(button, errorId, fn) {
@@ -36,7 +38,7 @@
     auditState.monitorRevision++;auditState.actionDepth++;clearInterval(auditState.monitorTimer);
     try { await fn(); } catch(e) { if(error)error.textContent=e.message;else toast(e.message); } finally {button.disabled=false;auditState.actionDepth--;monitorLoop();}
   }
-  async function select(id) {const revision=++auditState.monitorRevision;clearInterval(auditState.monitorTimer);const selected=await call(`/audits/${id}`);if(revision!==auditState.monitorRevision)return;auditState.actor='';auditState.timelineLimit=100;auditState.current=selected;render();}
+  async function select(id) {const revision=++auditState.monitorRevision;clearInterval(auditState.monitorTimer);const selected=await call(`/audits/${id}`);if(revision!==auditState.monitorRevision)return;auditState.actor='';auditState.timelineLimit=20;auditState.current=selected;render();}
   const formatTime = value => value ? new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'medium'}).format(new Date(value)) : '尚无记录';
   const formatBytes = value => value >= 1073741824 ? `${(value/1073741824).toFixed(1)} GB` : `${Math.round(value/1048576)} MB`;
   const translated = value => window.FIELDWORK_I18N?.t(value)||value;
@@ -44,6 +46,23 @@
     const labels={sampling:'快照采样',partial:'部分可见',unavailable:'暂不可用',not_connected:'未接入',application_log:'应用日志（部分）',waiting:'等待日志',browser_metadata:'浏览器元数据（部分）'};
     const coverage=snapshot?.coverage||{};
     return [['进程','processes'],['TCP','network'],['打开文件','open_files'],['工具 / MCP','tool_calls'],['浏览器 AI','browser_ai']].map(([name,key])=>`${translated(name)}: ${translated(labels[coverage[key]]||'未接入')}`).join(' · ')+' · '+translated('实际文件读写：未接入');
+  }
+  function resultBrief(a) {
+    const events=a.events||[], anomalies=a.live_anomalies||[], confirmed=a.findings||[];
+    const pending=(a.candidates||[]).filter(item=>item.status!=='verified');
+    const reviewCount=new Set([...anomalies.map(item=>item.event_id),...pending.map(item=>item.event_id)].filter(Boolean)).size;
+    const nativeFile=events.some(item=>item.schema==='fieldwork-native-es/1'&&item.source_type==='filesystem'&&(item.authenticity_verified===true||item.trust_level==='signed_collector'));
+    const coverage=a.monitor?.desktop?.coverage||{};
+    const browser=a.monitor?.browser?.status||'not_connected';
+    const status=confirmed.length?'confirmed':reviewCount?'review':events.length?'observing':'waiting';
+    const titles={confirmed:'存在已确认事件',review:'有事件需要审阅',observing:a.analysis?'本次记录暂无确认异常':'正在整理已观察活动',waiting:'等待活动记录'};
+    const details={confirmed:'下方只展示经过独立验证的结论；其余候选仍需检查。',review:'异常提示和候选不是已确认结论，请打开事件结果逐条核查。',observing:'目前没有已确认异常。这不代表电脑上的 AI 活动已全部被覆盖。',waiting:'开始监控后，已接入的来源出现活动才会产生记录。'};
+    const source=(key,active,partial='部分可见')=>`${translated(key)} · ${translated(active?partial:'未接入')}`;
+    const chips=a.monitor?.collector_kind==='desktop'?[source('进程',coverage.processes==='sampling'||coverage.processes==='partial','快照采样'),source('TCP',coverage.network==='sampling'||coverage.network==='partial','快照采样'),source('工具 / MCP',coverage.tool_calls==='application_log','应用日志（非独立证据）'),source('浏览器 AI',browser==='connected','请求元数据'),source('文件动作',nativeFile,'已验证记录')]:[];
+    const actors=new Set(events.filter(item=>item.actor&&item.actor!=='desktop-ai-apps').map(item=>item.actor));
+    const counts=`${actors.size} ${translated(a.monitor?.collector_kind==='desktop'?'个软件':'个行为主体')} · ${events.length} ${translated('条活动')} · ${reviewCount} ${translated('条待审阅')} · ${confirmed.length} ${translated('条已确认')}`;
+    const boundary=a.monitor?.collector_kind==='desktop'&&!nativeFile?translated('文件读写尚未接入；打开文件不等于实际读写。'):translated('仅对已记录范围给出结论；未观察到不等于没有发生。');
+    return `<div class="agent-result-head"><span class="agent-result-mark agent-result-mark--${status}" aria-hidden="true"></span><div><p class="agent-result-kicker">${esc(translated(a.demo?'模拟示例 · 检测概览':'检测概览'))}</p><h2>${esc(translated(titles[status]))}</h2><p>${esc(translated(details[status]))}</p></div>${reviewCount?`<button type="button" class="quiet-button agent-result-action" data-agent-go="findings">${esc(translated('查看待审阅事件'))} →</button>`:''}</div><div class="agent-result-bottom"><strong>${esc(counts)}</strong><span>${esc(boundary)}</span></div>${chips.length?`<div class="agent-coverage-chips" aria-label="${esc(translated('采集范围'))}">${chips.map(chip=>`<span>${esc(chip)}</span>`).join('')}</div>`:''}`;
   }
   function renderDiscovery(snapshot) {
     if(!snapshot)return;
@@ -93,16 +112,19 @@
     $('#agentAuditList').innerHTML=auditState.items.map(x=>`<article class="agent-list-row"><div><b>${esc(x.name)}</b><small>${new Date(x.created_at).toLocaleString()}${x.demo?' · SIMULATED':''}</small></div><button class="quiet-button" data-open-audit="${esc(x.id)}">查看记录 →</button></article>`).join('')||empty('还没有审计。建立审计或体验本地示例。');
     $('#agentAuditSelect').innerHTML='<option value="">选择审计</option>'+auditState.items.map(x=>`<option value="${esc(x.id)}" ${a?.id===x.id?'selected':''}>${esc(x.name)}</option>`).join('');
     $('#agentManualTools').hidden=!a||!!a.analysis||a?.monitor?.status==='active';$('#agentInputSummary').hidden=!a||!a.analysis;
-    if(!a){$('#agentKpis').innerHTML='';$('#agentMonitorControl').hidden=true;$('#agentComparisonCard').hidden=true;$('#agentTimeline').innerHTML=empty('暂无行为记录。');$('#agentCandidates').innerHTML=empty('暂无候选。');$('#agentFindings').innerHTML=empty('暂无确认事件。');return;}
+    if(!a){$('#agentKpis').innerHTML='';$('#agentResultBrief').innerHTML='';$('#agentFindingBrief').innerHTML='';$('#agentMonitorControl').hidden=true;$('#agentComparisonCard').hidden=true;$('#agentTimeline').innerHTML=empty('暂无行为记录。');$('#agentCandidates').innerHTML=empty('暂无候选。');$('#agentFindings').innerHTML=empty('暂无确认事件。');return;}
     const monitor=a.monitor, monitorStatus=monitor?.status;
     $('#agentBrowserSetup').hidden=monitor?.collector_kind!=='desktop';
     $('#agentBrowserDownload').disabled=monitorStatus!=='active';
     const browserLabels={waiting:'等待安装或授权',connected:'已连接',stale:'心跳已过期',revoked:'已撤销'};
     $('#agentBrowserConnections').innerHTML=(monitor?.browser?.connections||[]).map(connection=>`<div class="agent-list-row"><span>${esc(translated(browserLabels[connection.status]||'未接入'))} · ${connection.event_count}</span>${connection.status!=='revoked'?`<button class="text-action" data-revoke-browser="${esc(connection.id)}">撤销连接</button>`:''}</div>`).join('')||empty('浏览器采集器尚未连接。');
     $('#agentAuditBadge').textContent=a.demo?'模拟示例':a.analysis?'分析完成':monitorStatus==='paused'?'已暂停':'实时监控';
-    $('#agentRunHint').textContent=monitor?.collector_kind==='desktop' ? '后台记录本机 AI 进程、连接、打开文件与已适配的工具日志。可以离开本页面。' : monitor ? '这是旧版 Fieldwork 内部监控记录。请从首页开始本机监控。' : `${a.identity.name} · ${a.identity.agent_name}`;
+    $('#agent-run .page-intro h1').textContent=a.analysis?'本次检测结果。':monitorStatus==='paused'?'监控已暂停。':'实时观察 Agent 行为。';
+    $('#agentRunHint').textContent=a.analysis?'本次记录已经结束。先看检测概览，再按软件或事件类型查看时间线。':monitor?.collector_kind==='desktop' ? '后台记录本机 AI 进程、连接、打开文件与已适配的工具日志。可以离开本页面。' : monitor ? '这是旧版 Fieldwork 内部监控记录。请从首页开始本机监控。' : `${a.identity.name} · ${a.identity.agent_name}`;
     const evaluations=Object.values(a.analysis?.policy_evaluations||a.live_evaluations||{}), rows=a.analysis?.reconciliation.rows||[];
     const blocked=a.events.filter(x=>x.status==='blocked').length;
+    $('#agentResultBrief').innerHTML=resultBrief(a);
+    $('#agentFindingBrief').innerHTML=resultBrief(a);
     $('#agentKpis').innerHTML=[['已记录事件',a.events.length],['实时异常',a.live_anomalies?.length||0],['已阻止',blocked],['已确认事件',a.findings.length]].map(([label,n])=>`<div class="metric"><small>${label}</small><strong>${n}</strong></div>`).join('');
     panels.run.querySelectorAll('.agent-workflow span').forEach(step=>step.classList.toggle('active',step.dataset.step===(a.analysis?'review':monitorStatus==='active'||monitorStatus==='paused'?'record':'monitor')));
     const hasInputs=a.imports.length>0, analyze=$('#agentAnalyze'), generate=$('#agentGenerateReport');
@@ -175,9 +197,9 @@
   $('#agentCollectorForm').onsubmit=event=>{event.preventDefault();action(event.submitter,'agentCollectorError',async()=>{const form=new FormData(event.target);await call('/collectors',{name:form.get('name'),key_id:form.get('key_id'),public_key:String(form.get('public_key')).trim()});event.target.reset();await refreshAudit();toast('可信采集器已登记');});};
   $('#agentAnalyze').onclick=event=>action(event.currentTarget,'agentImportError',async()=>{auditState.current=await call(`/audits/${auditState.current.id}/analyze`,{});render();});
   $('#agentGenerateReport').onclick=event=>action(event.currentTarget,'agentImportError',async()=>{auditState.current=await call(`/audits/${auditState.current.id}/self-report/generate`,{});render();toast('已保存机器生成的自述建议');});
-  $('#agentEventFilter').onchange=event=>{auditState.filter=event.target.value;auditState.timelineLimit=100;renderTimeline();};
-  $('#agentActorFilter').onchange=event=>{auditState.actor=event.target.value;auditState.timelineLimit=100;renderTimeline();};
-  $('#agentTimelineMore').onclick=()=>{auditState.timelineLimit+=100;renderTimeline();};
+  $('#agentEventFilter').onchange=event=>{auditState.filter=event.target.value;auditState.timelineLimit=20;renderTimeline();};
+  $('#agentActorFilter').onchange=event=>{auditState.actor=event.target.value;auditState.timelineLimit=20;renderTimeline();};
+  $('#agentTimelineMore').onclick=()=>{auditState.timelineLimit+=50;renderTimeline();};
   $('#agentPreview').onclick=event=>action(event.currentTarget,'',async()=>{if(!auditState.current)throw Error('请先选择审计');const r=await fetch(`/api/v1/agent-audit/audits/${auditState.current.id}/report`);if(!r.ok)throw Error('报告读取失败，请检查审计证据完整性');$('#agentReportPreview').textContent=await r.text();});
   document.addEventListener('click',event=>{const open=event.target.closest('[data-open-audit]');if(open)action(open,'agentCreateError',async()=>{await select(open.dataset.openAudit);go('run');});const nav=event.target.closest('[data-agent-go]');if(nav)go(nav.dataset.agentGo);const verify=event.target.closest('[data-verify-incident]');if(verify)action(verify,'agentVerifyError',async()=>{const result=await call(`/audits/${auditState.current.id}/incidents/${verify.dataset.verifyIncident}/verify`,{});await select(auditState.current.id);toast(result.status==='verified'?'记录重建验证通过':'发现冲突遥测，需要人工审阅');});});
   document.addEventListener('fieldwork:languagechange',()=>{if(auditState.current)render();renderDiscovery(auditState.discovery);});

@@ -72,6 +72,7 @@ with sync_playwright() as p:
     page.screenshot(path=str(OUT/'02-comparison.png'),full_page=True)
     page.locator('.nav-link[data-go="findings"]').click()
     page.locator('#agentFindings .agent-incident').wait_for()
+    assert '待审阅事件' in page.locator('#agent-findings').inner_text()
     assert 'VERIFIED' in page.locator('#agentFindings').inner_text()
     assert page.locator('[data-verify-incident]').count() == 0
     page.wait_for_timeout(250)

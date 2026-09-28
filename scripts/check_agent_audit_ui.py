@@ -41,6 +41,8 @@ with sync_playwright() as p:
     assert '系统快照采样' in page.locator('#agentMonitorControl').inner_text()
     assert '自动监控已启动' in page.locator('#agentTimeline').inner_text()
     assert page.locator('#agentKpis').inner_text().count('已记录事件') == 1
+    assert '打开文件 ·' in page.locator('#agentResultBrief').inner_text()
+    assert '文件动作 · 未接入' in page.locator('#agentResultBrief').inner_text()
     page.locator('#agentMonitorPause').click()
     page.wait_for_function("document.querySelector('#agentMonitorPause').textContent.includes('恢复')")
     assert '监控已暂停' in page.locator('#agentMonitorControl').inner_text()

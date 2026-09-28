@@ -61,8 +61,9 @@
     const status=confirmed.length?'confirmed':reviewCount?'review':events.length?'observing':'waiting';
     const titles={confirmed:'存在已确认事件',review:'有事件需要审阅',observing:a.analysis?'本次记录暂无确认异常':'正在整理已观察活动',waiting:'等待活动记录'};
     const details={confirmed:'下方只展示经过独立验证的结论；其余候选仍需检查。',review:'异常提示和候选不是已确认结论，请打开事件结果逐条核查。',observing:'目前没有已确认异常。这不代表电脑上的 AI 活动已全部被覆盖。',waiting:'开始监控后，已接入的来源出现活动才会产生记录。'};
-    const source=(key,active,partial='部分可见')=>`${translated(key)} · ${translated(active?partial:'未接入')}`;
-    const chips=a.monitor?.collector_kind==='desktop'?[source('进程',coverage.processes==='sampling'||coverage.processes==='partial','快照采样'),source('TCP',coverage.network==='sampling'||coverage.network==='partial','快照采样'),source('工具 / MCP',coverage.tool_calls==='application_log','应用日志（非独立证据）'),source('浏览器 AI',browser==='connected','请求元数据'),source('文件动作',nativeFile,'已验证记录')]:[];
+    const source=(key,state)=>`${translated(key)} · ${translated(state)}`;
+    const sampled=state=>state==='sampling'?'快照采样':state==='partial'?'部分可见':state==='unavailable'?'暂不可用':'未接入';
+    const chips=a.monitor?.collector_kind==='desktop'?[source('进程',sampled(coverage.processes)),source('TCP',sampled(coverage.network)),source('打开文件',sampled(coverage.open_files)),source('工具 / MCP',coverage.tool_calls==='application_log'?'应用日志（非独立证据）':coverage.tool_calls==='waiting'?'等待日志':'未接入'),source('浏览器 AI',browser==='connected'?'请求元数据':'未接入'),source('文件动作',nativeFile?'已验证记录':'未接入')]:[];
     const actors=new Set(events.filter(item=>item.actor&&item.actor!=='desktop-ai-apps').map(item=>item.actor));
     const counts=`${actors.size} ${translated(a.monitor?.collector_kind==='desktop'?'个软件':'个行为主体')} · ${events.length} ${translated('条活动')} · ${reviewCount} ${translated('条待审阅')} · ${confirmed.length} ${translated('条已确认')}`;
     const boundary=a.monitor?.collector_kind==='desktop'&&!nativeFile?translated('文件读写尚未接入；打开文件不等于实际读写。'):translated('仅对已记录范围给出结论；未观察到不等于没有发生。');

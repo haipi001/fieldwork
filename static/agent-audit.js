@@ -114,6 +114,10 @@
   }
   function render() {
     const a=auditState.current;$('#agentAuditCount').textContent=`${auditState.items.length} 个审计`;
+    const currentItem=auditState.items.find(item=>item.id===a?.id);
+    if(currentItem&&a?.monitor)currentItem.monitor_status=a.monitor.status;
+    const desktopMonitor=auditState.items.find(item=>item.collector_kind==='desktop'&&['active','paused'].includes(item.monitor_status));
+    $('#agentMonitorStart').textContent=desktopMonitor?.monitor_status==='paused'?'恢复本机监控 ↗':desktopMonitor?'查看本机监控 ↗':'开始本机监控 ↗';
     $('#agentAuditList').innerHTML=auditState.items.map(x=>`<article class="agent-list-row"><div><b>${esc(x.name)}</b><small>${new Date(x.created_at).toLocaleString()}${x.demo?' · SIMULATED':''}</small></div><button class="quiet-button" data-open-audit="${esc(x.id)}">查看记录 →</button></article>`).join('')||empty('还没有审计。建立审计或体验本地示例。');
     $('#agentAuditSelect').innerHTML='<option value="">选择审计</option>'+auditState.items.map(x=>`<option value="${esc(x.id)}" ${a?.id===x.id?'selected':''}>${esc(x.name)}</option>`).join('');
     $('#agentManualTools').hidden=!a||!!a.analysis||a?.monitor?.status==='active';$('#agentInputSummary').hidden=!a||!a.analysis;

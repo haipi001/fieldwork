@@ -47,8 +47,12 @@ with sync_playwright() as p:
     page.locator('#agentMonitorPause').click()
     page.wait_for_function("document.querySelector('#agentMonitorPause').textContent.includes('恢复')")
     assert '监控已暂停' in page.locator('#agentMonitorControl').inner_text()
-    page.locator('#agentMonitorPause').click()
+    monitor_id = page.locator('#agentAuditSelect').input_value()
+    page.locator('.nav-link[data-go="new"]').click()
+    assert '恢复本机监控' in page.locator('#agentMonitorStart').inner_text()
+    page.locator('#agentMonitorStart').click()
     page.wait_for_function("document.querySelector('#agentMonitorPause').textContent.includes('暂停')")
+    assert page.locator('#agentAuditSelect').input_value() == monitor_id
     page.on('dialog', lambda dialog: dialog.accept())
     page.locator('#agentMonitorStop').click()
     page.wait_for_function("window.agentAudit && !document.querySelector('#agentMonitorControl').offsetParent")

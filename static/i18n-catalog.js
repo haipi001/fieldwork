@@ -486,6 +486,8 @@ window.FIELDWORK_EN = Object.freeze({
   "外部采集器与信任边界": "External collectors and trust boundaries",
   "看见本机 AI 的活动。": "See AI activity on your computer.",
   "开始本机监控 ↗": "Start desktop monitoring ↗",
+  "恢复本机监控 ↗": "Resume desktop monitoring ↗",
+  "查看本机监控 ↗": "View desktop monitoring ↗",
   "自动发现电脑上的 AI 软件，持续记录可见进程、子进程与 TCP 连接，整理行为时间线。无需填写表单。": "Discover AI software on your computer and record visible processes, child processes and TCP connections. No forms required.",
   "本机软件发现": "Desktop app discovery",
   "后台记录": "Background recording",

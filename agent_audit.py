@@ -475,9 +475,11 @@ async def monitor_worker():
 @serialized_monitor
 def start_monitor():
     with core.connect() as db:
-        active = db.execute("SELECT audit_id FROM agent_monitors WHERE status IN ('active','paused') AND collector_kind='desktop' ORDER BY started_at DESC LIMIT 1").fetchone()
+        active = db.execute("SELECT audit_id,status FROM agent_monitors WHERE status IN ('active','paused') AND collector_kind='desktop' ORDER BY started_at DESC LIMIT 1").fetchone()
         cursor = db.execute('SELECT COALESCE(MAX(id),0) FROM run_events_v2').fetchone()[0]
     if active:
+        if active['status'] == 'paused':
+            return resume_monitor(active['audit_id'])
         return get_audit(active['audit_id'])
     started = datetime.now().astimezone()
     session = 'live-' + started.strftime('%Y%m%d-%H%M%S')
@@ -1003,7 +1005,7 @@ def verify_incident(audit_id: str, candidate_id: str):
 @router.get('/audits')
 def list_audits():
     with core.connect() as db:
-        return [dict(row) for row in db.execute("SELECT a.id,a.run_id,a.demo,a.created_at,e.name,r.status,m.status AS monitor_status FROM agent_audits a JOIN engagements_v2 e ON e.id=a.id JOIN analysis_runs r ON r.id=a.run_id LEFT JOIN agent_monitors m ON m.audit_id=a.id WHERE e.status!='archived' ORDER BY a.created_at DESC")]
+        return [dict(row) for row in db.execute("SELECT a.id,a.run_id,a.demo,a.created_at,e.name,r.status,m.status AS monitor_status,m.collector_kind FROM agent_audits a JOIN engagements_v2 e ON e.id=a.id JOIN analysis_runs r ON r.id=a.run_id LEFT JOIN agent_monitors m ON m.audit_id=a.id WHERE e.status!='archived' ORDER BY a.created_at DESC")]
 
 
 @router.get('/audits/{audit_id}')

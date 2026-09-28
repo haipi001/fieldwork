@@ -326,6 +326,11 @@ def test_start_monitor_reuses_active_session(client):
     first = client.post('/api/v1/agent-audit/monitor/start').json()
     second = client.post('/api/v1/agent-audit/monitor/start').json()
     assert second['id'] == first['id']
+    paused = client.post(f"/api/v1/agent-audit/monitor/{first['id']}/pause").json()
+    assert paused['monitor']['status'] == 'paused'
+    resumed = client.post('/api/v1/agent-audit/monitor/start').json()
+    assert resumed['id'] == first['id']
+    assert resumed['monitor']['status'] == 'active'
 
 
 def test_monitor_pause_resume_health_and_live_anomalies(client, monkeypatch):

@@ -8,11 +8,14 @@
   let language = localStorage.getItem(storageKey) === 'en' ? 'en' : 'zh-CN';
   let applying = false;
   const patterns = [
+    [/^(\d+) 条匹配记录 · 已显示 (\d+) 条 · 最近记录优先$/, '$1 matching records · $2 shown · newest first'],
+    [/^(\d+) 个可见进程$/, '$1 visible processes'],
     [/^(\d+) 个活动任务$/, '$1 active tasks'],
     [/^(\d+) 个运行中$/, '$1 running'],
     [/^(\d+) 个运行中 · 上限 (\d+)$/, '$1 running · limit $2'],
     [/^(\d+) 个项目$/, '$1 projects'],
     [/^(\d+) 个审计$/, '$1 audits'],
+    [/^(\d+) 个记录$/, '$1 recordings'],
     [/^(\d+) 个行为 · (\d+) 条自述 · (\d+) 次导入$/, '$1 actions · $2 claims · $3 imports'],
     [/^剩余 (\d+) 阶段：(.+)$/, '$1 stages remaining: $2'],
     [/^(\d+) 个阶段已结束$/, '$1 stages completed'],

@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
+from isolated_execution import run_isolated
 from typing import Any
 
 
@@ -335,7 +336,7 @@ def replay_bundle(path: Path, execute: bool = False) -> dict[str, Any]:
                     if not isinstance(command, list) or not command or command[0] != "forge":
                         raise ValueError("Unsafe replay command")
                     argv = [forge, *[str(value) for value in command[1:]]]
-                    process = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=600, shell=False)
+                    process = run_isolated(argv, root, timeout=600, output_limit=1_000_000)
                     tests = [item for item in parse_forge_test_json(process.stdout)
                              if str(item.get("name", "")).split("(", 1)[0] == property_base]
                     failed = [item for item in tests if str(item.get("status", "")).lower() not in {"success", "passed"}

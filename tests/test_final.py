@@ -2304,6 +2304,36 @@ def test_resume_skips_existing_checkpoint(client):
     assert done_before >= 1
 
 
+def test_unsupported_resume_keeps_run_paused(client, monkeypatch):
+    async def no_demo_pipeline(_run_id):
+        return None
+
+    monkeypatch.setattr(final_core, "safe_demo_pipeline", no_demo_pipeline)
+    ready = create_ready(client, target="https://unsupported-resume.test")
+    started = client.post(
+        f"/api/v1/engagements/{ready['id']}/start",
+        json={"execution_mode": "demo"},
+    )
+    assert started.status_code == 202
+    run_id = started.json()["id"]
+    with final_core.connect() as db:
+        db.execute("UPDATE analysis_runs SET status='paused' WHERE id=?", (run_id,))
+    monkeypatch.delenv("SRC_ENABLE_SYNTHETIC_DEMO")
+    denied = client.post(f"/api/v1/runs/{run_id}/resume")
+    assert denied.status_code == 409
+    assert client.get(f"/api/v1/runs/{run_id}").json()["status"] == "paused"
+
+    with final_core.connect() as db:
+        db.execute("UPDATE analysis_runs SET synthetic=0,mode='web3' WHERE id=?", (run_id,))
+    denied_web3 = client.post(f"/api/v1/runs/{run_id}/resume")
+    assert denied_web3.status_code == 409
+    assert client.get(f"/api/v1/runs/{run_id}").json()["status"] == "paused"
+    center = client.get("/api/v1/task-center?mode=web3").json()
+    item = next(item for item in center["items"] if item["id"] == run_id)
+    assert item["resume_supported"] is False
+    assert "不支持恢复" in item["resume_unavailable_reason"]
+
+
 @pytest.mark.skipif(not web3_lab.binary("anvil"), reason="Anvil optional capability not installed")
 def test_real_anvil_local_fork_mutation(client):
     engagement = create_ready(client, "web3", "0x2222222222222222222222222222222222222222")

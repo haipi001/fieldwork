@@ -742,6 +742,13 @@ def inspect_source(body: SourceInspectInput):
             str(root), f"{framework} compile={compile_result['status']} fuzz={fuzz_result['status']}",
             1.0 if compile_result["status"] == "compiled" else .2, "forge", artifact_id, final_core.utcnow(),
         ))
+        from v5_graph import project_web3_run_facts
+        project_web3_run_facts(
+            db, body.engagement_id, body.run_id, artifact_id,
+            [*hypothesis_observation_ids, *property_observation_ids, observation_id],
+            {"source_commit": body.source_commit, "deployed_address": body.deployed_address,
+             "deployed_bytecode_hash": body.deployed_bytecode_hash},
+        )
     return {
         "artifact_id": artifact_id, "observation_id": observation_id,
         "hypothesis_observation_ids": hypothesis_observation_ids,
@@ -865,6 +872,15 @@ def execute_property_replay(candidate_id: str, body: PropertyReplayInput, job_id
         db.execute("UPDATE candidate_findings SET status=?,evidence_ids=?,updated_at=? WHERE id=?", (
             attempt_status, final_core.dump(evidence_ids), final_core.utcnow(), candidate_id,
         ))
+        from v5_graph import project_web3_run_facts
+        rows = db.execute(
+            "SELECT id FROM observations WHERE run_id=? AND raw_ref=? ORDER BY id",
+            (candidate["run_id"], artifact_id),
+        ).fetchall()
+        project_web3_run_facts(
+            db, candidate["engagement_id"], candidate["run_id"], artifact_id,
+            [row["id"] for row in rows],
+        )
     final_core.add_event(
         candidate["run_id"], "verification", "web3.property_replay_completed",
         f"Web3 属性定向复测完成：{attempt_status}",
@@ -1087,6 +1103,8 @@ def run_web3_tool(capability_id: str, body: Web3ToolInput):
                 str(root), summary or f"{capability_id} detector={detector.strip()}",
                 .8 if envelope.status == "completed" else .2, capability_id, artifact_id, final_core.utcnow(),
             ))
+        from v5_graph import project_web3_run_facts
+        project_web3_run_facts(db, body.engagement_id, body.run_id, artifact_id, observation_ids)
     return {"artifact_id": artifact_id, "observation_id": observation_ids[0], "observation_ids": observation_ids, "observation_count": len(observation_ids), "tool_result": envelope.__dict__}
 
 

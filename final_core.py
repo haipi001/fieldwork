@@ -1678,6 +1678,14 @@ def list_runs(mode: Literal["traditional", "web3", "agent_audit"] | None = None)
         return [hydrate_run(row, db.execute("SELECT * FROM run_events_v2 WHERE run_id=? ORDER BY id", (row["id"],)).fetchall()) for row in rows]
 
 
+def run_resume_supported(run) -> bool:
+    return (
+        not bool(run["synthetic"]) and run["mode"] == "traditional"
+    ) or (
+        bool(run["synthetic"]) and os.getenv("SRC_ENABLE_SYNTHETIC_DEMO") == "1"
+    )
+
+
 @router.get("/task-center")
 def task_center(mode: Literal["traditional", "web3", "agent_audit"] | None = None):
     runs = list_runs(mode)
@@ -1703,7 +1711,7 @@ def task_center(mode: Literal["traditional", "web3", "agent_audit"] | None = Non
         if stalled:
             next_action = "运行已超过 3 分钟无新事件，请检查工具详情，必要时停止后重跑"
         elif run["status"] == "paused":
-            next_action = "恢复后从首个缺失 checkpoint 继续"
+            next_action = "恢复后从首个缺失 checkpoint 继续" if run_resume_supported(run) else "当前运行模式不支持恢复，可停止后重新创建任务"
         elif run["status"] == "queued":
             next_action = "等待执行槽位"
         elif run["status"] in {"failed", "timeout", "budget_exhausted"}:
@@ -1715,6 +1723,8 @@ def task_center(mode: Literal["traditional", "web3", "agent_audit"] | None = Non
         result.append({
             "id": run["id"], "engagement_id": run["engagement_id"], "mode": run["mode"],
             "status": run["status"], "current_stage": run["current_stage"],
+            "resume_supported": run_resume_supported(run),
+            "resume_unavailable_reason": "" if run_resume_supported(run) else "当前运行模式不支持恢复，可停止后重新创建任务",
             "remaining_stages": remaining, "completed_stages": len(completed),
             "queue_position": ordered_queued.index(run["id"]) + 1 if run["id"] in ordered_queued else None,
             "last_event_at": last_at, "last_event": last["message"] if last else "尚无执行事件",
@@ -2398,6 +2408,8 @@ def pause_run(run_id: str):
 async def resume_run(run_id: str):
     with connect() as db:
         run = db.execute("SELECT * FROM analysis_runs WHERE id=? AND status='paused'", (run_id,)).fetchone()
+        if run and not run_resume_supported(run):
+            raise HTTPException(409, "该任务运行模式不支持恢复；状态保持暂停")
         config_row = db.execute("SELECT config FROM run_configs_v2 WHERE run_id=?", (run_id,)).fetchone()
         cur = db.execute("UPDATE analysis_runs SET status='running',paused_at=NULL WHERE id=? AND status='paused'", (run_id,))
     if not cur.rowcount:
@@ -2415,10 +2427,8 @@ async def resume_run(run_id: str):
             include_strix=bool(config.get("include_strix", False)),
             include_shannon=bool(config.get("include_shannon", False)),
         )))
-    elif os.getenv("SRC_ENABLE_SYNTHETIC_DEMO") == "1":
+    elif run and bool(run["synthetic"]) and os.getenv("SRC_ENABLE_SYNTHETIC_DEMO") == "1":
         asyncio.create_task(safe_demo_pipeline(run_id))
-    else:
-        raise HTTPException(409, "演示运行不能在生产模式恢复")
     return get_run(run_id)
 
 
@@ -3011,7 +3021,7 @@ def runtime_readiness(lightweight: bool = False):
     available = [name for name in required if by_id.get(name, {}).get("available")]
     from native_agent import readiness as native_agent_readiness
     agent = native_agent_readiness()
-    return {
+    result = {
         "backend": "local_native",
         "docker_required": False,
         "ready": len(available) == len(required),
@@ -3023,6 +3033,14 @@ def runtime_readiness(lightweight: bool = False):
         "optional_docker_agents": ["strix", "shannon"],
         "native_agent": agent,
     }
+    try:
+        from v5_runtime import status_snapshot
+        result["ai_runtime"] = status_snapshot()
+    except (sqlite3.Error, ValueError):
+        result["ai_runtime"] = {"providers": [], "profiles": 0, "decisions": 0,
+                                "healthy": {"local": 0, "cloud": 0},
+                                "modes": {"local": False, "cloud": False, "hybrid": False, "offline": False}}
+    return result
 
 
 @router.get("/runtime/status")
@@ -3065,7 +3083,7 @@ def runtime_status():
         except (OSError, subprocess.TimeoutExpired):
             pass
     usage = shutil.disk_usage(ROOT)
-    return {
+    result = {
         "service": {"connected": True, "endpoint": "127.0.0.1:8000", "backend": "local_native"},
         "network": network,
         "provider": provider,
@@ -3073,6 +3091,14 @@ def runtime_status():
         "docker": {"installed": bool(docker_path), "running": docker_running, "required": False},
         "storage": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free / usage.total * 100, 1)},
     }
+    try:
+        from v5_runtime import status_snapshot
+        result["ai_runtime"] = status_snapshot()
+    except (sqlite3.Error, ValueError):
+        result["ai_runtime"] = {"providers": [], "profiles": 0, "decisions": 0,
+                                "healthy": {"local": 0, "cloud": 0},
+                                "modes": {"local": False, "cloud": False, "hybrid": False, "offline": False}}
+    return result
 
 
 def onboarding_checks(run_fixture_tests: bool = False) -> dict[str, Any]:

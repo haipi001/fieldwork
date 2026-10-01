@@ -1,13 +1,26 @@
 import Cocoa
+import Security
 import WebKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
+    private enum ServerProbe: Equatable { case ready, absent, foreign }
     private var window: NSWindow!
     private var webView: WKWebView!
     private var serverProcess: Process?
     private let projectRoot = "/Users/lizekai/Documents/ChatGPT/SRC漏洞"
     private let python = "/Users/lizekai/anaconda3/bin/python3"
-    private let appURL = URL(string: "http://127.0.0.1:8000/new")!
+    private let appURL = URL(string: "http://127.0.0.1:8000/v5")!
+    private let desktopInstance = UUID().uuidString.lowercased()
+    private let sessionToken: String = {
+        var bytes = [UInt8](repeating: 0, count: 48)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            fatalError("Unable to create Fieldwork desktop session")
+        }
+        return Data(bytes).base64EncodedString()
+    }()
+    private var expectedVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -37,7 +50,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         NSApp.activate(ignoringOtherApps: true)
 
         showStartingPage()
-        ensureServerThenLoad(attempt: 0)
+        installSessionCookie {
+            self.ensureServerThenLoad(attempt: 0)
+        }
     }
 
     private func installMainMenu() {
@@ -77,14 +92,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         webView.loadHTMLString(html, baseURL: nil)
     }
 
-    private func serverIsReady(_ completion: @escaping (Bool) -> Void) {
-        // Capability inventory can take many seconds because it probes every
-        // installed binary. Use the lightweight UI route for liveness so a
-        // healthy server is never mistaken for a stopped one.
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:8000/new")!)
+    private func installSessionCookie(_ completion: @escaping () -> Void) {
+        let properties: [HTTPCookiePropertyKey: Any] = [
+            .domain: "127.0.0.1", .path: "/", .name: "fieldwork_session",
+            .value: sessionToken, .discard: "TRUE", .init(rawValue: "HttpOnly"): "TRUE",
+            .init(rawValue: "SameSite"): "Strict",
+        ]
+        guard let cookie = HTTPCookie(properties: properties) else {
+            showError("无法建立本机会话 Cookie")
+            return
+        }
+        webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie, completionHandler: completion)
+    }
+
+    private func serverIsReady(_ completion: @escaping (ServerProbe) -> Void) {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8000/health")!)
         request.timeoutInterval = 2
         URLSession.shared.dataTask(with: request) { _, response, _ in
-            completion((response as? HTTPURLResponse)?.statusCode == 200)
+            guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
+                completion(.absent)
+                return
+            }
+            let instance = response.value(forHTTPHeaderField: "X-Fieldwork-Instance")
+            let version = response.value(forHTTPHeaderField: "X-Fieldwork-Version")
+            completion(instance == self.desktopInstance && version == self.expectedVersion ? .ready : .foreign)
         }.resume()
     }
 
@@ -101,6 +132,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         process.executableURL = URL(fileURLWithPath: python)
         process.arguments = ["-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "8000"]
         process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
+        var environment = ProcessInfo.processInfo.environment
+        environment["FIELDWORK_SESSION_TOKEN"] = sessionToken
+        environment["FIELDWORK_DESKTOP_INSTANCE"] = desktopInstance
+        environment["FIELDWORK_PORT"] = "8000"
+        process.environment = environment
         process.standardOutput = logHandle
         process.standardError = logHandle
         do {
@@ -112,11 +148,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func ensureServerThenLoad(attempt: Int) {
-        serverIsReady { [weak self] ready in
+        serverIsReady { [weak self] probe in
             guard let self else { return }
             DispatchQueue.main.async {
-                if ready {
+                if probe == .ready {
                     self.webView.load(URLRequest(url: self.appURL))
+                    return
+                }
+                if probe == .foreign {
+                    self.showError("端口 8000 已被其他或旧版服务占用。为保护本机会话，Fieldwork 不会连接该服务。")
                     return
                 }
                 if attempt == 0 { self.startServer() }
@@ -137,6 +177,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+        if url.scheme == "about" || (url.scheme == "http" && url.host == "127.0.0.1" && url.port == 8000) {
+            decisionHandler(.allow)
+            return
+        }
+        if navigationAction.targetFrame?.isMainFrame != false {
+            NSWorkspace.shared.open(url)
+        }
+        decisionHandler(.cancel)
+    }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {

@@ -453,6 +453,9 @@ def _persist_result(run: dict[str, Any], capability: str, envelope: capability_r
                 item["subject"], item["summary"], item["confidence"], capability, artifact_id, final_core.utcnow(),
             ))
             observation_ids.append(observation_id)
+        if run["mode"] == "traditional":
+            from v5_graph import project_traditional_tool_result
+            project_traditional_tool_result(db, run["engagement_id"], run["id"], artifact_id, observation_ids)
     return {
         "capability": capability, "tool_result": safe_result, "artifact_id": artifact_id,
         "observation_ids": observation_ids, "observation_count": len(observation_ids),

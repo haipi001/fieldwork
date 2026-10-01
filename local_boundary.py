@@ -1,5 +1,11 @@
 """Local browser boundary. This is not session authentication or a sandbox."""
+import re
+
 from starlette.responses import JSONResponse
+
+
+EXTENSION_EVENT_PATH = "/api/v1/agent-audit/browser/events"
+CHROME_EXTENSION_ORIGIN = re.compile(r"chrome-extension://[a-p]{32}\Z")
 
 
 class LocalBoundaryMiddleware:
@@ -24,8 +30,11 @@ class LocalBoundaryMiddleware:
         reason = None
         if len(hosts) != 1 or hosts[0] not in self.authorities:
             reason = "local_host_rejected"
-        elif origins and (len(origins) != 1 or origins[0] != "http://" + hosts[0]):
-            reason = "local_origin_rejected"
+        elif origins:
+            extension_event = (scope.get("path") == EXTENSION_EVENT_PATH and len(origins) == 1
+                               and CHROME_EXTENSION_ORIGIN.fullmatch(origins[0]))
+            if len(origins) != 1 or (origins[0] != "http://" + hosts[0] and not extension_event):
+                reason = "local_origin_rejected"
         elif fetch_sites and (len(fetch_sites) != 1 or fetch_sites[0] not in {"same-origin", "none"}):
             reason = "cross_site_rejected"
         if reason:

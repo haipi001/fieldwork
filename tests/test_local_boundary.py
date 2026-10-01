@@ -74,6 +74,17 @@ def test_websocket_boundary(client):
         assert ws.receive_text() == 'ready'
 
 
+def test_browser_collector_origin_exception_is_exact_path_only(client):
+    origin = 'chrome-extension://' + 'a' * 32
+    # The collector route is allowed through the outer browser boundary; its
+    # own bearer/pairing contract remains responsible for authentication.
+    assert client.post('/api/v1/agent-audit/browser/events', headers={'origin': origin}).status_code == 404
+    assert client.post('/api/private', headers={'origin': origin}).status_code == 403
+    assert client.post('/api/v1/agent-audit/browser/events', headers={
+        'origin': 'chrome-extension://' + 'z' * 32,
+    }).status_code == 403
+
+
 def test_custom_port():
     app = FastAPI()
     app.add_middleware(LocalBoundaryMiddleware, port=9123)
@@ -88,3 +99,11 @@ def test_application_routes_are_guarded_without_database_startup():
     assert client.get('/health').json() == {'status': 'ready'}
     for path in ['/api/v1/engagements', '/api/engagements', '/new', '/static/final.js', '/api/v1/reports/export']:
         assert client.get(path, headers={'origin': 'https://evil.example'}).status_code == 403
+
+
+def test_application_rejects_spoofed_host_even_without_origin():
+    import app as application
+    client = TestClient(application.app, base_url='http://127.0.0.1:8000')
+    response = client.get('/health', headers={'host': 'fieldwork.attacker.test:8000'})
+    assert response.status_code == 403
+    assert response.json()['code'] == 'local_host_rejected'

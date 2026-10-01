@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 import yaml
 from adapters import adapter_statuses, build_command, stop_process, stream_process
+from local_boundary import LocalBoundaryMiddleware
+from session_auth import SessionAuthMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,11 +30,20 @@ from web3_analysis import router as web3_analysis_router
 from web3_practice import router as web3_practice_router
 from traditional_runtime import router as traditional_router
 from traditional_tools import router as traditional_tools_router
-from guided_research import router as guided_router, init_guided_db, start_completed_followups
-from local_boundary import LocalBoundaryMiddleware
-from agent_audit import router as agent_audit_router, init_agent_audit_db
+from agent_audit import router as agent_audit_router, init_agent_audit_db, monitor_worker
+from browser_ai_bridge import router as browser_ai_router
+from guided_research import init_guided_db, router as guided_research_router
 from lifecycle import finalize_database_version, prepare_database_upgrade
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
+from v5_schema import apply_v5_schema
+from v5_graph import router as v5_graph_router
+from v5_orchestration import recover_expired_leases, router as v5_orchestration_router, runner_router as v5_runner_router
+from v5_verification import router as v5_verification_router
+from v5_runtime import router as v5_runtime_router
+from v5_continuous import router as v5_continuous_router, run_due as run_due_continuous_research
+from v5_intelligence import router as v5_intelligence_router
+from v5_workers import router as v5_workers_router
+from v5_evolution import router as v5_evolution_router
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -175,27 +186,22 @@ async def lifespan(_: FastAPI):
     prepare_database_upgrade(DB, DATA / "backups", ROOT)
     init_db()
     init_final_db()
-    init_guided_db()
     init_agent_audit_db()
+    init_guided_db()
+    apply_v5_schema(DB)
+    recover_expired_leases(DB)
     finalize_database_version(DB)
-    followup_task = None
-    if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_GUIDED_SCHEDULER") != "1":
-        async def followup_loop():
-            while True:
-                try:
-                    await asyncio.to_thread(start_completed_followups)
-                except Exception:
-                    # Keep persisted launch intent available after transient database errors.
-                    pass
-                await asyncio.sleep(3)
-        followup_task = asyncio.create_task(followup_loop())
     scheduler_task = None
+    agent_monitor_task = None
+    if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_AGENT_MONITOR") != "1":
+        agent_monitor_task = asyncio.create_task(monitor_worker())
     if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER") != "1":
         async def scheduler_loop():
             mark_campaign_scheduler(running=True, last_error=None)
             while True:
                 try:
                     processed = await asyncio.to_thread(run_due_campaign_schedules)
+                    await asyncio.to_thread(run_due_continuous_research)
                     mark_campaign_scheduler(last_tick_at=now(), last_processed=len(processed), last_error=None)
                 except Exception as error:
                     # Individual schedule failures are persisted by the scheduler.
@@ -206,10 +212,10 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
-        if followup_task:
-            followup_task.cancel()
+        if agent_monitor_task:
+            agent_monitor_task.cancel()
             try:
-                await followup_task
+                await agent_monitor_task
             except asyncio.CancelledError:
                 pass
         if scheduler_task:
@@ -223,22 +229,41 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Security Research OS", version=APP_VERSION, lifespan=lifespan)
-app.add_middleware(LocalBoundaryMiddleware, port=os.environ.get("FIELDWORK_PORT", "8000"))
 app.include_router(final_router)
 app.include_router(agent_audit_router)
-app.include_router(guided_router)
+app.include_router(browser_ai_router)
 app.include_router(web3_router)
 app.include_router(web3_analysis_router)
 app.include_router(web3_practice_router)
 app.include_router(traditional_router)
 app.include_router(traditional_tools_router)
+app.include_router(guided_research_router)
+app.include_router(v5_graph_router)
+app.include_router(v5_orchestration_router)
+app.include_router(v5_runner_router)
+app.include_router(v5_verification_router)
+app.include_router(v5_runtime_router)
+app.include_router(v5_continuous_router)
+app.include_router(v5_intelligence_router)
+app.include_router(v5_workers_router)
+app.include_router(v5_evolution_router)
+app.add_middleware(SessionAuthMiddleware, allow_test_bypass=True)
+app.add_middleware(LocalBoundaryMiddleware, port=int(os.getenv("FIELDWORK_PORT", "8000")))
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 templates = Jinja2Templates(directory=ROOT / "templates")
 
 
-@app.get("/health", include_in_schema=False)
-async def local_health():
-    return {"status": "ready"}
+@app.get("/health")
+def health():
+    """Minimal readiness probe; it deliberately exposes no project or runtime data."""
+    return JSONResponse(
+        {"status": "ready"},
+        headers={
+            "X-Fieldwork-Instance": os.getenv("FIELDWORK_DESKTOP_INSTANCE", "unmanaged"),
+            "X-Fieldwork-Version": APP_VERSION,
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 class ManifestInput(BaseModel):
@@ -707,7 +732,13 @@ async def adapter_run(run_id: str, engagement_id: str, manifest: dict[str, Any],
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    return templates.TemplateResponse(request, "index.html")
+    return templates.TemplateResponse(request, "v5.html")
+
+
+@app.get("/v5", response_class=HTMLResponse)
+def v5_workspace(request: Request):
+    """Serve the V5 control-plane frontend without replacing the stable workspace."""
+    return templates.TemplateResponse(request, "v5.html")
 
 
 @app.get("/new", response_class=HTMLResponse)

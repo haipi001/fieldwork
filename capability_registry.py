@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from reporting import redact
+from isolated_execution import run_isolated
 
 
 @dataclass(frozen=True)
@@ -139,15 +140,14 @@ def execute(capability_id: str, args: list[str], cwd: Path, timeout: int = 120) 
         return ToolResultEnvelope(capability_id, "unavailable", None, "", "capability unavailable")
     if not cwd.is_dir():
         raise ValueError("cwd must be an existing directory")
-    env = os.environ.copy()
-    extra_paths = [str(Path(sys.executable).resolve().parent), str(Path.home() / ".foundry" / "bin")]
-    env["PATH"] = os.pathsep.join([*extra_paths, env.get("PATH", "")])
     try:
-        result = subprocess.run([capability.executable, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, shell=False, env=env)
+        output_limit = 1_000_000 if capability_id in {"slither", "echidna", "medusa"} else 12000
+        result = run_isolated([capability.executable, *args], cwd, timeout=timeout, output_limit=output_limit)
+        if result.status == "timeout":
+            return ToolResultEnvelope(capability_id, "timeout", None, result.stdout, result.stderr or "execution timed out")
         # Slither returns 255 when detectors report findings; that is a
         # successful analysis result, not an adapter failure.
         accepted = result.returncode == 0 or (capability_id == "slither" and result.returncode == 255) or (capability_id == "gitleaks" and result.returncode == 1)
-        output_limit = 1_000_000 if capability_id in {"slither", "echidna", "medusa"} else 12000
-        return ToolResultEnvelope(capability_id, "completed" if accepted else "failed", result.returncode, redact(result.stdout[-output_limit:]), redact(result.stderr[-output_limit:]))
-    except subprocess.TimeoutExpired as error:
-        return ToolResultEnvelope(capability_id, "timeout", None, redact(error.stdout or ""), redact(error.stderr or "execution timed out"))
+        return ToolResultEnvelope(capability_id, "completed" if accepted else "failed", result.returncode, redact(result.stdout), redact(result.stderr))
+    except (OSError, ValueError) as error:
+        return ToolResultEnvelope(capability_id, "failed", None, "", redact(str(error)))

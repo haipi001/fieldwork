@@ -29,12 +29,11 @@ Web3 与 Web/API 安全研究工作台
 
 ```bash
 ./scripts/bootstrap_local.sh
-.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
 需要从空环境重建时执行 `./scripts/bootstrap_local.sh --recreate`。脚本会安装锁定依赖并执行启动导入检查；开发验收环境使用 `./scripts/bootstrap_local.sh --recreate --dev`。
 
-打开 [本地工作台](http://127.0.0.1:8000/new)。外部工具和模型需按使用场景配置，详见 [运行与维护](OPERATIONS.md)。
+日常使用请从 Fieldwork 桌面 App 打开工作台。后端业务接口现在要求每次启动会话；直接运行 uvicorn 只适合带显式 `FIELDWORK_SESSION_TOKEN` 的 CLI/测试客户端，普通浏览器不会获得桌面 HttpOnly Cookie。外部工具和模型配置详见 [运行与维护](OPERATIONS.md)。
 
 ## AI Agent Audit
 
@@ -45,6 +44,12 @@ Web3 与 Web/API 安全研究工作台
 ## 当前阶段
 
 持续开发中的个人研究工作台。候选不等于漏洞，属性失败仍需确认攻击条件与实际影响。桌面安装与不可信项目执行隔离正在完善，当前能力及缺口见 [综合评估](APPLICATION_ASSESSMENT_2026-09-11.md)。
+
+V5 编排 API 已支持 Research Group、持久 AgentTask、原子 Lease/Heartbeat、Checkpoint、重试和预算停止。编排器只分配声明式工作，不直接执行目标工具；Runner 的实际操作仍受 Scope、Policy 与隔离边界约束。
+
+V5 Verification Receipt 由独立 verifier task 的当前租约签发，绑定输入快照、Runner/环境、Replay Contract、结果和 Evidence，并以 SHA-256 与数据库不可变约束保护。`inconclusive`、中断、自证、输入变化或无 binding 的记录不能晋升 Canonical Result。
+
+V5 Runtime Router 已实现 local/cloud/hybrid/offline 的真实后端决策，敏感上下文强制本地，独立复验不降级到普通模型。Provider 凭据只以后台 secret ref 关联，Route Decision 与 Usage Ledger 不可变且受 Campaign/Task 预算约束。
 
 ## 开发与接力
 

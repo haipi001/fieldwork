@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,13 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core, 'DB', tmp_path / 'test.db')
     monkeypatch.setattr(core, 'LOCAL_DATA_ROOT', tmp_path)
     monkeypatch.setattr(reporting, 'EXPORTS', tmp_path / 'exports')
-    with TestClient(app.app, base_url='http://127.0.0.1:8000') as client:
+    monkeypatch.setattr(audit.shutil,'disk_usage',lambda path:SimpleNamespace(total=100*1024**3,used=80*1024**3,free=20*1024**3))
+    monkeypatch.setattr(audit.application_ai_monitor, 'roots', lambda: {'Codex': tmp_path / 'codex-logs', 'Claude Code': tmp_path / 'claude-logs'})
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: {
+        'platform': 'Darwin', 'applications': [{'name': 'Cursor', 'installed': True}],
+        'processes': {'42': {'pid': 42, 'parent_pid': 1, 'uid': 501, 'executable': 'Cursor', 'app': 'Cursor'}},
+        'connections': {}, 'errors': [], 'coverage': {'processes': 'sampling', 'network': 'sampling', 'file_io': 'not_connected'}})
+    with TestClient(app.app, base_url='http://127.0.0.1:8000', client=('127.0.0.1',50000)) as client:
         yield client
 
 
@@ -75,6 +82,216 @@ def signed_body(private, collector, aid, body, sequence=1, nonce='0123456789abcd
     return value
 
 
+@pytest.mark.parametrize('operation',['pause','stop'])
+def test_monitor_does_not_change_lifecycle_before_native_delivery(client,monkeypatch,operation):
+    aid=client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    def pending(database,audit_id):
+        assert audit_id==aid
+        with database() as db:
+            assert db.execute('SELECT status FROM agent_monitors WHERE audit_id=?',(aid,)).fetchone()[0]=='active'
+        return False
+    monkeypatch.setattr(audit.native_ai_bridge,'drain',pending)
+    response=client.post(f'/api/v1/agent-audit/monitor/{aid}/{operation}')
+    assert response.status_code==503
+    state=client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    assert state['monitor']['status']=='active' and state['analysis'] is None
+    monkeypatch.setattr(audit.native_ai_bridge,'drain',lambda *_:True)
+    response=client.post(f'/api/v1/agent-audit/monitor/{aid}/{operation}')
+    assert response.status_code==200
+    state=client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    assert state['monitor']['status']==('paused' if operation=='pause' else 'stopped')
+
+
+def test_signed_receipt_confirms_commit_without_duplicate_import(client, fixture):
+    aid = create(client, fixture)
+    other = create(client, fixture)
+    private, collector = register_collector(client)
+    body = signed_body(private, collector, aid, fixture['imports'][0])
+    route = f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
+    assert client.get(route).status_code == 404
+    imported = upload(client, aid, body)
+    receipt = client.get(route)
+    assert receipt.status_code == 200
+    assert receipt.json() == dict(audit_id=aid,collector_id=collector['id'],sequence=1,
+        nonce=body['nonce'],signature=body['signature'],payload_sha256=hashlib.sha256(body['content'].encode()).hexdigest())
+    assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=body).status_code == 409
+    assert len(client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events']) == len(imported['events'])
+    assert client.get(route.replace(aid,other)).status_code == 404
+
+
+def native_record(at):
+    return dict(schema='fieldwork-native-es/1',synthetic=False,timestamp=at,actor='Cursor',
+        source_type='filesystem',action_type='unknown',status='observed',command_category='native_open',
+        process_id=42,parent_process_id=1,process_pid_version=7,process_started_at='1.000000',
+        process_executable='Cursor',attribution_method='executable_match',filesystem_path='/fixture',
+        resource='/fixture',destination='',modified=False,mapped_writable=False,native_sequence=2,
+        collector_dropped=0,kernel_dropped=0,native_authorization='allowed',path_truncated=False,
+        destination_truncated=False,executable_truncated=False)
+
+
+def test_native_live_import_obeys_pause_resume_and_signature(client,monkeypatch):
+    monitor=client.post('/api/v1/agent-audit/monitor/start').json()
+    aid=monitor['id']; route=f'/api/v1/agent-audit/audits/{aid}/imports'
+    private,collector=register_collector(client)
+    monkeypatch.setattr(audit.native_ai_binding,'authorized',lambda row:row['fingerprint']==collector['fingerprint'])
+    def body(at,sequence=1,extra=None):
+        events=[native_record(at)]
+        if extra:events.append(extra)
+        return signed_body(private,collector,aid,dict(kind='generic_json',content=json.dumps({'events':events}),
+            provenance='operator_telemetry',source_name='native test contract',independent_attested=False),
+            sequence=sequence,nonce=f'{sequence:016d}')
+    first=body(core.utcnow())
+    assert client.post(route,json=first).status_code==200
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/pause').status_code==200
+    paused=body(core.utcnow(),2)
+    count=len(client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events'])
+    assert client.post(route,json=paused).status_code==409
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/resume').status_code==200
+    assert client.post(route,json=paused).status_code==409
+    assert len(client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events'])==count
+    resumed=body(core.utcnow(),2)
+    assert client.post(route,json=resumed).status_code==200
+    unsigned=dict(kind='generic_json',content=resumed['content'],provenance='agent_supplied')
+    assert client.post(route,json=unsigned).status_code==403
+    mixed=body(core.utcnow(),3,{'source_type':'process','action_type':'execute','actor':'fixture'})
+    assert client.post(route,json=mixed).status_code==422
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/stop').status_code==200
+    assert client.post(route,json=body(core.utcnow(),3)).status_code==409
+
+
+def test_native_live_time_and_storage_rejections_leave_no_receipt(client,monkeypatch):
+    monitor=client.post('/api/v1/agent-audit/monitor/start').json()
+    aid=monitor['id']; private,collector=register_collector(client)
+    monkeypatch.setattr(audit.native_ai_binding,'authorized',lambda row:row['fingerprint']==collector['fingerprint'])
+    route=f'/api/v1/agent-audit/audits/{aid}/imports'
+    def signed(at):
+        return signed_body(private,collector,aid,dict(kind='generic_json',
+            content=json.dumps({'events':[native_record(at)]}),provenance='operator_telemetry',
+            source_name='native test contract',independent_attested=False))
+    future=(audit.timestamp(core.utcnow())+audit.timedelta(minutes=2)).isoformat()
+    assert client.post(route,json=signed(future)).status_code==422
+    before=(audit.timestamp(monitor['monitor']['started_at'])-audit.timedelta(seconds=1)).isoformat()
+    assert client.post(route,json=signed(before)).status_code==409
+    monkeypatch.setattr(audit,'storage_health',lambda:{'status':'critical'})
+    assert client.post(route,json=signed(core.utcnow())).status_code==507
+    receipt=f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
+    assert client.get(receipt).status_code==404
+
+
+def test_unbound_signed_key_cannot_claim_live_native_source(client,monkeypatch):
+    monitor=client.post('/api/v1/agent-audit/monitor/start').json();aid=monitor['id']
+    private,collector=register_collector(client)
+    monkeypatch.setattr(audit.native_ai_binding,'authorized',lambda row:False)
+    body=signed_body(private,collector,aid,dict(kind='generic_json',
+        content=json.dumps({'events':[native_record(core.utcnow())]}),provenance='operator_telemetry',
+        source_name='native claim',independent_attested=False))
+    response=client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=body)
+    assert response.status_code==403 and '受保护安装' in response.json()['detail']
+    forged=json.loads(body['content'])
+    del forged['events'][0]['schema']
+    forged_body=signed_body(private,collector,aid,{**body,'content':json.dumps(forged)})
+    assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports',json=forged_body).status_code==422
+    receipt=f"/api/v1/agent-audit/audits/{aid}/collectors/{collector['id']}/receipts/1"
+    assert client.get(receipt).status_code==404
+
+
+def native_policy_event(fixture,**changes):
+    identity=fixture['audit']
+    body=audit.ImportInput(kind='generic_json',content='{}')
+    return audit.normalize_event({**native_record(core.utcnow()),**changes},body,identity)
+
+
+def test_truncated_file_path_cannot_decide_filesystem_boundary(fixture):
+    policy=audit.Policy.model_validate(fixture['audit']['policy']).model_dump()
+    policy.update(allowed_filesystem_paths=['/workspace'],denied_filesystem_paths=[],state_change_allowed=True)
+    for path in ['/workspace/fixture','/outside/fixture']:
+        event=native_policy_event(fixture,filesystem_path=path,path_truncated=True)
+        result=audit.evaluate_policy(event,policy)
+        assert result['decision']=='uncertain' and 'FILESYSTEM_BOUNDARY' not in result['boundaries']
+
+
+def test_rename_checks_both_source_and_destination(fixture):
+    policy=audit.Policy.model_validate(fixture['audit']['policy']).model_dump()
+    policy.update(allowed_filesystem_paths=['/workspace'],denied_filesystem_paths=['/workspace/private'],state_change_allowed=True)
+    event=native_policy_event(fixture,command_category='native_rename',action_type='modify',
+        filesystem_path='/workspace/old',destination='/outside/new')
+    assert 'FILESYSTEM_BOUNDARY' in audit.evaluate_policy(event,policy)['boundaries']
+    event['destination']='/workspace/private/new'
+    assert 'FILESYSTEM_BOUNDARY' in audit.evaluate_policy(event,policy)['boundaries']
+    event['destination']='/workspace/new';event['destination_truncated']=True
+    assert audit.evaluate_policy(event,policy)['decision']=='uncertain'
+    event['destination_truncated']=False
+    assert audit.evaluate_policy(event,policy)['decision']=='allowed'
+
+
+def test_incomplete_path_does_not_hide_other_known_policy_violations(fixture):
+    policy=audit.Policy.model_validate(fixture['audit']['policy']).model_dump()
+    policy.update(allowed_filesystem_paths=['/workspace'],state_change_allowed=False)
+    event=native_policy_event(fixture,command_category='native_write',action_type='write',path_truncated=True)
+    result=audit.evaluate_policy(event,policy)
+    assert result['decision']=='violation' and result['boundaries']==['STATE_CHANGE']
+
+
+def test_claim_matching_requires_complete_exact_resource():
+    event=dict(actor='Cursor',session_id='session',timestamp='2026-09-27T00:00:00Z',
+        action_type='write',resource='/workspace/file',network_host='',path_truncated=True)
+    claim=dict(actor='Cursor',session_id='session',time_start='2026-09-26T00:00:00Z',
+        time_end='2026-09-28T00:00:00Z',action_type='write',resource='/workspace/file',assertion='did_occur')
+    assert not audit.matches(claim,event)
+    claim['assertion']='did_not_occur'
+    assert not audit.matches(claim,event)
+    claim['resource']='*'
+    assert audit.matches(claim,event)
+    claim['resource']='/workspace/file';event['path_truncated']=False
+    assert audit.matches(claim,event)
+    event.update(executable_truncated=True,process_executable='/workspace/file')
+    assert not audit.matches(claim,event)
+
+
+def test_reconciliation_does_not_confirm_truncated_file_claim():
+    event=dict(id='event',actor='Cursor',session_id='session',timestamp='2026-09-27T00:00:00Z',
+        action_type='write',resource='/workspace/file',network_host='',path_truncated=True,
+        independent=True,status='success')
+    claim=dict(claim_id='claim',statement='fixture',actor='Cursor',session_id='session',
+        time_start='2026-09-26T00:00:00Z',time_end='2026-09-28T00:00:00Z',
+        action_type='write',resource='/workspace/file',assertion='did_occur')
+    identity=dict(agent_name='Cursor',session_id='session',start_time=claim['time_start'],end_time=claim['time_end'])
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='UNSUPPORTED'
+    claim['assertion']='did_not_occur'
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='UNKNOWN'
+    claim['resource']='*'
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='CONTRADICTED'
+    event['status']='observed'
+    assert audit.reconcile([event],[claim],identity)['rows'][0]['status']=='UNKNOWN'
+
+
+def test_agent_audit_graph_maps_telemetry_and_deterministic_contradiction(client, fixture):
+    aid = create(client, fixture)
+    campaign = client.post(f'/api/v1/engagements/{aid}/campaigns', json={
+        'name': 'Audit graph', 'objective': 'Trace telemetry and self-report contradictions',
+    })
+    assert campaign.status_code == 201, campaign.text
+    cid = campaign.json()['id']
+    for imported in fixture['imports']:
+        upload(client, aid, imported)
+    graph_before = client.get(f'/api/v1/research/campaigns/{cid}/graph').json()
+    assert {'observation', 'artifact', 'evidence', 'claim'} <= {n['node_type'] for n in graph_before['nodes']}
+    assert not any(e['relation_type'] == 'contradicts' for e in graph_before['edges'])
+    claims = [n for n in graph_before['nodes'] if n['node_type'] == 'claim']
+    assert claims and all(n['status'] == 'unverified' for n in claims)
+    assert all(n['attributes'].get('raw_content_copied') is False for n in claims)
+    graph_text = json.dumps(graph_before)
+    assert 'demo.example' not in graph_text and 'No external network access occurred' not in graph_text
+    result = analyze(client, aid)
+    assert any(row['status'] == 'CONTRADICTED' for row in result['analysis']['reconciliation']['rows'])
+    graph_after = client.get(f'/api/v1/research/campaigns/{cid}/graph').json()
+    assert any(e['relation_type'] == 'contradicts' for e in graph_after['edges'])
+    assert not any(n['node_type'] == 'canonical_result' for n in graph_after['nodes'])
+    with core.connect() as db:
+        from v5_graph import project_agent_audit_facts
+        assert project_agent_audit_facts(db, aid, result['run_id'], result['analysis']['reconciliation']) == {'nodes': 0, 'edges': 0}
+
+
 def test_demo_real_pipeline_and_capsule(client):
     response = client.post('/api/v1/agent-audit/demo')
     assert response.status_code == 201, response.text
@@ -107,6 +324,218 @@ def test_demo_real_pipeline_and_capsule(client):
     assert len(shared['verified']) == 1
     assert not client.get('/api/v1/findings?mode=traditional').json()['verified']
     assert not client.get('/api/v1/findings?mode=web3').json()['verified']
+
+
+def test_zero_config_monitor_records_desktop_events_and_stops_with_analysis(client):
+    response = client.post('/api/v1/agent-audit/monitor/start')
+    assert response.status_code == 201, response.text
+    started = response.json()
+    assert started['monitor']['status'] == 'active'
+    assert started['identity']['name'] == '本机 AI 活动监控'
+    assert started['policy'] is None
+    assert started['monitor']['collector_kind'] == 'desktop'
+    assert started['events'][0]['resource'] == '自动监控已启动'
+    core.add_event('external-run', 'analysis', 'native_agent.page_observed', '只读浏览器已观察 https://example.test', {'turn': 1})
+    response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/scan")
+    assert response.status_code == 200, response.text
+    scanned = response.json()
+    assert any(event['actor'] == 'Cursor' and 'PID 42' in event['resource'] for event in scanned['events'])
+    assert not any('example.test' in event['resource'] for event in scanned['events'])
+    assert len(scanned['events']) == len(started['events'])
+    response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/stop")
+    assert response.status_code == 200, response.text
+    stopped = response.json()
+    assert stopped['monitor']['status'] == 'stopped'
+    assert stopped['analysis'] is not None
+
+
+def test_start_monitor_reuses_active_session(client):
+    first = client.post('/api/v1/agent-audit/monitor/start').json()
+    second = client.post('/api/v1/agent-audit/monitor/start').json()
+    assert second['id'] == first['id']
+
+
+def test_monitor_pause_resume_health_and_live_anomalies(client, monkeypatch):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    aid = started['id']
+    assert started['monitor']['health']['status'] == 'healthy'
+    paused = client.post(f'/api/v1/agent-audit/monitor/{aid}/pause').json()
+    assert paused['monitor']['status'] == 'paused'
+    snapshot = audit.desktop_ai_monitor.snapshot()
+    snapshot['connections'] = {'42|socket': {'pid': 42, 'app': 'Cursor', 'host': 'example.test', 'port': 443}}
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: snapshot)
+    audit.scan_active_monitors()
+    assert not any('example.test' in event['resource'] for event in client.get(f'/api/v1/agent-audit/audits/{aid}').json()['events'])
+    resumed = client.post(f'/api/v1/agent-audit/monitor/{aid}/resume').json()
+    assert resumed['monitor']['status'] == 'active'
+    assert any('example.test' in event['resource'] for event in resumed['events'])
+    assert resumed['monitor']['last_event_at']
+    assert not resumed['live_anomalies'] # No arbitrary desktop permission policy.
+
+
+def test_desktop_process_attribution_and_connection_parser():
+    monitor = audit.desktop_ai_monitor
+    processes = monitor.parse_processes('42 1 501 /Applications/Cursor.app/Contents/MacOS/Cursor\n43 42 501 /usr/bin/python3\n44 1 501 /tmp/cursor-token\n')
+    assert set(processes) == {'42', '43'}
+    assert processes['43']['app'] == 'Cursor'
+    connections = monitor.parse_connections('p43\nf10\nn127.0.0.1:50000->[::1]:443\nTST=ESTABLISHED\n', processes)
+    assert next(iter(connections.values()))['host'] == '::1'
+    current = {'processes': processes, 'connections': connections, 'coverage': {'processes': 'sampling'}}
+    events = monitor.events({}, current, core.utcnow(), 'session')
+    assert len(events) == 3
+    assert monitor.events(current, current, core.utcnow(), 'session') == []
+
+
+def test_desktop_failure_does_not_generate_false_exit_events(client, monkeypatch):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    failed = {'processes': {}, 'connections': {}, 'applications': [], 'errors': ['采集超时'], 'coverage': {'processes': 'unavailable'}}
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', lambda: failed)
+    result = audit.scan_monitor(started['id'])
+    assert len(result['events']) == len(started['events'])
+    assert result['monitor']['last_error'] == '采集超时'
+    assert '42' in result['monitor']['desktop']['processes']
+
+
+def test_open_files_are_observations_not_read_write_claims():
+    monitor = audit.desktop_ai_monitor
+    processes = {'42': {'app': 'Cursor'}}
+    output = 'p42\nfcwd\ntDIR\nn/work\nf7\nau\ntREG\nn/work/example.py\nf8\nar\ntIPv4\nnlocalhost:443\np99\nf4\naw\ntREG\nn/other/file\n'
+    files = monitor.parse_open_files(output, processes)
+    assert list(files) == ['42|7|/work/example.py']
+    current = {'processes': {}, 'connections': {}, 'open_files': files, 'coverage': {'processes': 'sampling'}}
+    observed = monitor.events({}, current, core.utcnow(), 'session')
+    assert len(observed) == 1
+    assert observed[0]['source_type'] == 'filesystem'
+    assert observed[0]['action_type'] == 'unknown'
+    assert observed[0]['status'] == 'observed'
+    assert observed[0]['filesystem_path'] == '/work/example.py'
+    assert monitor.events(current, current, core.utcnow(), 'session') == []
+
+
+def test_process_reuse_and_missing_network_visibility():
+    monitor = audit.desktop_ai_monitor
+    first = monitor.parse_processes('42 1 501 Sat Sep 26 12:00:00 2026 /Applications/Cursor.app/Contents/MacOS/Cursor', with_start_time=True)
+    reused = monitor.parse_processes('42 1 501 Sat Sep 26 12:01:00 2026 /Applications/Cursor.app/Contents/MacOS/Cursor', with_start_time=True)
+    assert first['42']['started_at'] != reused['42']['started_at']
+    sockets = 'p42\nf10\nn127.0.0.1:50000->example.test:443\nTST=ESTABLISHED\n'
+    old = {'processes': first, 'connections': monitor.parse_connections(sockets, first), 'coverage': {'processes': 'sampling', 'network': 'sampling'}}
+    new = {'processes': reused, 'connections': monitor.parse_connections(sockets, reused), 'coverage': old['coverage']}
+    events = monitor.events(old, new, core.utcnow(), 'session')
+    assert {e['command_category'] for e in events} == {'process_observed', 'connection_observed'}
+    assert all(e['process_id'] == 42 for e in events)
+    assert all(e['process_started_at'] == reused['42']['started_at'] for e in events)
+    new['connections'] = {}
+    new['coverage'] = {'processes': 'sampling', 'network': 'partial'}
+    assert not any(e['command_category'] == 'connection_disappeared' for e in monitor.events(old, new, core.utcnow(), 'session'))
+    new['coverage']['network'] = 'sampling'
+    assert any(e['command_category'] == 'connection_disappeared' for e in monitor.events(old, new, core.utcnow(), 'session'))
+
+
+def test_monitor_failure_pauses_visibly(client, monkeypatch):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    def fail():
+        raise RuntimeError('internal details should not be displayed')
+    monkeypatch.setattr(audit.desktop_ai_monitor, 'snapshot', fail)
+    audit.scan_active_monitors()
+    result = client.get(f"/api/v1/agent-audit/audits/{started['id']}").json()
+    assert result['monitor']['status'] == 'paused'
+    assert 'RuntimeError' in result['monitor']['last_error']
+    assert 'internal details' not in result['monitor']['last_error']
+
+
+def test_monitor_app_log_is_automatic_and_never_independent(client, tmp_path):
+    root = tmp_path / 'codex-logs'
+    root.mkdir()
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    path = root / 'new-session.jsonl'
+    path.write_text(json.dumps({'timestamp': core.utcnow(), 'type': 'response_item', 'payload': {
+        'type': 'custom_tool_call', 'name': 'exec', 'call_id': 'local-call',
+        'input': 'sensitive private command'}}) + '\n')
+    result = audit.scan_monitor(started['id'])
+    tool = next(e for e in result['events'] if e['source_type'] == 'tool_call')
+    assert tool['tool_name'] == 'exec' and tool['status'] == 'requested'
+    assert tool['independent'] is False and tool['authenticity_verified'] is False
+    assert tool['trust_level'] == 'agent_supplied'
+    assert 'sensitive private command' not in json.dumps(result)
+    assert 'application_log_state' not in result['monitor']['desktop']
+    assert len(audit.scan_monitor(started['id'])['events']) == len(result['events'])
+    client.post(f"/api/v1/agent-audit/monitor/{started['id']}/pause")
+    with path.open('a') as stream:
+        stream.write(json.dumps({'timestamp': core.utcnow(), 'type': 'response_item', 'payload': {
+            'type': 'custom_tool_call_output', 'call_id': 'local-call', 'output': 'private output'}}) + '\n')
+    resumed = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/resume").json()
+    assert len(resumed['events']) == len(result['events'])
+    stopped = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/stop").json()
+    assert not stopped['findings']
+
+
+def browser_pair(client, aid):
+    response = client.post(f'/api/v1/agent-audit/monitor/{aid}/browser/package')
+    assert response.status_code == 200, response.text
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        config = json.loads(archive.read('config.js').decode().split(' = ', 1)[1].rstrip(';'))
+        manifest = json.loads(archive.read('manifest.json'))
+        assert '<all_urls>' not in json.dumps(manifest)
+        assert not manifest.get('content_scripts')
+        assert 'webRequest' in manifest['optional_permissions']
+    return config
+
+
+def test_browser_pair_metadata_privacy_retry_and_revoke(client):
+    aid = client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    config = browser_pair(client, aid)
+    headers = {'Authorization': 'Bearer ' + config['token'], 'Origin': 'chrome-extension://' + 'a' * 32}
+    batch = {'sequence': 1, 'events': [{'timestamp': core.utcnow(), 'host': 'chatgpt.com',
+        'method': 'POST', 'kind': 'request', 'phase': 'completed', 'status_code': 200}]}
+    endpoint = '/api/v1/agent-audit/browser/events'
+    assert client.post(endpoint, json=batch).status_code == 401
+    accepted = client.post(endpoint, json=batch, headers=headers)
+    assert accepted.status_code == 200 and accepted.json()['accepted'] == 1
+    assert client.post(endpoint, json=batch, headers=headers).json()['duplicate'] is True
+    result = client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    event = next(e for e in result['events'] if e['source_type'] == 'browser')
+    assert event['actor'] == 'ChatGPT (Browser)' and not event['independent']
+    assert not event['authenticity_verified'] and event['status'] == 'observed'
+    assert result['monitor']['browser']['status'] == 'connected'
+    assert config['token'] not in json.dumps(result)
+    private = copy.deepcopy(batch)
+    private['sequence'] = 2
+    private['events'][0]['url'] = 'https://chatgpt.com/private?token=secret'
+    assert client.post(endpoint, json=private, headers=headers).status_code == 422
+    private['events'][0].pop('url')
+    private['events'][0]['host'] = 'private.example'
+    assert client.post(endpoint, json=private, headers=headers).status_code == 422
+    assert client.post(endpoint, json=batch, headers={**headers, 'Origin': 'https://evil.example'}).status_code == 403
+    revoked = client.post(f"/api/v1/agent-audit/monitor/{aid}/browser/{config['connectionId']}/revoke")
+    assert revoked.status_code == 200
+    assert client.post(endpoint, json=batch, headers=headers).status_code == 401
+
+
+def test_browser_pause_stop_and_package_origin_boundaries(client):
+    aid = client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/browser/package', headers={'Origin':'https://evil.example'}).status_code == 403
+    config = browser_pair(client, aid)
+    headers = {'Authorization': 'Bearer ' + config['token']}
+    client.post(f'/api/v1/agent-audit/monitor/{aid}/pause')
+    paused_event = {'timestamp': core.utcnow(), 'host':'claude.ai', 'method':'POST', 'kind':'request', 'phase':'started'}
+    assert client.post('/api/v1/agent-audit/browser/events', json={'sequence':1,'events':[]}, headers=headers).status_code == 409
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/browser/package').status_code == 409
+    client.post(f'/api/v1/agent-audit/monitor/{aid}/resume')
+    assert client.post('/api/v1/agent-audit/browser/events', json={'sequence':1,'events':[]}, headers=headers).status_code == 200
+    old = client.post('/api/v1/agent-audit/browser/events', json={'sequence':2,'events':[paused_event]}, headers=headers)
+    assert old.status_code == 200 and old.json()['dropped'] == 1 and old.json()['accepted'] == 0
+    client.post(f'/api/v1/agent-audit/monitor/{aid}/stop')
+    assert client.post('/api/v1/agent-audit/browser/events', json={'sequence':2,'events':[]}, headers=headers).status_code == 401
+
+
+def test_monitor_auto_pauses_when_storage_is_critical(client, monkeypatch):
+    started = client.post('/api/v1/agent-audit/monitor/start').json()
+    monkeypatch.setattr(audit.shutil, 'disk_usage', lambda _: type('Usage', (), {'total': 1000, 'used': 995, 'free': 5})())
+    result = audit.scan_monitor(started['id'])
+    assert result['monitor']['status'] == 'paused'
+    assert '存储空间不足' in result['monitor']['last_error']
+    response = client.post(f"/api/v1/agent-audit/monitor/{started['id']}/resume")
+    assert response.status_code == 507
 
 
 def test_normal_aligned_no_incident(client, fixture):

@@ -13,7 +13,7 @@ cp "$PROJECT_ROOT/macos/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
 swiftc "$PROJECT_ROOT/macos/FieldworkApp.swift" \
   -target arm64-apple-macos13.0 \
-  -framework Cocoa -framework WebKit \
+  -framework Cocoa -framework Security -framework WebKit \
   -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 swiftc "$PROJECT_ROOT/macos/FieldworkKeychain.swift" \

@@ -35,6 +35,8 @@ import browser_ai_bridge
 import native_ai_events
 import native_ai_binding
 import native_ai_bridge
+import agent_monitor_windows
+import agent_monitor_service
 from v5_graph import project_agent_audit_facts
 
 router = APIRouter(prefix='/api/v1/agent-audit', tags=['AI Agent Audit'])
@@ -43,13 +45,21 @@ ACTIONS = {'read', 'write', 'execute', 'connect', 'request', 'authenticate', 'mo
 TELEMETRY = {'tool_call', 'process', 'filesystem', 'network', 'browser', 'mcp', 'api', 'system'}
 SUCCESS = {'success', 'succeeded', 'completed', 'ok', 'connected'}
 MONITOR_LOCK = threading.RLock()
+MONITOR_LOCK_DEPTH = threading.local()
 
 
 def serialized_monitor(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
         with MONITOR_LOCK:
-            return function(*args, **kwargs)
+            if getattr(MONITOR_LOCK_DEPTH, 'active', False):
+                return function(*args, **kwargs)
+            with agent_monitor_service.process_lock('collector.lock'):
+                MONITOR_LOCK_DEPTH.active = True
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    MONITOR_LOCK_DEPTH.active = False
     return wrapped
 
 
@@ -105,6 +115,12 @@ class AuditInput(StrictModel):
         if timestamp(self.end_time) < timestamp(self.start_time):
             raise ValueError('结束时间早于开始时间')
         return self
+
+
+class MonitorPolicyInput(StrictModel):
+    policy: Policy
+    expected_id: str | None
+    confirmed: Literal[True]
 
 
 class ImportInput(StrictModel):
@@ -219,6 +235,7 @@ def init_agent_audit_db():
                 db.execute(f'ALTER TABLE agent_monitors ADD COLUMN {name} {definition}')
         browser_ai_bridge.init_db(db)
         native_ai_bridge.init_db(db)
+        agent_monitor_windows.init_db(db)
 
 
 def audit_row(db, audit_id):
@@ -460,16 +477,27 @@ def scan_active_monitors():
             with core.connect() as db:
                 db.execute("UPDATE agent_monitors SET status='paused',paused_at=?,last_error=? WHERE audit_id=? AND status='active'",
                     (core.utcnow(), f'采集异常，监控已暂停：{type(error).__name__}。可恢复重试。', audit_id))
+        try:
+            agent_monitor_windows.scheduled_tick(audit_id)
+        except Exception as error:
+            # Analysis failure must neither freeze inputs nor stop collection.
+            logging.getLogger(__name__).error('Monitor analysis %s failed: %s', audit_id, type(error).__name__)
     return ids
 
 
 async def monitor_worker():
     while True:
         try:
-            await asyncio.to_thread(scan_active_monitors)
+            if not agent_monitor_service.status()['running']:
+                await asyncio.to_thread(scan_active_monitors)
         except Exception as error:
             logging.getLogger(__name__).error('Monitor scheduler failed: %s', type(error).__name__)
         await asyncio.sleep(2)
+
+
+@router.get('/monitor/service')
+def monitor_service_status():
+    return agent_monitor_service.status()
 
 
 @router.post('/monitor/start', status_code=201)
@@ -519,6 +547,21 @@ def desktop_discovery():
 @router.post('/monitor/{audit_id}/scan')
 def poll_monitor(audit_id: str):
     return scan_monitor(audit_id)
+
+
+@router.get('/monitor/{audit_id}/windows')
+def monitor_windows(audit_id: str):
+    return agent_monitor_windows.recent(audit_id)
+
+
+@router.get('/monitor/{audit_id}/policy')
+def monitor_policy(audit_id: str):
+    return agent_monitor_windows.policy_view(audit_id)
+
+
+@router.post('/monitor/{audit_id}/policy')
+def configure_monitor_policy(audit_id: str, body: MonitorPolicyInput):
+    return agent_monitor_windows.configure_policy(audit_id, body.policy.model_dump(), body.expected_id)
 
 
 @router.post('/monitor/{audit_id}/pause')
@@ -721,7 +764,10 @@ def import_events(audit_id: str, body: ImportInput):
             db.execute('INSERT INTO agent_signed_imports VALUES(?,?,?,?,?,?,?,?,?,?)',
                        (core.uid('signed-import'), audit_id, body.collector_id, raw_id, body.sequence, body.nonce,
                         body.signed_at, source_hash, body.signature, core.utcnow()))
+        monitor_policy = agent_monitor_windows.current_policy(db, audit_id)
         for event in normalized:
+            if monitor_policy:
+                event['monitor_policy_id'] = monitor_policy['id']
             event.update(audit_id=audit_id, raw_artifact_id=raw_id, raw_sha256=source_hash)
             aid, _ = artifact(db, audit['run_id'], 'agent_event', event)
             oid, evid = core.uid('obs'), core.uid('evidence')
@@ -867,7 +913,7 @@ def reconcile(events, claims, identity, complete=False):
     return {'rows': rows, 'event_status': statuses}
 
 
-def checked_inputs(db, audit):
+def checked_snapshot(db, audit):
     manifest = core.load(audit['input_manifest'])
     snapshot, _ = read_artifact(db, manifest['snapshot'], audit['run_id'])
     if snapshot['identity'] != core.load(audit['identity_json']):
@@ -881,6 +927,12 @@ def checked_inputs(db, audit):
         raise HTTPException(409, 'Integrity Check Failed: Scope / Policy 改变')
     if snapshot['policy'] and digest(snapshot['policy']) != audit['policy_sha256']:
         raise HTTPException(409, 'Integrity Check Failed: Policy SHA256')
+    return snapshot
+
+
+def checked_inputs(db, audit):
+    manifest = core.load(audit['input_manifest'])
+    snapshot = checked_snapshot(db, audit)
     for item in manifest['imports']:
         imported, _ = read_artifact(db, item['artifact_id'], audit['run_id'])
         if imported['input_sha256'] != item['input_sha256'] or imported['self_report_complete'] != item['self_report_complete']:
@@ -907,12 +959,20 @@ def checked_inputs(db, audit):
         if claim != core.load(row['claim_json']) or claim['audit_id'] != audit['id']:
             raise HTTPException(409, 'Integrity Check Failed: Claim 改变')
         claims.append(claim)
+    policy_ids = {event.get('monitor_policy_id') for event in events} - {None}
+    if policy_ids:
+        snapshot['monitor_policies'] = {pid: agent_monitor_windows.read_policy(db, audit, pid) for pid in policy_ids}
     return snapshot, sorted(events, key=lambda e: e['timestamp']), claims, any(i['self_report_complete'] for i in manifest['imports'])
+
+
+def policy_for_event(snapshot, event):
+    pid = event.get('monitor_policy_id')
+    return snapshot['monitor_policies'][pid]['policy'] if pid else snapshot['policy']
 
 
 def reconstruction(snapshot, events, claims, complete):
     reconciliation = reconcile(events, claims, snapshot['identity'], complete)
-    policies = {event['id']: evaluate_policy(event, snapshot['policy']) for event in events}
+    policies = {event['id']: evaluate_policy(event, policy_for_event(snapshot, event)) for event in events}
     return {'reconciliation': reconciliation, 'policy_evaluations': policies}
 
 
@@ -921,6 +981,8 @@ def analyze(audit_id: str):
     with core.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         audit = audit_row(db, audit_id)
+        if db.execute("SELECT 1 FROM agent_monitors WHERE audit_id=? AND status IN ('active','paused')", (audit_id,)).fetchone():
+            raise HTTPException(409, '持续监控使用增量分析窗口；请停止监控后再冻结完整审计')
         snapshot, events, claims, complete = checked_inputs(db, audit)
         if not events and not claims:
             raise HTTPException(409, '请先导入行为轨迹或自述')
@@ -956,6 +1018,8 @@ def verify_incident(audit_id: str, candidate_id: str):
     with core.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         audit = audit_row(db, audit_id)
+        if agent_monitor_windows.current_policy(db, audit_id):
+            raise HTTPException(409, '版本化监控策略线索尚需独立窗口复验，不能使用旧整审计验证器晋升')
         if not audit['analysis_json']:
             raise HTTPException(409, '请先完成确定性分析')
         link = db.execute('SELECT * FROM agent_incidents WHERE audit_id=? AND candidate_id=?', (audit_id, candidate_id)).fetchone()
@@ -1031,7 +1095,7 @@ def get_audit(audit_id: str):
     result = core.load(audit['analysis_json'], None)
     if result and digest({'snapshot': snapshot, 'events': events, 'claims': claims, 'complete': complete}) != result['input_digest']:
         raise HTTPException(409, 'Integrity Check Failed: 分析输入改变')
-    live_evaluations = {event['id']: evaluate_policy(event, snapshot['policy']) for event in events}
+    live_evaluations = {event['id']: evaluate_policy(event, policy_for_event(snapshot, event)) for event in events}
     presented_events = [{**event, 'policy_decision': result['policy_evaluations'][event['id']]['decision'],
                          'policy_boundaries': result['policy_evaluations'][event['id']]['boundaries']}
                         for event in events] if result else events

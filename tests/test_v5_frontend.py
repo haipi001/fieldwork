@@ -150,7 +150,7 @@ def test_v5_graph_modes_use_persisted_asset_and_research_relationships():
     assert "/api/v1/engagements/${encodeURIComponent(id)}/asset-graph" in script
     assert "window.loadFieldworkResearchGraph" in script
     graph_script = client.get("/static/v5-research-graph.js").text
-    assert "/api/v1/research/campaigns/${encodeURIComponent(detail.id)}/graph" in graph_script
+    assert "/api/v1/research/campaigns/${encodeURIComponent(id)}/graph/page" in graph_script
     assert "关系仅来自持久化 Observation" in script
 
 
@@ -210,11 +210,14 @@ def test_v5_language_toggle_translates_shell_and_preserves_preference():
     script = client.get("/static/v5.js").text
 
     assert 'id="settingsLanguageToggle"' in html
-    assert "function applyLanguage()" in script
+    assert "function applyLanguage(notify=true)" in script
     assert 'document.documentElement.lang=state.language==="en"?"en":"zh-CN"' in script
-    assert "dataset.zhText" in script
-    assert "applyLanguage();setView(" in script
-    assert "dynamic workflow copy is still being migrated" in script
+    assert "FieldworkStaticLocale?.apply()" in script
+    assert "fieldwork:languagechange" in script
+    assert "applyLanguage(false);setView(" in script
+    locale = client.get("/static/v5-locale.js").text
+    assert "NodeFilter.SHOW_TEXT" in locale
+    assert "MutationObserver" not in locale  # Never translate dynamically supplied evidence.
 
 
 def test_v5_report_preview_tracks_source_and_backend_completeness():
@@ -237,11 +240,11 @@ def test_v5_overview_distinguishes_unavailable_from_empty_data():
     script = client.get("/static/v5.js").text
 
     assert "const campaignsOk=state.remote.engagements?.ok,tasksOk=state.remote.tasks?.ok,findingsOk=state.remote.findings?.ok" in script
-    assert '$("#metricTasks").textContent=tasksOk?active.length:"–"' in script
-    assert '$("#metricVerified").textContent=findingsOk?verified.length:"–"' in script
-    assert '$("#attentionCount").textContent=partial?"部分数据"' in script
+    assert 'localizedText($("#metricTasks"),()=>tasksOk?active.length:"–")' in script
+    assert 'localizedText($("#metricVerified"),()=>findingsOk?verified.length:"–")' in script
+    assert 'localizedText($("#attentionCount"),()=>partial?t("部分数据","Partial data")' in script
     assert "无法确认待办总量" in script
-    assert '$("#trustRatio").textContent=findingsOk?candidates.length:"–"' in script
+    assert 'localizedText($("#trustRatio"),()=>findingsOk?candidates.length:"–")' in script
 
 
 def test_v5_orchestration_views_keep_agent_and_runner_roles_distinct():
@@ -295,7 +298,7 @@ def test_v5_domain_selector_filters_real_research_data_and_resets_stale_state():
         assert f'<option value="{domain}">' in html
     assert 'const endpointFor=(key,domain)' in script
     assert '`${endpoints[key]}?mode=${encodeURIComponent(domain)}`' in script
-    assert 'domain:domains.includes(storedDomain)?storedDomain:"traditional"' in script
+    assert 'domain:storedDomain==="web3"?"web3":"traditional"' in script
     assert 'if(token!==state.loadToken||domain!==state.domain)return' in script
     assert 'state.researchLoadToken++;state.graphLoadToken++;state.runLoadToken++;state.verificationLoadToken++' in script
     assert '$("#domainSelect").onchange=e=>selectDomain(e.target.value)' in script

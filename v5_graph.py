@@ -1,6 +1,7 @@
 """V5 Research Graph repository, API, and explicit legacy provenance bridge."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import sqlite3
@@ -303,6 +304,55 @@ def delete_edge(edge_id: str):
             raise HTTPException(404, "research edge not found")
         db.execute("DELETE FROM research_edges WHERE id=?", (edge_id,))
         _emit(db, row["campaign_id"], edge_id, "edge.deleted", {"relation_type": row["relation_type"]})
+
+
+@router.get("/campaigns/{campaign_id}/graph/page")
+def get_graph_page(campaign_id: str, limit: int = Query(default=200, ge=1, le=1000),
+                   cursor: str | None = Query(default=None, max_length=4096)):
+    """Page nodes and edges independently so cross-page relations are retained.
+
+    Each request is a read snapshot; the traversal is a live view, not a
+    cross-request snapshot. Refresh to include new records before a cursor.
+    """
+    markers, done = [None, None], [False, False]
+    if cursor:
+        try:
+            value = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
+            if (not isinstance(value, list) or len(value) != 5 or value[0] != campaign_id
+                    or any(type(flag) is not bool for flag in value[3:])
+                    or any(marker is not None and (not isinstance(marker, list) or len(marker) != 2
+                           or any(not isinstance(part, str) for part in marker)) for marker in value[1:3])):
+                raise ValueError("invalid graph cursor")
+            markers, done = value[1:3], value[3:]
+        except (ValueError, TypeError, RecursionError):
+            raise HTTPException(422, "invalid cursor for this campaign") from None
+    rows_by_kind = []
+    with _core().connect() as db:
+        db.execute("BEGIN")
+        _campaign(db, campaign_id)
+        for index, table in enumerate(("research_nodes", "research_edges")):
+            rows = []
+            if not done[index]:
+                clause, params = "", [campaign_id]
+                if markers[index] is not None:
+                    clause = " AND (created_at,id)>(?,?)"
+                    params.extend(markers[index])
+                rows = db.execute(
+                    f"SELECT * FROM {table} WHERE campaign_id=?{clause} ORDER BY created_at,id LIMIT ?",
+                    (*params, limit + 1),
+                ).fetchall()
+                done[index] = len(rows) <= limit
+                rows = rows[:limit]
+                if rows:
+                    markers[index] = [rows[-1]["created_at"], rows[-1]["id"]]
+            rows_by_kind.append(rows)
+        nodes = [_node_with_trust(db, row) for row in rows_by_kind[0]]
+    has_more = not all(done)
+    next_cursor = base64.urlsafe_b64encode(_dump([campaign_id, *markers, *done]).encode()).decode() if has_more else None
+    return {"campaign_id": campaign_id, "nodes": nodes,
+            "edges": [_edge(row) for row in rows_by_kind[1]],
+            "page": {"limit": limit, "has_more": has_more, "next_cursor": next_cursor,
+                     "nodes_complete": done[0], "edges_complete": done[1]}}
 
 
 @router.get("/campaigns/{campaign_id}/graph")

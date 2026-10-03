@@ -278,18 +278,19 @@ def _claim_local_task(db: sqlite3.Connection, population_id: str | None = None) 
             "SELECT * FROM agent_tasks WHERE status='queued' AND role='evolver' "
             "AND attempt<max_attempts AND json_valid(context_capsule_json) "
             "AND json_extract(context_capsule_json,'$.evolution_population_id')=? "
-            "ORDER BY priority DESC,created_at,id LIMIT 100", (population_id,),
+            "ORDER BY priority DESC,created_at,id", (population_id,),
         )
     else:
         candidates = db.execute(
             "SELECT * FROM agent_tasks WHERE status='queued' AND role IN ('critic','synthesizer','evolver') "
-            "AND attempt<max_attempts ORDER BY priority DESC,created_at,id LIMIT 100",
+            "AND attempt<max_attempts ORDER BY priority DESC,created_at,id",
         )
     for task in candidates:
         context = _load(task["context_capsule_json"], {})
         if (context.get("structured_worker") != task["role"]
                 or not _group_can_lease(db, task) or not _continuous_scope_current(db, task)):
             continue
+        candidates.close()
         expires = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
         db.execute(
             "UPDATE agent_tasks SET status='running',attempt=attempt+1,lease_owner=?,"
@@ -298,6 +299,7 @@ def _claim_local_task(db: sqlite3.Connection, population_id: str | None = None) 
         )
         _sync_runner_jobs(db, LOCAL_RUNNER_ID)
         return db.execute("SELECT * FROM agent_tasks WHERE id=?", (task["id"],)).fetchone()
+    candidates.close()
     return None
 
 

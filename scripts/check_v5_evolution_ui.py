@@ -1,7 +1,7 @@
 """Read-only browser smoke for the V5 Evolution control plane.
 
-All Evolution responses and writes are intercepted in the browser. The supplied
-server only serves static assets; this script never persists research records.
+All requests are intercepted, including static assets. No server or real
+research records are used.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from playwright.sync_api import sync_playwright
 
 
 BASE = os.getenv("FIELDWORK_V5_BASE", "http://127.0.0.1:8012").rstrip("/")
+ROOT = Path(__file__).resolve().parents[1]
 parsed = urlparse(BASE)
 if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
     raise SystemExit("Evolution UI smoke requires a loopback HTTP server")
@@ -57,6 +58,19 @@ def run() -> None:
         page = browser.new_page(viewport={"width": 1280, "height": 900})
         errors: list[str] = []
         page.on("pageerror", lambda error: errors.append(str(error)))
+        def isolated_assets(route):
+            path = urlparse(route.request.url).path
+            if path == "/v5":
+                route.fulfill(path=str(ROOT / "templates/v5.html"), content_type="text/html")
+            elif path.startswith("/static/"):
+                route.fulfill(path=str(ROOT / path.lstrip("/")))
+            elif path == "/api/v1/findings":
+                route.fulfill(json={"verified": [], "candidates": []})
+            elif path in {"/api/v1/task-center", "/api/v1/capabilities", "/api/v1/agent-audit/audits"}:
+                route.fulfill(json=[])
+            else:
+                route.fulfill(status=503, json={"detail": "Outside isolated fixture"})
+        page.route("**/*", isolated_assets)
         page.route("**/api/v1/engagements?mode=traditional", lambda route: route.fulfill(json=[{
             "id": "eng-ui", "name": "Isolated Evolution UI", "mode": "traditional", "status": "ready",
             "normalized_target": "https://ui.example.test",
@@ -72,7 +86,21 @@ def run() -> None:
                        "target_group_id": group_one, "source_claim_id": "claim-source", "current": True,
                        "capsule": {"key_idea": "Cross-group source idea"}}]}))
         page.route("**/api/v1/orchestration/tasks?campaign_id=campaign-ui&limit=500",
-                   lambda route: route.fulfill(json={"items": tasks}))
+                   lambda route: route.fulfill(json={"items": [{"id": f"unrelated-{index}", "role": "critic"}
+                       for index in range(500)], "page": {"next_cursor": "page-two", "has_more": True}}))
+        page.route("**/api/v1/orchestration/tasks?campaign_id=campaign-ui&limit=500&cursor=page-two",
+                   lambda route: route.fulfill(json={"items": [{"id": f"unrelated-{index}", "role": "critic"}
+                       for index in range(500, 1000)], "page": {"next_cursor": "page-three", "has_more": True}}))
+        page.route("**/api/v1/orchestration/tasks?campaign_id=campaign-ui&limit=500&cursor=page-three",
+                   lambda route: route.fulfill(json={"items": tasks, "page": {"next_cursor": None, "has_more": False}}))
+
+        def load_task_pages():
+            for _ in range(2):
+                with page.expect_response("**/orchestration/tasks?*&cursor=*"):
+                    page.locator("[data-evolution-more-tasks]").click()
+                page.wait_for_function("!document.querySelector('[data-evolution-more-tasks]') || !document.querySelector('[data-evolution-more-tasks]').disabled")
+            assert page.locator("[data-evolution-more-tasks]").count() == 0
+            page.get_by_text("任务列表已读取完毕，共 1001 项。").wait_for()
         page.route("**/api/v1/research/campaigns/campaign-ui/graph?limit=1000",
                    lambda route: route.fulfill(json={"nodes": claims, "edges": [], "page": {"has_more": False}}))
         page.route("**/api/v1/workers/status", lambda route: route.fulfill(json={
@@ -102,11 +130,27 @@ def run() -> None:
         page.get_by_text("当前快照").wait_for()
         assert page.locator("#evolutionContent").get_by_text("A bounded supported idea").count() > 0
         assert page.locator("#evolutionContent").get_by_text("0.810").count() == 1
+        assert page.locator('[data-evolution-action="collect"]').is_disabled()
+        load_task_pages()
+        page.locator('#evolutionSeedForm input[name="claim"]').first.check()
+        page.locator('#evolutionSeedForm [name="selection"]').fill('1')
+        page.locator('#languageToggle').click()
+        assert page.locator('#evolutionFreshness').text_content() == 'Current snapshot'
+        assert page.locator('#evolutionSeedForm input[name="claim"]').first.is_checked()
+        assert page.locator('#evolutionSeedForm [name="selection"]').input_value() == '1'
+        assert page.evaluate("!/[\\u3400-\\u9fff]/.test(document.querySelector('#evolutionContent').innerText)")
+        assert writes == []
+        page.locator('#languageToggle').click()
+        assert page.locator('#evolutionSeedForm input[name="claim"]').first.is_checked()
         page.locator('[data-evolution-population="population-old"]').click()
         assert page.locator('[data-evolution-action="advance"]').is_disabled()
         page.locator('[data-evolution-population="population-current"]').click()
         page.locator('[data-evolution-action="advance"]').click()
         assert page.locator("#evolutionActionDialog").evaluate("el => el.open")
+        page.evaluate("document.querySelector('#languageToggle').click()")
+        assert page.locator('#evolutionActionTitle').inner_text() == 'Create evolver tasks for this generation'
+        assert 'group budgets' in page.locator('#evolutionActionSummary').inner_text()
+        page.evaluate("document.querySelector('#languageToggle').click()")
         assert writes == []
         page.locator("#evolutionActionBack").click()
         assert writes == []
@@ -114,13 +158,16 @@ def run() -> None:
         page.locator("#evolutionActionCommit").click()
         page.get_by_text("已创建 1 个任务").wait_for()
         assert len(writes) == 1 and writes[0][0].endswith("/population-current/advance")
+        load_task_pages()
         page.locator('[data-evolution-action="tick"]').click()
         page.locator("#evolutionActionCommit").click()
         page.get_by_text("本代 Worker tick 已完成").wait_for()
         assert "population_id=population-current" in writes[-1][0]
         tasks[0].update(status="running", lease_expires_at="2000-01-01T00:00:00+00:00")
         page.locator("#evolutionRefresh").click()
-        page.locator(".evolution-task-list").get_by_text("running", exact=True).wait_for()
+        page.get_by_text("已读取当前 Campaign 的真实演化数据。").wait_for()
+        load_task_pages()
+        page.locator(".evolution-task-list .state.running").get_by_text("运行中", exact=True).wait_for()
         assert page.locator('[data-evolution-action="tick"]').is_enabled()
         page.locator('[data-evolution-action="tick"]').click()
         with page.expect_response("**/workers/local/tick?limit=2&population_id=population-current"):

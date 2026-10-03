@@ -295,25 +295,45 @@ def _score(signals: dict) -> float:
                  + 0.1 * signals["declared_impact"] + 0.05 * signals["cost_efficiency"], 6)
 
 
-def _population_value(db: sqlite3.Connection, row: sqlite3.Row, ancestors: frozenset[str] = frozenset()) -> dict:
-    try:
-        campaign = _campaign(db, row["campaign_id"])
-    except HTTPException:
-        campaign = None
+def _population_value(db: sqlite3.Connection, row: sqlite3.Row,
+                      current_cache: dict[str, bool] | None = None) -> dict:
+    # Callers may share this cache only within one database read snapshot.
+    # Iteration avoids recursion limits; shared ancestors are checked once.
+    cache = {} if current_cache is None else current_cache
     variants = db.execute("SELECT * FROM research_variants_v5 WHERE population_id=? ORDER BY rank",
                           (row["id"],)).fetchall()
-    group = db.execute("SELECT status FROM research_groups WHERE id=? AND campaign_id=?",
-                       (row["group_id"], row["campaign_id"])).fetchone()
-    current = bool(campaign and group and group["status"] != "cancelled"
-                   and campaign["current_scope_snapshot_id"] == row["scope_snapshot_id"]
-                   and campaign["current_policy_id"] == row["policy_id"]
-                   and all(_inputs_current(db, row["campaign_id"], variant["claim_node_id"],
-                                           _load(variant["input_hashes_json"])) for variant in variants))
-    if current and row["parent_population_id"]:
-        parent = db.execute("SELECT * FROM research_populations_v5 WHERE id=? AND campaign_id=?",
-                            (row["parent_population_id"], row["campaign_id"])).fetchone()
-        current = bool(parent and parent["id"] not in ancestors and parent["id"] != row["id"]
-                       and _population_value(db, parent, ancestors | {row["id"]})["current"])
+    cursor, visited = row, set()
+    current = True
+    while cursor["id"] not in cache:
+        if cursor["id"] in visited:
+            current = False
+            break
+        visited.add(cursor["id"])
+        try:
+            campaign = _campaign(db, cursor["campaign_id"])
+        except HTTPException:
+            campaign = None
+        group = db.execute("SELECT status FROM research_groups WHERE id=? AND campaign_id=?",
+                           (cursor["group_id"], cursor["campaign_id"])).fetchone()
+        inputs = variants if cursor["id"] == row["id"] else db.execute(
+            "SELECT * FROM research_variants_v5 WHERE population_id=? ORDER BY rank", (cursor["id"],)).fetchall()
+        current = bool(campaign and group and group["status"] != "cancelled"
+                       and campaign["current_scope_snapshot_id"] == cursor["scope_snapshot_id"]
+                       and campaign["current_policy_id"] == cursor["policy_id"]
+                       and all(_inputs_current(db, cursor["campaign_id"], variant["claim_node_id"],
+                                               _load(variant["input_hashes_json"])) for variant in inputs))
+        if not current or not cursor["parent_population_id"]:
+            break
+        parent = db.execute("SELECT * FROM research_populations_v5 WHERE id=? AND campaign_id=? AND group_id=?",
+                            (cursor["parent_population_id"], cursor["campaign_id"], cursor["group_id"])).fetchone()
+        if not parent or parent["generation"] >= cursor["generation"]:
+            current = False
+            break
+        cursor = parent
+    else:
+        current = cache[cursor["id"]]
+    for population_id in visited:
+        cache[population_id] = current
     return {**dict(row), "current": current,
             "variants": [{**dict(variant), "parent_variant_ids": _load(variant["parent_variant_ids_json"]),
                           "signals": _load(variant["signals_json"])} for variant in variants],
@@ -408,6 +428,7 @@ def create_population(body: PopulationCreate):
 @router.get("/populations/{population_id}")
 def get_population(population_id: str):
     with _core().connect() as db:
+        db.execute("BEGIN")
         row = db.execute("SELECT * FROM research_populations_v5 WHERE id=?", (population_id,)).fetchone()
         if not row:
             raise HTTPException(404, "population not found")
@@ -418,10 +439,12 @@ def get_population(population_id: str):
 def list_populations(campaign_id: str = Query(min_length=1), group_id: str | None = None,
                      limit: int = Query(100, ge=1, le=500)):
     with _core().connect() as db:
+        db.execute("BEGIN")
         rows = db.execute("SELECT * FROM research_populations_v5 WHERE campaign_id=? "
                           "AND (? IS NULL OR group_id=?) ORDER BY created_at DESC,id DESC LIMIT ?",
                           (campaign_id, group_id, group_id, limit)).fetchall()
-        return {"items": [_population_value(db, row) for row in rows]}
+        current_cache: dict[str, bool] = {}
+        return {"items": [_population_value(db, row, current_cache) for row in rows]}
 
 
 def evolution_task_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool:

@@ -8,6 +8,8 @@ Fieldwork V5 是 Evidence-first Autonomous Research & Verification OS。它在�
 
 本轮优先级：先形成可运行的新版前端控制面，再逐阶段接入 V5 后端 Overlay。
 
+2026-10-02 用户明确最终验收要求：Fieldwork 必须可靠地自动发现并确认漏洞，并要求覆盖安装到本机。产品完成必须由实际运行的漏洞发现与独立确认验收证明；工具接入、单元测试、编排规模、模拟结果均不能替代该证据。详见 `docs/acceptance/RELIABLE_AUTONOMOUS_VULNERABILITY_GATE.md`。该目标尚未达成。
+
 ## 当前基线
 
 - 旧业务路由仍保留，但 V5 已迁入研究草稿创建、Scope 确认、执行预检与启动、Run 暂停/恢复/停止以及已验证结果的报告预览/导出；身份、复验等深度操作仍需迁移。
@@ -122,6 +124,8 @@ Fieldwork V5 是 Evidence-first Autonomous Research & Verification OS。它在�
 8. `V5-FE-01C`：把 Graph、Orchestrator、Intelligence 和 Receipt 页面切换到真实 Overlay 数据。
 9. `V5-ORCH-02`：固定本地 HTTP/包适用性 Oracle 已使用 macOS 沙箱与负向能力探针；通用/远端可信 Verifier、完整跨平台隔离仍未完成。见 `docs/acceptance/2026-10-01-v5-orch-02-macos-verifier-sandbox.md`。
 10. `V5-ORCH-03`：跨组精简胶囊、确定性群体评估、rank/select、谱系、mutation/combine Worker 与 Evolution 控制面已接入。六轮跨进程演化、崩溃租约恢复、组预算截止、重试结果隔离及 32 候选容量边界已验证；真实 Provider 长时运行和更长代际压力验收仍待补。见 `docs/acceptance/2026-10-01-v5-orch-03-cross-pollination-evolution.md`、`docs/acceptance/2026-10-01-v5-orch-03-evolver-worker.md`、`docs/acceptance/2026-10-01-v5-orch-03-evolution-control-plane.md` 与 `docs/acceptance/2026-10-02-v5-orch-03-durable-evolution.md`。
+
+11. `V5-SCALE-01`：修复 1100 代谱系递归溢出与重复祖先查询；本地/通用队列可越过 1000 条过期 Scope 任务找到有效任务，保留并发门禁。任务 API 与 Evolution 页面已可游标分页读取 1001 条任务，未读完时禁止汇集。首页/研究图谱可分页读完 1001 节点与 1201 关系，跨页反证边不再丢失。全负载、预算指标、Evolution Claim/历史及其他队列页面上限仍待补。见 `docs/acceptance/2026-10-02-v5-scale-01-history-and-queue.md`、`docs/acceptance/2026-10-02-v5-scale-01-task-pagination.md`、`docs/acceptance/2026-10-02-v5-scale-01-graph-pagination.md`。
 
 ## 回滚
 

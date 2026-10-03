@@ -15,7 +15,7 @@ with sync_playwright() as p:
           hypotheses:[{id:'hyp-a',campaign_id:'camp-a',statement:'Missing authorization',evidence_ids:['ev-1'],counterevidence_ids:['ev-2']}],
           candidate_links:[{candidate_id:'cand-1',title:'Authorization candidate',status:'candidate'}]
         };
-        if(url.endsWith('/research/campaigns/camp-a/graph'))return {nodes:[],edges:[],page:{has_more:false}};
+        if(url.endsWith('/research/campaigns/camp-a/graph/page'))return {campaign_id:'camp-a',nodes:[],edges:[],page:{has_more:false}};
         throw Error('Unexpected '+url);
       };
       const graph=await window.loadFieldworkResearchGraph({engagementId:'eg-a',mode:'traditional',findings:{

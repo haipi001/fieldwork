@@ -6,7 +6,9 @@ runners with explicit capabilities.
 """
 from __future__ import annotations
 
+import base64
 import json
+import math
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -181,11 +183,13 @@ class LeaseRequest(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     runner_id: str = Field(min_length=1, max_length=200)
+    lease_attempt: int | None = Field(default=None, ge=1)
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
 class CheckpointRequest(BaseModel):
     runner_id: str = Field(min_length=1, max_length=200)
+    lease_attempt: int | None = Field(default=None, ge=1)
     checkpoint: dict[str, Any]
 
 
@@ -198,6 +202,7 @@ class Usage(BaseModel):
 
 class CompletionRequest(BaseModel):
     runner_id: str = Field(min_length=1, max_length=200)
+    lease_attempt: int | None = Field(default=None, ge=1)
     outcome: Literal["succeeded", "failed"]
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -383,14 +388,36 @@ def get_task(task_id: str):
 
 @router.get("/tasks")
 def list_tasks(campaign_id: str = Query(min_length=1), status: str | None = None,
-               limit: int = Query(100, ge=1, le=500)):
+               limit: int = Query(100, ge=1, le=500), cursor: str | None = Query(None, max_length=4096)):
     f = _core()
-    clause, params = (" AND status=?", [campaign_id, status, limit]) if status else ("", [campaign_id, limit])
+    clause, params = (" AND status=?", [campaign_id, status]) if status else ("", [campaign_id])
+    if cursor:
+        try:
+            value = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
+            if (not isinstance(value, list) or len(value) != 5 or value[:2] != [campaign_id, status]
+                    or type(value[2]) not in (int, float) or not math.isfinite(value[2])
+                    or not isinstance(value[3], str) or not isinstance(value[4], str)):
+                raise ValueError("invalid task cursor")
+            priority, created_at, task_id = value[2:]
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            raise HTTPException(422, "invalid cursor for this campaign/status") from None
+        clause += " AND (priority<? OR (priority=? AND (created_at>? OR (created_at=? AND id>?))))"
+        params.extend([priority, priority, created_at, created_at, task_id])
+    params.append(limit + 1)
     with f.connect() as db:
         rows = db.execute(
-            f"SELECT * FROM agent_tasks WHERE campaign_id=?{clause} ORDER BY priority DESC,created_at LIMIT ?", params,
+            f"SELECT * FROM agent_tasks WHERE campaign_id=?{clause} ORDER BY priority DESC,created_at,id LIMIT ?", params,
         ).fetchall()
-    return {"items": [_task_value(row) for row in rows]}
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = None
+    if has_more:
+        last = rows[-1]
+        next_cursor = base64.urlsafe_b64encode(json.dumps(
+            [campaign_id, status, last["priority"], last["created_at"], last["id"]],
+            separators=(",", ":"), allow_nan=False).encode()).decode()
+    return {"items": [_task_value(row) for row in rows],
+            "page": {"has_more": has_more, "next_cursor": next_cursor, "limit": limit}}
 
 
 @router.get("/status")
@@ -538,7 +565,26 @@ def _group_can_lease(db: sqlite3.Connection, task: sqlite3.Row) -> bool:
         "SELECT COALESCE(SUM(u.cost_micros),0) FROM agent_tasks t "
         "LEFT JOIN agent_task_usage u ON u.task_id=t.id WHERE t.group_id=?", (group["id"],),
     ).fetchone()[0]
-    return budget.get("max_cost_micros") is None or cost < budget["max_cost_micros"]
+    cap = budget.get("max_cost_micros")
+    if cap is None:
+        return True
+    if cost >= cap:
+        return False
+    # Running attempts reserve the remaining declared task allowance. This is
+    # evaluated inside the same write transaction as the lease acquisition.
+    rows = db.execute(
+        "SELECT t.id,t.budget_json,COALESCE(u.cost_micros,0) spent FROM agent_tasks t "
+        "LEFT JOIN agent_task_usage u ON u.task_id=t.id "
+        "WHERE t.group_id=? AND (t.status IN ('leased','running') OR t.id=?)",
+        (group["id"], task["id"]),
+    ).fetchall()
+    reserved = 0
+    for item in rows:
+        task_cap = _load(item["budget_json"], {}).get("max_cost_micros")
+        if task_cap is None:
+            return False  # An unbounded task cannot fit a finite group budget.
+        reserved += max(0, task_cap - item["spent"])
+    return cost + reserved <= cap
 
 
 def _continuous_scope_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool:
@@ -588,13 +634,16 @@ def lease_task(body: LeaseRequest):
         capabilities = set(_load(runner["capabilities_json"], []))
         candidates = db.execute(
             "SELECT * FROM agent_tasks WHERE status='queued' AND attempt<max_attempts "
-            "ORDER BY priority DESC,created_at,id LIMIT 500",
-        ).fetchall()
+            "ORDER BY priority DESC,created_at,id",
+        )
+        # Stream in scheduling order and stop at the first eligible task. A
+        # fixed prefix can permanently hide live work behind stale capsules.
         chosen = next((task for task in candidates
                        if set(_load(task["tool_grants_json"], [])).issubset(capabilities)
                        and _route_matches(_load(task["route_requirement_json"], {}), runner)
                        and _group_can_lease(db, task)
                        and _continuous_scope_current(db, task)), None)
+        candidates.close()
         if not chosen:
             return {"task": None, "reason": "no_eligible_task"}
         expires = (datetime.now(timezone.utc) + timedelta(seconds=body.lease_seconds)).isoformat()
@@ -625,7 +674,7 @@ def _owned_running(db: sqlite3.Connection, task_id: str, runner_id: str) -> sqli
 
 
 def _check_lease_attempt(task: sqlite3.Row, lease_attempt: int | None) -> None:
-    """Fence late structured results when a runner reclaims the same task.
+    """Fence late writes when a runner reclaims the same task.
 
     Initial leases accept the original result contract. Retried leases must echo
     the attempt returned by the scheduler; runner identity alone is ambiguous.
@@ -644,6 +693,7 @@ def task_heartbeat(task_id: str, body: HeartbeatRequest):
     with f.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = _owned_running(db, task_id, body.runner_id)
+        _check_lease_attempt(row, body.lease_attempt)
         expires = (datetime.now(timezone.utc) + timedelta(seconds=body.lease_seconds)).isoformat()
         db.execute("UPDATE agent_tasks SET heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE id=?",
                    (_now(), expires, _now(), task_id))
@@ -660,7 +710,9 @@ def checkpoint_task(task_id: str, body: CheckpointRequest):
         raise HTTPException(413, "checkpoint is too large")
     f, checkpoint_id = _core(), _uid("checkpoint")
     with f.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         row = _owned_running(db, task_id, body.runner_id)
+        _check_lease_attempt(row, body.lease_attempt)
         db.execute("INSERT INTO agent_task_checkpoints VALUES(?,?,?,?,?)",
                    (checkpoint_id, task_id, body.runner_id, encoded, _now()))
         _emit(db, row["campaign_id"], task_id, "task.checkpoint", {"checkpoint_id": checkpoint_id})
@@ -675,12 +727,16 @@ def complete_task(task_id: str, body: CompletionRequest):
     with f.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = _owned_running(db, task_id, body.runner_id)
+        _check_lease_attempt(row, body.lease_attempt)
         context = _load(row["context_capsule_json"], {})
         if row["role"] == "verifier" and context.get("verification_request_id"):
             raise HTTPException(409, "verification tasks must finish through the immutable receipt endpoint")
         if context.get("structured_worker") in {"critic", "synthesizer", "evolver"}:
             raise HTTPException(409, "structured worker tasks must use the role-specific result endpoint")
         usage = body.usage.model_dump()
+        previous = db.execute("SELECT * FROM agent_task_usage WHERE task_id=?", (task_id,)).fetchone()
+        if previous:
+            usage = {key: value + previous[key] for key, value in usage.items()}
         budget = _load(row["budget_json"], {})
         over = (
             (budget.get("max_tokens") is not None and usage["input_tokens"] + usage["output_tokens"] > budget["max_tokens"])

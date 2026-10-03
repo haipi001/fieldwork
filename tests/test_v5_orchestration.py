@@ -169,7 +169,7 @@ def test_checkpoint_completion_and_task_budget_are_persistent(client):
 def test_group_task_and_cost_budgets_gate_creation_and_future_leases(client):
     current = campaign(client)
     capped = group(client, current["id"], {"max_tasks": 1, "max_cost_micros": 10})
-    first = task(client, current["id"], "only", group_id=capped["id"])
+    first = task(client, current["id"], "only", group_id=capped["id"], budget={"max_cost_micros": 10})
     denied = client.post("/api/v1/orchestration/tasks", json={
         "campaign_id": current["id"], "group_id": capped["id"], "role": "researcher",
         "objective": "Second", "idempotency_key": "second",

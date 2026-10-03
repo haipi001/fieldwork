@@ -1,16 +1,18 @@
-"""Browser smoke for Fieldwork V5: live reads and isolated write-flow mocks.
+"""Browser smoke for Fieldwork V5: isolated reads and write-flow fixtures.
 
-Run against a locally running service:
+No running service is required:
     FIELDWORK_V5_BASE=http://127.0.0.1:8011 .venv/bin/python scripts/check_v5_frontend_ui.py
 
-The creation, Scope confirmation, execution plan, and start endpoints are
-intercepted in the workflow scenario; no test target or run is persisted.
+All requests are intercepted; unexpected writes fail the test. No test target
+or run is persisted, and no scan reaches the network.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -29,8 +31,31 @@ WIDTHS = (400, 640, 800, 1024, 1280, 1440)
 THEMES = ("dark", "light")
 
 
+def isolated_page(browser, **kwargs):
+    """Serve repository assets and fixtures; never reach the local service."""
+    page = browser.new_page(**kwargs)
+    root = Path(__file__).resolve().parents[1]
+
+    def serve(route):
+        path = urlparse(route.request.url).path
+        assert route.request.method == "GET", f"Unexpected write: {path}"
+        if path == "/v5":
+            route.fulfill(path=str(root / "templates/v5.html"), content_type="text/html")
+        elif path.startswith("/static/"):
+            route.fulfill(path=str(root / path.lstrip("/")))
+        elif path in ("/api/v1/engagements", "/api/v1/task-center", "/api/v1/capabilities", "/api/v1/agent-audit/audits"):
+            route.fulfill(json=[])
+        elif path == "/api/v1/findings":
+            route.fulfill(json={"verified": [], "candidates": []})
+        else:
+            route.fulfill(status=503, json={"detail": "Outside isolated fixture"})
+
+    page.route("**/*", serve)
+    return page
+
+
 def assert_task_controls_with_isolated_api(browser) -> None:
-    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    page = isolated_page(browser, viewport={"width": 1280, "height": 900})
     status = {"value": "running"}
     actions: list[str] = []
 
@@ -89,7 +114,7 @@ def assert_task_controls_with_isolated_api(browser) -> None:
 
 
 def assert_inspector_modal_with_isolated_api(browser) -> None:
-    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    page = isolated_page(browser, viewport={"width": 1280, "height": 900})
     page.route("**/api/v1/engagements?mode=traditional", lambda route: route.fulfill(json=[{
         "id": "engagement-inspector-check",
         "name": "只读详情焦点验收",
@@ -120,7 +145,7 @@ def assert_inspector_modal_with_isolated_api(browser) -> None:
 
 def assert_research_creation_with_isolated_api(browser) -> None:
     """Test the primary creation flow without adding a real research target."""
-    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    page = isolated_page(browser, viewport={"width": 1280, "height": 900})
     created = {
         "id": "engagement-isolated-ui-check",
         "name": "隔离前端验收",
@@ -267,7 +292,7 @@ def assert_findings_with_isolated_api(browser) -> None:
     planned: list[dict] = []
     exports: list[str] = []
     for width in (400, 1440):
-        page = browser.new_page(viewport={"width": width, "height": 900})
+        page = isolated_page(browser, viewport={"width": width, "height": 900})
         errors: list[str] = []
         proof_calls: list[bool] = []
         page.on("pageerror", lambda error: errors.append(str(error)))
@@ -435,7 +460,7 @@ def main() -> None:
         try:
             for width in WIDTHS:
                 for theme in THEMES:
-                    page = browser.new_page(viewport={"width": width, "height": 900})
+                    page = isolated_page(browser, viewport={"width": width, "height": 900})
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(f"{BASE}/v5#campaign", wait_until="domcontentloaded")
@@ -463,7 +488,7 @@ def main() -> None:
                     assert not errors, (width, theme, errors)
                     page.close()
 
-            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            page = isolated_page(browser, viewport={"width": 1440, "height": 900})
             page.goto(f"{BASE}/v5#campaign", wait_until="domcontentloaded")
             page.locator("#commandTrigger").click()
             page.locator("#commandInput").fill("任务")
@@ -476,7 +501,7 @@ def main() -> None:
             assert page.locator(".view.active").get_attribute("id") == "tasks"
             page.close()
 
-            page = browser.new_page(viewport={"width": 400, "height": 800})
+            page = isolated_page(browser, viewport={"width": 400, "height": 800})
             page.goto(f"{BASE}/v5#campaign", wait_until="domcontentloaded")
             page.locator("#mobileMenu").click()
             assert page.locator("#mobileMenu").get_attribute("aria-expanded") == "true"

@@ -13,6 +13,7 @@ import app
 import agent_audit as audit
 import final_core as core
 import reporting
+import agent_monitor_windows as windows
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -38,6 +39,84 @@ def fixture():
     return audit.demo_fixture()
 
 
+def test_monitor_windows_do_not_freeze_or_repeat_inputs(client):
+    aid = client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    first = windows.tick(aid, limit=1)
+    assert first['event_count'] == 1
+    assert first['status'] == 'policy_required'
+    while windows.tick(aid, limit=1):
+        pass
+    before = windows.recent(aid)
+    assert before['pending_events'] == 0
+    assert windows.tick(aid) is None
+    assert client.post(f'/api/v1/agent-audit/audits/{aid}/analyze').status_code == 409
+    body = {'content': json.dumps({'events': [{'timestamp': core.utcnow(), 'actor': 'test', 'session_id': 'test', 'source_type': 'system', 'action_type': 'unknown', 'resource': 'new observation', 'status': 'success'}]}), 'provenance': 'agent_supplied'}
+    assert client.post(f'/api/v1/agent-audit/audits/{aid}/imports', json=body).status_code == 200
+    assert windows.tick(aid)['event_count'] == 1
+    after = windows.recent(aid)
+    assert after['windows'][1:] == before['windows']
+    assert all(w['verification_status'] == 'not_verified' for w in after['windows'])
+    assert client.get(f'/api/v1/agent-audit/audits/{aid}').json()['analysis'] is None
+    assert client.get(f'/api/v1/agent-audit/monitor/{aid}/windows').status_code == 200
+
+
+def test_monitor_policy_versions_bind_on_ingestion_not_analysis(client):
+    aid = client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    url = f'/api/v1/agent-audit/monitor/{aid}/policy'
+    assert client.get(url).json()['id'] is None
+    def event(label):
+        return {'content': json.dumps({'events': [{'timestamp': core.utcnow(), 'source_type': 'network', 'action_type': 'connect', 'network_host': 'example.test', 'resource': label, 'status': 'success', 'monitor_policy_id': 'forged'}]})}
+    upload(client, aid, event('before'))
+    denied = audit.Policy().model_dump()
+    assert client.post(url, json={'policy': denied, 'expected_id': None, 'confirmed': False}).status_code == 422
+    first = client.post(url, json={'policy': denied, 'expected_id': None, 'confirmed': True})
+    assert first.status_code == 200
+    pid = first.json()['id']
+    upload(client, aid, event('denied'))
+    allowed = {**denied, 'internet_access': True, 'allowed_network_hosts': ['example.test']}
+    assert client.post(url, json={'policy': allowed, 'expected_id': None, 'confirmed': True}).status_code == 409
+    second = client.post(url, json={'policy': allowed, 'expected_id': pid, 'confirmed': True})
+    assert second.status_code == 200
+    upload(client, aid, event('allowed'))
+    windows.tick(aid)
+    detail = client.get(f'/api/v1/agent-audit/audits/{aid}').json()
+    events = {e['resource']: e for e in detail['events']}
+    assert 'monitor_policy_id' not in events['before']
+    assert events['denied']['monitor_policy_id'] == pid
+    assert events['allowed']['monitor_policy_id'] == second.json()['id']
+    assert detail['live_evaluations'][events['before']['id']]['decision'] == 'uncertain'
+    assert detail['live_evaluations'][events['denied']['id']]['decision'] == 'violation'
+    assert detail['live_evaluations'][events['allowed']['id']]['decision'] != 'violation'
+    signals = windows.recent(aid)['windows'][0]['signals']
+    assert [s['event_id'] for s in signals] == [events['denied']['id']]
+    assert client.post(f'/api/v1/agent-audit/monitor/{aid}/stop').status_code == 200
+    assert client.post(url, json={'policy': denied, 'expected_id': second.json()['id'], 'confirmed': True}).status_code == 409
+
+
+def test_monitor_window_retry_and_integrity_failure_preserve_collection(client, monkeypatch):
+    aid = client.post('/api/v1/agent-audit/monitor/start').json()['id']
+    original = windows.tick
+    calls = []
+    def failure(*args):
+        calls.append(args)
+        raise OSError('fixture')
+    monkeypatch.setattr(windows, 'tick', failure)
+    windows.scheduled_tick(aid)
+    windows.scheduled_tick(aid)
+    assert len(calls) == 1
+    assert windows.recent(aid)['recovery']['failures'] == 1
+    assert client.get(f'/api/v1/agent-audit/audits/{aid}').json()['monitor']['status'] == 'active'
+    monkeypatch.setattr(windows, 'tick', original)
+    with core.connect() as db:
+        db.execute('UPDATE agent_monitor_analysis_state SET retry_after=0 WHERE audit_id=?', (aid,))
+    assert windows.scheduled_tick(aid)
+    assert windows.recent(aid)['recovery'] is None
+    with core.connect() as db:
+        row = db.execute('SELECT a.uri FROM artifacts a JOIN agent_monitor_windows w ON w.artifact_id=a.id WHERE w.audit_id=?', (aid,)).fetchone()
+    Path(row['uri']).write_text('{}')
+    assert client.get(f'/api/v1/agent-audit/monitor/{aid}/windows').status_code == 409
+
+
 def create(client, fixture, policy=True):
     body = copy.deepcopy(fixture['audit'])
     if not policy:
@@ -45,6 +124,29 @@ def create(client, fixture, policy=True):
     response = client.post('/api/v1/agent-audit/audits', json=body)
     assert response.status_code == 201, response.text
     return response.json()['id']
+
+
+def test_monitor_windows_policy_signals_concurrent_exactly_once(client, fixture):
+    from concurrent.futures import ThreadPoolExecutor
+    aid = create(client, fixture)
+    for body in fixture['imports']:
+        upload(client, aid, body)
+    now = core.utcnow()
+    with core.connect() as db:
+        db.execute('INSERT INTO agent_monitors(audit_id,status,started_at,last_scan_at) VALUES(?,?,?,?)', (aid, 'active', now, now))
+        count = db.execute('SELECT COUNT(*) FROM agent_events WHERE audit_id=?', (aid,)).fetchone()[0]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: windows.tick(aid, limit=1), range(count + 4)))
+    result = windows.recent(aid)
+    assert result['pending_events'] == 0
+    assert len(result['windows']) == count
+    assert any(w['signals'] for w in result['windows'])
+    with core.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM agent_monitor_window_events').fetchone()[0] == count
+        assert db.execute('SELECT COUNT(*) FROM canonical_findings WHERE engagement_id=?', (aid,)).fetchone()[0] == 0
+    assert all(w['verification_status'] == 'not_verified' for w in result['windows'])
+    client.post(f'/api/v1/agent-audit/monitor/{aid}/pause')
+    assert windows.tick(aid) is None
 
 
 def upload(client, aid, body):

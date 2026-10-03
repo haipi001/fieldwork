@@ -40,6 +40,19 @@ html[data-theme=light] .primary-button{color:#fff!important}
 .form-stack label{display:grid;gap:5px;color:var(--muted);font-size:11px;font-weight:600}
 .form-stack input,.form-stack textarea,.form-stack select{width:100%;min-height:38px;padding:9px 10px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--radius-sm);color:var(--text);font-size:13px}
 .form-stack textarea{resize:vertical;min-height:80px}
+.domain-control[hidden]{display:none}
+#monitorControl{padding:24px;margin-bottom:20px}
+#monitorControl>p{max-width:76ch;line-height:1.7;color:var(--muted)}
+#monitorState{font-size:17px;color:var(--text)!important;font-weight:600}
+#monitorControl .monitor-toolbar{flex-wrap:wrap;margin:20px 0}
+#monitorControl button:disabled{opacity:.45;cursor:not-allowed}
+#monitorControl details{border-top:1px solid var(--line);padding-top:18px;margin-top:22px}
+#monitorControl summary,.monitor-history>summary{cursor:pointer;font-size:15px;font-weight:600}
+.monitor-history{padding:20px}
+#monitorPolicyFields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+#monitorPolicyFields label{min-width:0}
+#monitorPolicyForm{margin-top:18px}
+@media(max-width:640px){#monitorPolicyFields{grid-template-columns:1fr}#monitorControl{padding:18px}}
 .form-stack .check-line{display:flex;align-items:flex-start;gap:9px;color:var(--text);font-size:12px;font-weight:500}
 .check-line input{width:auto;min-height:auto;margin:2px 0 0}
 .form-pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}

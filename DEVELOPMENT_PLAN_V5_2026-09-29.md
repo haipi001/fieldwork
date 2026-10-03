@@ -6,7 +6,7 @@
 
 Fieldwork V5 是 Evidence-first Autonomous Research & Verification OS。它在现有 FastAPI、SQLite、Traditional、Web3、AI Agent Audit、Evidence、Candidate、Verification 与报告能力上增加统一研究编排层，不进行整体重写。
 
-本轮优先级：先形成可运行的新版前端控制面，再逐阶段接入 V5 后端 Overlay。
+当前优先级：UI 0.68.0 已交付；按用户最新要求，先补齐核心功能并跑通端到端流程，不再优先扩大页面或候选数量。以授权与预算、真实发现/证据、自动分诊、复验调度、独立判定和结果恢复为六项核心。详见 `docs/acceptance/CORE_WORKFLOW_DELIVERY.md`，全部完成必须通过实际靶场与安装版验收。
 
 2026-10-02 用户明确最终验收要求：Fieldwork 必须可靠地自动发现并确认漏洞，并要求覆盖安装到本机。产品完成必须由实际运行的漏洞发现与独立确认验收证明；工具接入、单元测试、编排规模、模拟结果均不能替代该证据。详见 `docs/acceptance/RELIABLE_AUTONOMOUS_VULNERABILITY_GATE.md`。该目标尚未达成。
 

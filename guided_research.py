@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from candidate_quality import HTTP_READ_CATEGORIES, INFORMATION_CATEGORIES
+from candidate_workflow import annotate as annotate_workflow
 from reporting import redact_structure
 
 router = APIRouter(prefix='/api/v1', tags=['Guided research'])
@@ -115,6 +116,20 @@ def fingerprint(data):
     return hashlib.sha256(core().dump(data).encode()).hexdigest()
 
 
+def verification_input_digest(candidate, data, binding):
+    """Reuse requires the same claim, referenced evidence and authority context."""
+    ids = set(core().load(candidate['evidence_ids'], []))
+    evidence = [row for row in data['evidence'] if row['id'] in ids]
+    observations = {row['observation_id'] for row in evidence}
+    context = data.get('runtime_context', {})
+    return fingerprint({
+        'candidate': candidate, 'binding': binding,
+        'evidence': sorted(evidence, key=lambda row: row['id']),
+        'observations': sorted((row for row in data['observations'] if row['id'] in observations), key=lambda row: row['id']),
+        'authority': {key: context.get(key) for key in ('run_scope', 'run_policy', 'scope_id', 'policy_id', 'scope_digest', 'policy_digest')},
+    })
+
+
 def safe_url(value, base):
     """Discovery only. Drop credentials and query data; never open inferred URLs."""
     try:
@@ -159,6 +174,9 @@ def material_for(candidate, data):
     matching = [x for x in data['exchanges'] if x['url'] == candidate['target'] and x['method'] == 'GET']
     sources.extend({'kind': 'http_exchange', 'id': x['id'], 'text': f"GET 已记录，HTTP {x['response_status']}", 'sha256': x['response_sha256']} for x in matching[:5])
     gaps = []
+    missing = sorted(linked - {x['id'] for x in evidence})
+    if missing or not linked:
+        gaps.append({'code': 'linked_evidence', 'message': '候选引用证据缺失，不能使用相关页面代替来源证明。', 'action': None})
     if not sources:
         gaps.append({'code': 'evidence', 'message': '尚无可关联的请求或源码证据。需要先完成一次授权分析。', 'action': 'run'})
     if category in INFORMATION_CATEGORIES:
@@ -215,6 +233,18 @@ def hydrate(row):
         value[name] = core().load(value[name], {})
     value['cancel_requested'] = bool(value['cancel_requested'])
     return redact_structure(value)
+
+
+@router.get('/runs/{run_id}/candidate-workflow')
+def candidate_workflow(run_id: str, after_candidate_id: str | None = None):
+    """Preview a bounded batch without requests, workers or candidate mutation."""
+    data = snapshot(run_id, after_candidate_id=after_candidate_id)
+    items = [material_for(candidate, data) for candidate in data['candidates']]
+    counts = annotate_workflow(data['candidates'], items)
+    return {'run_id': run_id, 'counts': counts, 'items': items,
+            'next_cursor': data['next_cursor'], 'truncated': data['truncated'],
+            'source_fingerprint': fingerprint(data), 'automatic_execution': False,
+            'boundary': 'Readiness is not authorization or a vulnerability verdict.'}
 
 
 @router.get('/guided-research/{job_id}')
@@ -311,18 +341,21 @@ def run_job(job_id, data):
                     save(job_id, steps, result, f"正在整理 {len(result['items'])}/{len(data['candidates'])} 条候选")
             elif index == 3:
                 from guided_http import execute
+                result['triage_counts'] = annotate_workflow(data['candidates'], result['items'])
                 executed = 0
                 for item in result['items']:
                     binding = item['draft'].get('http_binding')
-                    if not binding or not data.get('execute_ready'):
+                    if not item['triage']['dispatch_eligible'] or not binding or not data.get('execute_ready'):
                         continue
+                    candidate=next(c for c in data['candidates'] if c['id']==item['candidate_id'])
+                    input_digest = verification_input_digest(candidate, data, binding)
                     previous = None
                     with core().connect() as db:
                         histories = db.execute('SELECT result FROM guided_research_jobs WHERE run_id=? AND id!=? ORDER BY created_at DESC LIMIT 100', (data['run_id'],job_id)).fetchall()
                     for history in histories:
                         for old in core().load(history['result'],{}).get('items',[]):
                             check = old.get('auto_verification',{})
-                            if old['candidate_id']==item['candidate_id'] and check.get('binding_hash')==binding['binding_hash']:
+                            if old['candidate_id']==item['candidate_id'] and check.get('binding_hash')==binding['binding_hash'] and check.get('input_digest')==input_digest:
                                 previous=check
                                 break
                         if previous:
@@ -344,7 +377,7 @@ def run_job(job_id, data):
                         def after_response():
                             result['requests_sent'] += 1
                             save(job_id,steps,result,f"已读取 {result['requests_sent']} 个验证响应")
-                        item['auto_verification']=execute(candidate,binding,before_request,after_response)
+                        item['auto_verification']={**execute(candidate,binding,before_request,after_response), 'input_digest': input_digest}
                         result['verification_executed']=True
                         item['status']=item['auto_verification']['status']
                         item['gaps']=[{'code':'impact_review','message':'正反对照已执行；业务权限、影响与严重度尚需证据确认。','action':None}] if item['status']=='reproduced' else []

@@ -261,3 +261,58 @@ def promote_finding(receipt_id, source_fingerprint):
     proof = f.VerificationInput.model_validate(plan['proof'])
     proof.receipt_id = issue_receipt(plan['candidate_id'], proof, v5_receipt_id=receipt_id)
     return f.verify_candidate(plan['candidate_id'], proof)
+
+
+def fixed_plan(receipt_id, *, db=None):
+    import final_core as f
+    import v5_verification as v
+    from fastapi import HTTPException
+    if db is None:
+        with f.connect() as connection:
+            return fixed_plan(receipt_id, db=connection)
+    row, payload, _ = v._validated_receipt(db, receipt_id)
+    v.validate_receipt_for_promotion(db, receipt_id, row['campaign_id'], row['claim_node_id'], 'refuted', KIND)
+    if payload['result']['classification'] != 'repaired_negative':
+        raise HTTPException(409, '修复确认需要两轮实际拒绝旧攻击，合法共享不能作为修复')
+    contract = payload['replay_contract']
+    candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (contract['candidate_id'],)).fetchone()
+    retest = next((r for r in db.execute("SELECT * FROM finding_retests WHERE run_id=? AND status IN ('planned','fixed')", (candidate['run_id'],))
+                   if f.load(r['result'], {}).get('candidate_id') == candidate['id']), None)
+    if not retest:
+        raise HTTPException(409, '回执没有与旧Finding绑定的定向复测计划')
+    finding = db.execute('SELECT * FROM canonical_findings WHERE id=?', (retest['finding_id'],)).fetchone()
+    if not finding or finding['status'] != 'verified' or finding['target'] != candidate['target'] or finding['category'] != candidate['category'] or finding['engagement_id'] != candidate['engagement_id']:
+        raise HTTPException(409, '修复候选不能替换旧Finding的对象、类别或项目')
+    old_machine = db.execute("SELECT result FROM verification_attempts WHERE id=? AND status='machine_receipt'", (f.load(finding['verification'], {})['receipt_id'],)).fetchone()
+    old_id = f.load(old_machine['result'], {}).get('v5_verification_receipt_id') if old_machine else None
+    if not old_id:
+        raise HTTPException(409, '旧Finding没有独立V5证明谱系')
+    _, old, _ = v._validated_receipt(db, old_id)
+    if not v._process_observed(old) or old['result']['status'] != 'verified' or old['replay_contract'].get('type') != KIND:
+        raise HTTPException(409, '旧Finding证明不满足独立对象读取协议')
+    if payload['created_at'] <= old['created_at']:
+        raise HTTPException(409, '修复回执早于最近的违规证明，不能关闭新的重现')
+    before, after = old['result']['oracle'], payload['result']['oracle']
+    if any(before.get(key) != after.get(key) for key in ('owner_sha256','principal_sha256','rule_sha256')):
+        raise HTTPException(409, '修复复测必须核对旧所有者、读取主体和业务权限规则')
+    return {'receipt_id': receipt_id, 'finding_id': finding['id'], 'candidate_id': candidate['id'],
+            'artifact_id': contract['artifact_id'], 'sends_requests': False,
+            'source_fingerprint': v._sha({'receipt_sha256': row['receipt_sha256'], 'retest_id': retest['id'],
+                                        'finding_verification': finding['verification'], 'old_receipt_sha256': v._sha(old)})}
+
+
+def confirm_fixed(receipt_id, source_fingerprint):
+    import final_core as f
+    from fastapi import HTTPException
+    from verification_receipts import issue_fixed_receipt
+    plan = fixed_plan(receipt_id)
+    if plan['source_fingerprint'] != source_fingerprint:
+        raise HTTPException(409, '修复确认计划已变化，请重新核对')
+    with f.connect() as db:
+        stored = db.execute("SELECT * FROM verification_attempts WHERE candidate_id=? AND status='machine_negative_receipt'", (plan['candidate_id'],)).fetchall()
+        for row in stored:
+            if f.load(row['result'], {}).get('v5_verification_receipt_id') == receipt_id:
+                return {'id': plan['finding_id'], 'candidate_id': plan['candidate_id'], 'status':'verified_fixed', 'receipt_id':row['id']}
+        artifact = db.execute('SELECT uri FROM artifacts WHERE id=?', (plan['artifact_id'],)).fetchone()
+    replay = json.loads(Path(artifact['uri']).read_text())
+    return issue_fixed_receipt(plan['candidate_id'], 'http-authorization-read-v2', plan['artifact_id'], replay['repair_checks'], v5_receipt_id=receipt_id)

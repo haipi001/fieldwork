@@ -25,6 +25,8 @@ def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
     if not proof.reproduced or proof.attempts < 2 or not proof.counterevidence_checked or not proof.counterevidence_summary.strip():
         raise HTTPException(409, '不完整复验不能签发成功收据')
     with core.connect() as db:
+        if v5_receipt_id:
+            db.execute('BEGIN IMMEDIATE')
         candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (candidate_id,)).fetchone()
         if not candidate or candidate['status'] in {'verified', 'archived'}:
             raise HTTPException(409, '候选不可签发复验收据')
@@ -138,12 +140,14 @@ def _validate_current_http_scope(db, candidate, scope):
         raise HTTPException(409, '业务权限规则所属授权已变化，请重新复验')
 
 
-def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks):
+def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_receipt_id=None):
     """Close a planned retest only after a registered runtime proves the old exploit is denied twice."""
     import final_core as core
     if oracle != 'http-authorization-read-v2' or len(repair_checks) < 2 or not all(item.get('passed') is True for item in repair_checks):
         raise HTTPException(409, '负向复测未满足已注册的修复确认协议')
     with core.connect() as db:
+        if v5_receipt_id:
+            db.execute('BEGIN IMMEDIATE')
         candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (candidate_id,)).fetchone()
         if not candidate or candidate['status'] != 'candidate':
             raise HTTPException(409, '修复复测候选不存在或状态无效')
@@ -166,6 +170,11 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks):
         ).fetchone()
         if not lifecycle or not run or not scope or not artifact:
             raise HTTPException(409, '修复复测缺少生命周期、Scope 或实际 Artifact')
+        if v5_receipt_id:
+            from v5_http_receipts import fixed_plan
+            current_plan = fixed_plan(v5_receipt_id, db=db)
+            if current_plan['candidate_id'] != candidate_id or current_plan['finding_id'] != retest['finding_id'] or current_plan['artifact_id'] != artifact_id:
+                raise HTTPException(409, 'V5 修复回执与定向复测谱系不一致')
         path = Path(artifact['uri'])
         digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
         if not digest or digest != artifact['sha256']:
@@ -181,6 +190,8 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks):
             'repair_checks': repair_checks,
             'expires_at': (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
         }
+        if v5_receipt_id:
+            payload['v5_verification_receipt_id'] = v5_receipt_id
         db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (
             receipt_id, candidate_id, oracle, 'machine_negative_receipt', len(repair_checks),
             core.dump(payload), timestamp, timestamp,

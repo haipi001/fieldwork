@@ -14,15 +14,15 @@ from tests.test_v5_http_workflow import prepared_live_candidate, workflow_path
 
 @pytest.fixture
 def controlled_server():
-    state = {'fixed': False}
+    state = {'fixed': False, 'owner_id':'A', 'other_id':'B'}
     calls = []
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             role = self.headers.get('X-Role')
             calls.append((self.path, role))
             allowed = bool(role) and not (state['fixed'] and role == 'other' and self.path == '/object')
-            value = ({'id': 'A' if role == 'owner' else 'B'} if self.path == '/me'
-                     else {'owner_id': 'A', 'record': 'fixture record', 'token': 'fixture-private-value'}) if allowed else {'error': 'denied'}
+            value = ({'id': state['owner_id'] if role == 'owner' else state['other_id']} if self.path == '/me'
+                     else {'owner_id': state['owner_id'], 'record': 'fixture record', 'token': 'fixture-private-value'}) if allowed else {'error': 'denied'}
             body = json.dumps(value).encode()
             self.send_response(200 if allowed else 403)
             self.send_header('Content-Length', str(len(body)))
@@ -160,3 +160,55 @@ def test_reviewed_v5_result_promotes_idempotently_and_exports_bound_proof(client
     from fastapi import HTTPException
     with pytest.raises(HTTPException):
         core.build_proof_attachments(*core.finding_report_inputs(identifier))
+
+
+@pytest.mark.parametrize('changed_principal', [None,'owner_id','other_id'])
+def test_v5_fixed_receipt_closes_only_bound_retest_and_is_idempotent(client, monkeypatch, controlled_server, changed_principal):
+    import traditional_runtime as http
+    run, candidate, project, job, proof, receipt = execute(client, monkeypatch, controlled_server)
+    base='/api/v1/verification/receipts/' + proof['receipt_id']
+    material=client.get(base + '/http-finding-plan').json()
+    finding=client.post(base + '/promote-http',json={'authorized':True,'source_fingerprint':material['source_fingerprint']}).json()
+    new_run=core.uid('run')
+    with core.connect() as db:
+        previous=dict(db.execute('SELECT * FROM analysis_runs WHERE id=?',(run,)).fetchone())
+        previous['id']=new_run
+        db.execute('INSERT INTO analysis_runs ('+','.join(previous)+') VALUES ('+','.join('?' for _ in previous)+')',list(previous.values()))
+        db.execute('INSERT INTO run_budgets_v2 VALUES(?,?,?,?,?,?,?,?)',(new_run,30,0,10,0,0,0,core.utcnow()))
+        identities=db.execute('SELECT id,label FROM identities WHERE engagement_id=?',(project['id'],)).fetchall()
+    retest=client.post('/api/v1/findings/'+finding['id']+'/retest-plans',json={'run_id':new_run,'note':'Actual two-round object authorization retest'})
+    assert retest.status_code in (200,201),retest.text
+    controlled_server[1]['fixed']=True
+    if changed_principal:
+        controlled_server[1][changed_principal]='C'
+    by_role={row['label']:row['id'] for row in identities}
+    origin=controlled_server[0][0]
+    for path,role in [('/object','owner'),('/me','owner'),('/me','other')]:
+        assert http.create_http_exchange(new_run,http.ExchangeRequestInput(url=origin+path,identity_id=by_role[role]))['response_status']==200
+    path='/api/v1/runs/'+new_run+'/candidate-workflow/'+retest.json()['candidate_id']
+    execution=client.get(path+'/execution-plan').json()
+    assert execution['can_execute'],execution
+    outcome=wait(client,client.post(path+'/execute',json={'authorized':True,'source_fingerprint':execution['source_fingerprint']}).json())
+    negative=outcome['result']['items'][0]['auto_verification']['independent_verification']
+    assert negative['status']=='refuted'
+    base='/api/v1/verification/receipts/'+negative['receipt_id']
+    plan=client.get(base+'/http-fixed-plan')
+    if changed_principal:
+        assert plan.status_code==409,plan.text
+        with core.connect() as db:
+            assert db.execute('SELECT status FROM finding_lifecycle WHERE finding_id=?',(finding['id'],)).fetchone()[0]=='retest_required'
+            assert db.execute("SELECT count(*) FROM verification_attempts WHERE status='machine_negative_receipt'").fetchone()[0]==0
+        return
+    assert plan.status_code==200,plan.text
+    assert plan.json()['finding_id']==finding['id'] and plan.json()['sends_requests'] is False
+    assert client.post(base+'/confirm-http-fixed',json={'source_fingerprint':plan.json()['source_fingerprint']}).status_code==422
+    fixed=client.post(base+'/confirm-http-fixed',json={'authorized':True,'source_fingerprint':plan.json()['source_fingerprint']})
+    assert fixed.status_code==200,fixed.text
+    again=client.post(base+'/confirm-http-fixed',json={'authorized':True,'source_fingerprint':plan.json()['source_fingerprint']})
+    assert again.status_code==200,again.text
+    assert again.json()['receipt_id']==fixed.json()['receipt_id']
+    assert len(controlled_server[0][1])==26
+    with core.connect() as db:
+        assert db.execute('SELECT status FROM finding_lifecycle WHERE finding_id=?',(finding['id'],)).fetchone()[0]=='verified_fixed'
+        row=db.execute("SELECT result FROM verification_attempts WHERE status='machine_negative_receipt'").fetchone()
+        assert core.load(row['result'],{})['v5_verification_receipt_id']==negative['receipt_id']

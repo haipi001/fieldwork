@@ -953,6 +953,18 @@ def promote_http_finding(receipt_id: str, body: HttpFindingPromotion):
     return promote_finding(receipt_id, body.source_fingerprint)
 
 
+@router.get('/receipts/{receipt_id}/http-fixed-plan')
+def http_fixed_plan(receipt_id: str):
+    from v5_http_receipts import fixed_plan
+    return fixed_plan(receipt_id)
+
+
+@router.post('/receipts/{receipt_id}/confirm-http-fixed')
+def confirm_http_fixed(receipt_id: str, body: HttpFindingPromotion):
+    from v5_http_receipts import confirm_fixed
+    return confirm_fixed(receipt_id, body.source_fingerprint)
+
+
 def node_is_receipt_locked(db: sqlite3.Connection, node_id: str) -> bool:
     if db.execute("SELECT 1 FROM verification_receipts_v5 WHERE claim_node_id=? LIMIT 1", (node_id,)).fetchone():
         return True

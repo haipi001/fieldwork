@@ -55,6 +55,10 @@ def run():
                 assert payload == {'authorized': True, 'source_fingerprint': 'b' * 64}
                 job['result']['items'][0]['auto_verification']['independent_verification']['finding_id']='finding-fixture'
                 route.fulfill(json={'id':'finding-fixture','status':'verified'})
+            elif path.endswith('/confirm-http-fixed'):
+                assert payload == {'authorized': True, 'source_fingerprint': 'c' * 64}
+                job['result']['items'][0]['auto_verification']['independent_verification']['fixed_confirmed']=True
+                route.fulfill(json={'id':'finding-fixture','status':'verified_fixed'})
             else:
                 raise AssertionError(f'Unexpected write: {path}')
         elif path == '/v5': route.fulfill(path=str(ROOT / 'templates/v5.html'), content_type='text/html')
@@ -70,6 +74,7 @@ def run():
         elif path.endswith('/http-finding-plan'): route.fulfill(json={'source_fingerprint':'b'*64,
              'impact_description':'Selected object read only; broader access is unproven.',
              'root_cause':'Observed boundary failure; source implementation unexamined.'})
+        elif path.endswith('/http-fixed-plan'): route.fulfill(json={'source_fingerprint':'c'*64,'finding_id':'finding-fixture'})
         elif path == '/api/v1/guided-research/job-fixture': route.fulfill(json=job)
         elif path in ('/api/v1/capabilities', '/api/v1/agent-audit/audits'): route.fulfill(json=[])
         else: route.fulfill(status=503, json={'detail':'Outside isolated fixture'})
@@ -161,6 +166,19 @@ def run():
         page.locator('#workflowRead').click()
         page.get_by_text('Receipt inputs or authorization changed; review again.',exact=True).wait_for()
         assert len(writes)==6
+        proof.update(status='refuted',current_inputs_match=True,promotion_eligible=True,fixed_finding_id='finding-fixture',fixed_confirmed=False)
+        proof.pop('finding_id',None)
+        page.locator('#workflowRead').click()
+        page.locator('[data-workflow-fixed]').click()
+        page.locator('[data-confirm-finding]').wait_for()
+        modal=page.locator('dialog').filter(has=page.locator('[data-confirm-finding]'))
+        assert modal.locator('[type=submit]').is_disabled() and len(writes)==6
+        modal.locator('[data-confirm-finding]').check()
+        modal.locator('[type=submit]').click()
+        page.get_by_text('Targeted fix confirmed',exact=True).wait_for()
+        page.locator('dialog').filter(has=page.get_by_text('Targeted fix confirmed',exact=True)).get_by_role('button',name='Close',exact=True).click()
+        page.get_by_text('Targeted fix confirmed: finding-fixture',exact=True).wait_for()
+        assert len(writes)==7
         page.evaluate("window.FieldworkReviewScope('project-fixture')")
         page.get_by_text('This scope is frozen.',exact=False).wait_for()
         assert page.locator('[data-field="target"]').is_disabled()

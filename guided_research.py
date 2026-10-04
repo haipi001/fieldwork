@@ -244,6 +244,16 @@ def hydrate(row):
                     finding = db.execute('SELECT id FROM canonical_findings WHERE candidate_id=?', (item['candidate_id'],)).fetchone()
                 if finding:
                     independent['finding_id'] = finding['id']
+                if receipt['result']['classification'] == 'repaired_negative' and independent['promotion_eligible']:
+                    try:
+                        from v5_http_receipts import fixed_plan
+                        plan = fixed_plan(independent['receipt_id'])
+                        independent['fixed_finding_id'] = plan['finding_id']
+                        with core().connect() as db:
+                            lifecycle = db.execute('SELECT status FROM finding_lifecycle WHERE finding_id=?', (plan['finding_id'],)).fetchone()
+                        independent['fixed_confirmed'] = bool(lifecycle and lifecycle['status'] == 'verified_fixed')
+                    except Exception:
+                        independent['fixed_confirmed'] = False
             except Exception:
                 independent['current_inputs_match'] = False
                 independent['promotion_eligible'] = False

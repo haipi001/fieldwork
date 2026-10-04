@@ -1,5 +1,5 @@
 """Single source of truth for Fieldwork release and database compatibility."""
 
-APP_VERSION = "0.68.3"
-BUILD_NUMBER = 81
+APP_VERSION = "0.68.4"
+BUILD_NUMBER = 82
 SCHEMA_VERSION = 25

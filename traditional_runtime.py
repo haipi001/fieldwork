@@ -98,7 +98,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def network_guard(engagement: dict, request: ReplayRequest) -> None:
+def network_guard(engagement: dict, request: ReplayRequest) -> tuple[str, ...]:
     import final_core
     destructive = request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
     result = final_core.execution_policy_check(final_core.PolicyCheckInput(
@@ -120,6 +120,9 @@ def network_guard(engagement: dict, request: ReplayRequest) -> None:
         unsafe = ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
         if unsafe and not allow_private:
             raise HTTPException(409, f"private_or_special_ip_denied: {address}")
+    if not addresses:
+        raise HTTPException(409, "dns_resolution_empty")
+    return tuple(sorted(addresses))
 
 
 def request_once(spec: ReplayRequest) -> dict:
@@ -559,7 +562,7 @@ def _job_cancel_requested(job_id: str) -> bool:
     return bool(row and row["cancel_requested"])
 
 
-def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None):
+def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False):
     import final_core
     run, engagement, specs, names = prepare_http_replay(run_id, body)
     rate = max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
@@ -575,11 +578,20 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                 _job_update(job_id, phase=f"第 {replay_index + 1} 轮 · {name}")
             if before_request:
                 before_request(replay_index, name)
-            network_guard(engagement, spec)
+            addresses = network_guard(engagement, spec)
             consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
             if not consumed:
                 raise HTTPException(409, reason)
-            results[name] = request_once(spec)
+            if isolated_transport:
+                from v5_http_transport import request_once as isolated_request
+                def check_current():
+                    if job_id and _job_cancel_requested(job_id):
+                        raise VerificationCancelled("用户取消了复验")
+                    if before_request:
+                        before_request(replay_index, name)
+                results[name] = isolated_request(spec, addresses, check_current)
+            else:
+                results[name] = request_once(spec)
             if after_response:
                 after_response()
             completed_requests += 1

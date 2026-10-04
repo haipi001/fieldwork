@@ -296,7 +296,19 @@ def workflow_execution_plan(run_id, candidate_id):
         blockers.append('request_budget')
     requests = []
     if binding:
+        import ipaddress
+        import sys
+        from pathlib import Path
+        if sys.platform != 'darwin' or not Path('/usr/bin/sandbox-exec').is_file():
+            blockers.append('isolated_transport_unavailable')
         for target in (binding['target'], binding['identity_url']):
+            host = urlsplit(target).hostname
+            try:
+                local = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                local = host == 'localhost'
+            if not local:
+                blockers.append('isolated_transport_local_only')
             if not core().execution_policy_check(core().PolicyCheckInput(
                     engagement_id=engagement['id'], target=target, action='read'))['allowed']:
                 blockers.append('out_of_scope')
@@ -479,7 +491,8 @@ def run_job(job_id, data):
                         def after_response():
                             result['requests_sent'] += 1
                             save(job_id,steps,result,f"已读取 {result['requests_sent']} 个验证响应")
-                        item['auto_verification']={**execute(candidate,binding,before_request,after_response), 'input_digest': input_digest}
+                        execution_options = {'isolated_transport': True} if data.get('reviewed_execution') else {}
+                        item['auto_verification']={**execute(candidate,binding,before_request,after_response,**execution_options), 'input_digest': input_digest}
                         result['verification_executed']=True
                         item['status']=item['auto_verification']['status']
                         item['gaps']=[{'code':'impact_review','message':'正反对照已执行；业务权限、影响与严重度尚需证据确认。','action':None}] if item['status']=='reproduced' else []

@@ -1,7 +1,7 @@
 """Draft rules and explicitly reviewed replay over real loopback HTTP.
 
 Candidate construction and account credential supply are fixture inputs.
-These tests do not establish autonomous discovery or process independence.
+These tests do not establish autonomous discovery or independent semantic verification.
 """
 import copy
 
@@ -132,6 +132,14 @@ def test_reviewed_live_replay_requires_authorization_and_preserves_unconfirmed_r
     assert persisted['result']['reviewed_execution'] is True
     with core.connect() as db:
         assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0] == 0
+        import json
+        artifact = db.execute("SELECT uri FROM artifacts WHERE kind='http.replay'").fetchone()
+        from pathlib import Path
+        replay = json.loads(Path(artifact['uri']).read_text())
+        responses = [response for group in replay['rounds'] for response in group.values()]
+        assert len(responses) == 10
+        assert all(response['process_execution']['file_read_denied'] for response in responses)
+        assert len({response['process_execution']['child_pid'] for response in responses}) == 10
 
 
 @pytest.mark.parametrize('change', ['shared', 'missing_rule', 'budget', 'stale_evidence', 'expired_identity', 'new_scope'])
@@ -171,13 +179,14 @@ def test_cancel_before_first_request_and_changed_material_during_replay(client, 
     plan = client.get(path + '/execution-plan').json()
     response = client.post(path + '/execute', json={'source_fingerprint': plan['source_fingerprint'], 'authorized': True})
     job_id, data = captured.pop()
-    original = http.request_once
-    def changing(spec):
-        result = original(spec)
+    import v5_http_transport as transport
+    original = transport.request_once
+    def changing(spec, addresses, check_current=None):
+        result = original(spec, addresses, check_current)
         with core.connect() as db:
             db.execute("UPDATE observations SET summary='Modified during replay' WHERE run_id=?", (run_id,))
         return result
-    monkeypatch.setattr(http, 'request_once', changing)
+    monkeypatch.setattr(transport, 'request_once', changing)
     guided.run_job(job_id, data)
     result = client.get(f'/api/v1/guided-research/{job_id}').json()
     assert len(calls) == 4 and result['result']['requests_sent'] == 1

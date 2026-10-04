@@ -503,13 +503,20 @@ def run_job(job_id, data):
                             current = snapshot(data['run_id'], candidate['id'])
                             if verification_input_digest(current['candidates'][0], current, binding) != input_digest:
                                 raise HTTPException(409, '复验材料或授权已变化，任务停止')
+                    requests_before = result['requests_sent']
+                    def on_checkpoint(checkpoint):
+                        item['replay_checkpoint'] = checkpoint
+                        result['requests_sent'] = requests_before + checkpoint['completed_responses']
+                        # Preserve completed observations even when cancel was requested.
+                        with core().connect() as db:
+                            db.execute("UPDATE guided_research_jobs SET result=?,updated_at=? WHERE id=? AND status IN ('queued','running')",
+                                       (core().dump(redact_structure(result)), core().utcnow(), job_id))
                     try:
                         executed += 1
                         def after_response():
-                            result['requests_sent'] += 1
                             save(job_id,steps,result,f"已读取 {result['requests_sent']} 个验证响应")
                         execution_options = {'isolated_transport': True} if data.get('reviewed_execution') else {}
-                        item['auto_verification']={**execute(candidate,binding,before_request,after_response,**execution_options), 'input_digest': input_digest}
+                        item['auto_verification']={**execute(candidate,binding,before_request,after_response,checkpoint_callback=on_checkpoint,**execution_options), 'input_digest': input_digest}
                         result['verification_executed']=True
                         item['status']=item['auto_verification']['status']
                         item['gaps']=[{'code':'impact_review','message':'正反对照已执行；业务权限、影响与严重度尚需证据确认。','action':None}] if item['status']=='reproduced' else []

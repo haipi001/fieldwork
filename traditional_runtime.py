@@ -562,7 +562,7 @@ def _job_cancel_requested(job_id: str) -> bool:
     return bool(row and row["cancel_requested"])
 
 
-def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False, source_snapshot=None):
+def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False, source_snapshot=None, checkpoint_callback=None):
     import final_core
     run, engagement, specs, names = prepare_http_replay(run_id, body)
     # Formal HTTP results must always use supervised transport, even if a caller
@@ -592,140 +592,161 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
     interval = 1 / rate
     rounds = []
     completed_requests = 0
-    for replay_index in range(2):
-        results = {}
-        for index, (name, spec) in enumerate(zip(names, specs)):
-            if job_id and _job_cancel_requested(job_id):
-                raise VerificationCancelled("用户取消了复验")
-            if job_id:
-                _job_update(job_id, phase=f"第 {replay_index + 1} 轮 · {name}")
-            if finalize:
-                check_formal_inputs()
-            if before_request:
-                before_request(replay_index, name)
-            addresses = network_guard(engagement, spec)
-            consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
-            if not consumed:
-                raise HTTPException(409, reason)
-            if isolated_transport:
-                from v5_http_transport import request_once as isolated_request
-                def check_current():
-                    if finalize:
-                        check_formal_inputs()
-                    if job_id and _job_cancel_requested(job_id):
-                        raise VerificationCancelled("用户取消了复验")
-                    if before_request:
-                        before_request(replay_index, name)
-                fields = (body.authorization.principal_field, body.authorization.owner_field) if body.authorization else ()
-                results[name] = isolated_request(spec, addresses, check_current, scalar_fields=fields)
-            else:
-                results[name] = request_once(spec)
-            if after_response:
-                after_response()
-            completed_requests += 1
-            if job_id:
-                _job_update(job_id, completed_requests=completed_requests)
-            if index < len(specs) - 1:
+    checkpoint_result = None
+    def checkpoint(state, *, error_type=None, final_artifact_id=None):
+        nonlocal checkpoint_result
+        from http_replay_checkpoints import persist
+        checkpoint_result = persist(run, body.candidate_id, rounds, len(specs) * 2,
+                                    previous=checkpoint_result['artifact_id'] if checkpoint_result else None,
+                                    state=state, error_type=error_type, final_artifact_id=final_artifact_id)
+        if job_id:
+            _job_update(job_id, completed_requests=completed_requests,
+                        result={'replay_checkpoint': checkpoint_result})
+        if checkpoint_callback:
+            checkpoint_callback(checkpoint_result)
+    try:
+        for replay_index in range(2):
+            results = {}
+            rounds.append(results)
+            for index, (name, spec) in enumerate(zip(names, specs)):
+                if job_id and _job_cancel_requested(job_id):
+                    raise VerificationCancelled("用户取消了复验")
+                if job_id:
+                    _job_update(job_id, phase=f"第 {replay_index + 1} 轮 · {name}")
+                if finalize:
+                    check_formal_inputs()
+                if before_request:
+                    before_request(replay_index, name)
+                addresses = network_guard(engagement, spec)
+                consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
+                if not consumed:
+                    raise HTTPException(409, reason)
+                if isolated_transport:
+                    from v5_http_transport import request_once as isolated_request
+                    def check_current():
+                        if finalize:
+                            check_formal_inputs()
+                        if job_id and _job_cancel_requested(job_id):
+                            raise VerificationCancelled("用户取消了复验")
+                        if before_request:
+                            before_request(replay_index, name)
+                    fields = (body.authorization.principal_field, body.authorization.owner_field) if body.authorization else ()
+                    results[name] = isolated_request(spec, addresses, check_current, scalar_fields=fields)
+                else:
+                    results[name] = request_once(spec)
+                completed_requests += 1
+                checkpoint("in_progress")
+                if after_response:
+                    after_response()
+                if job_id:
+                    _job_update(job_id, completed_requests=completed_requests)
+                if index < len(specs) - 1:
+                    time.sleep(interval)
+            if replay_index == 0:
                 time.sleep(interval)
-        rounds.append(results)
-        if replay_index == 0:
-            time.sleep(interval)
-    differential_match = all(signature(r["attack"]) == signature(r["baseline"]) and signature(r["negative_control"]) != signature(r["attack"]) for r in rounds)
-    if job_id and _job_cancel_requested(job_id):
-        raise VerificationCancelled("用户取消了复验")
-    stable = len({signature(r["attack"]) for r in rounds}) == 1
-    artifact_id = final_core.uid("artifact")
-    ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
-    artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
-    semantic_checks = [authorization_round(r, body.authorization) for r in rounds] if body.authorization else []
-    repair_checks = [authorization_repair_round(r, body.authorization) for r in rounds] if body.authorization else []
-    reproduced = bool(semantic_checks) and all(check["passed"] for check in semantic_checks)
-    repaired = bool(repair_checks) and all(check["passed"] for check in repair_checks)
-    repaired = repaired and len({signature(r["attack"]) for r in rounds}) == 1
-    oracle = "http-authorization-read-v2" if body.authorization else "http-state-replay-v1"
-    from http_authorization_policy import evaluate
-    business_boundary = evaluate(engagement['scope'], body.attack.url, rounds, body.authorization)
-    for results in rounds:
-        for response in results.values():
-            response.pop("_transient_body", None)
-    artifact = {"oracle": oracle, "rounds": rounds, "reproduced": reproduced, "repaired": repaired, "stable": stable,
-                "differential_match": differential_match, "semantic_checks": semantic_checks,
-                "repair_checks": repair_checks,
-                "business_boundary": business_boundary,
-                "assertion": {"principal_field": body.authorization.principal_field, "owner_field": body.authorization.owner_field} if body.authorization else None,
-                "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
-    if isolated_transport:
-        artifact['source_snapshot'] = source_snapshot
-    if finalize:
-        check_formal_inputs()
-    if finalize and body.authorization:
-        from http_independent_confirmation import confirm
-        artifact["independent_confirmation"] = confirm(artifact, engagement["scope"], body.attack.url)
-        check_formal_inputs()
+        differential_match = all(signature(r["attack"]) == signature(r["baseline"]) and signature(r["negative_control"]) != signature(r["attack"]) for r in rounds)
         if job_id and _job_cancel_requested(job_id):
             raise VerificationCancelled("用户取消了复验")
-    artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
-    with final_core.connect() as db:
-        db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
-            artifact_id, run_id, "http.replay", str(artifact_path), hashlib.sha256(artifact_path.read_bytes()).hexdigest(), "application/json", 1, final_core.utcnow(),
-        ))
-        observation_id = final_core.uid("obs")
-        db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
-            observation_id, run_id, run["engagement_id"], "traditional", "http.replay_result",
-            body.attack.url, f"Two-round HTTP replay reproduced={reproduced} stable={stable}",
-            1.0 if reproduced and stable else .3, "http-state-replay", artifact_id, final_core.utcnow(),
-        ))
-    if not finalize:
-        if before_request:
-            before_request(2, "save_result")
+        stable = len({signature(r["attack"]) for r in rounds}) == 1
+        artifact_id = final_core.uid("artifact")
+        ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
+        semantic_checks = [authorization_round(r, body.authorization) for r in rounds] if body.authorization else []
+        repair_checks = [authorization_repair_round(r, body.authorization) for r in rounds] if body.authorization else []
+        reproduced = bool(semantic_checks) and all(check["passed"] for check in semantic_checks)
+        repaired = bool(repair_checks) and all(check["passed"] for check in repair_checks)
+        repaired = repaired and len({signature(r["attack"]) for r in rounds}) == 1
+        oracle = "http-authorization-read-v2" if body.authorization else "http-state-replay-v1"
+        from http_authorization_policy import evaluate
+        business_boundary = evaluate(engagement['scope'], body.attack.url, rounds, body.authorization)
+        for results in rounds:
+            for response in results.values():
+                response.pop("_transient_body", None)
+        artifact = {"oracle": oracle, "rounds": rounds, "reproduced": reproduced, "repaired": repaired, "stable": stable,
+                    "differential_match": differential_match, "semantic_checks": semantic_checks,
+                    "repair_checks": repair_checks,
+                    "business_boundary": business_boundary,
+                    "assertion": {"principal_field": body.authorization.principal_field, "owner_field": body.authorization.owner_field} if body.authorization else None,
+                    "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
+        if isolated_transport:
+            artifact['source_snapshot'] = source_snapshot
+        if finalize:
+            check_formal_inputs()
+        if finalize and body.authorization:
+            from http_independent_confirmation import confirm
+            artifact["independent_confirmation"] = confirm(artifact, engagement["scope"], body.attack.url)
+            check_formal_inputs()
+            if job_id and _job_cancel_requested(job_id):
+                raise VerificationCancelled("用户取消了复验")
+        artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
         with final_core.connect() as db:
-            current = db.execute("SELECT status,evidence_ids FROM candidate_findings WHERE id=? AND run_id=?", (body.candidate_id,run_id)).fetchone()
-            if not current or current['status'] in ('verified','archived','graveyard'):
-                raise HTTPException(409, "候选状态已变化，停止自动更新")
-            evidence_id=final_core.uid('evidence')
-            db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)',
-                       (evidence_id,observation_id,run_id,'http.replay',
-                        '自动执行两轮对象读取正反对照',artifact_id,'supporting' if reproduced and stable else 'counterevidence',final_core.utcnow()))
-            status='reproduced' if reproduced and stable else current['status']
-            ids=final_core.load(current['evidence_ids'],[])+[evidence_id]
-            db.execute('UPDATE candidate_findings SET status=?,evidence_ids=?,updated_at=? WHERE id=?',
-                       (status,final_core.dump(ids),final_core.utcnow(),body.candidate_id))
-        return {'artifact_id':artifact_id,'observation_id':observation_id,'replay':artifact,
-                'verification':{'status':'reproduced' if reproduced and stable else 'not_established',
-                                'formal_finding_created':False}}
-    from http_independent_confirmation import valid as independently_valid
-    independently_positive = independently_valid(artifact, engagement["scope"], body.attack.url, "positive")
-    independently_repaired = independently_valid(artifact, engagement["scope"], body.attack.url, "repaired_negative")
-    proof = final_core.VerificationInput(
-        oracle=oracle, attempts=2, reproduced=independently_positive and business_boundary['status'] == 'denied',
-        counterevidence_checked=True, counterevidence_summary="Unauthenticated access denied; authenticated distinct principal read owner-bound object in both rounds" if reproduced else "Identity/object ownership assertions missing or not established; response differences alone are not proof",
-        severity=body.severity, impact_description=body.impact_description,
-        steps=["Replay authorized baseline", "Replay candidate attack", "Replay negative control", "Repeat the sequence"],
-        expected="Authenticated non-owner cannot read owner-bound object; unauthenticated control is denied",
-        actual=f"attack={rounds[-1]['attack']['status']} baseline={rounds[-1]['baseline']['status']}",
-        root_cause=body.root_cause, weakness=body.weakness, location=body.location,
-        poc_artifact_ids=[artifact_id],
-    )
-    if proof.reproduced:
-        current = final_core.get_engagement(run['engagement_id'])
-        from http_authorization_policy import digest
-        if (current['current_scope_snapshot_id'] != run['scope_snapshot_id']
-                or digest(current['scope']) != business_boundary['scope_sha256']):
-            raise HTTPException(409, '项目授权或业务权限规则已变化，请重新复验')
-        from verification_receipts import issue_receipt
-        proof.receipt_id = issue_receipt(body.candidate_id, proof)
-        result = final_core.verify_candidate(body.candidate_id, proof)
-    elif independently_repaired and business_boundary['status'] == 'denied':
-        from verification_receipts import issue_fixed_receipt
-        result = issue_fixed_receipt(body.candidate_id, oracle, artifact_id, repair_checks)
-        final_core.add_event(run_id, "verification", "finding.verified_fixed",
-                             "两轮身份边界负向复测均拒绝旧攻击，Finding 已确认修复",
-                             {"finding_id": result["id"], "candidate_id": body.candidate_id,
-                              "receipt_id": result["receipt_id"]})
-    else:
-        result = final_core.verify_candidate(body.candidate_id, proof)
-    result['business_boundary'] = business_boundary
-    return {"artifact_id": artifact_id, "observation_id": observation_id, "replay": artifact, "verification": result}
+            db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
+                artifact_id, run_id, "http.replay", str(artifact_path), hashlib.sha256(artifact_path.read_bytes()).hexdigest(), "application/json", 1, final_core.utcnow(),
+            ))
+            observation_id = final_core.uid("obs")
+            db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                observation_id, run_id, run["engagement_id"], "traditional", "http.replay_result",
+                body.attack.url, f"Two-round HTTP replay reproduced={reproduced} stable={stable}",
+                1.0 if reproduced and stable else .3, "http-state-replay", artifact_id, final_core.utcnow(),
+            ))
+        checkpoint("responses_complete", final_artifact_id=artifact_id)
+        if not finalize:
+            if before_request:
+                before_request(2, "save_result")
+            with final_core.connect() as db:
+                current = db.execute("SELECT status,evidence_ids FROM candidate_findings WHERE id=? AND run_id=?", (body.candidate_id,run_id)).fetchone()
+                if not current or current['status'] in ('verified','archived','graveyard'):
+                    raise HTTPException(409, "候选状态已变化，停止自动更新")
+                evidence_id=final_core.uid('evidence')
+                db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)',
+                           (evidence_id,observation_id,run_id,'http.replay',
+                            '自动执行两轮对象读取正反对照',artifact_id,'supporting' if reproduced and stable else 'counterevidence',final_core.utcnow()))
+                status='reproduced' if reproduced and stable else current['status']
+                ids=final_core.load(current['evidence_ids'],[])+[evidence_id]
+                db.execute('UPDATE candidate_findings SET status=?,evidence_ids=?,updated_at=? WHERE id=?',
+                           (status,final_core.dump(ids),final_core.utcnow(),body.candidate_id))
+            return {'artifact_id':artifact_id,'observation_id':observation_id,'replay':artifact,
+                    'verification':{'status':'reproduced' if reproduced and stable else 'not_established',
+                                    'formal_finding_created':False}}
+        from http_independent_confirmation import valid as independently_valid
+        independently_positive = independently_valid(artifact, engagement["scope"], body.attack.url, "positive")
+        independently_repaired = independently_valid(artifact, engagement["scope"], body.attack.url, "repaired_negative")
+        proof = final_core.VerificationInput(
+            oracle=oracle, attempts=2, reproduced=independently_positive and business_boundary['status'] == 'denied',
+            counterevidence_checked=True, counterevidence_summary="Unauthenticated access denied; authenticated distinct principal read owner-bound object in both rounds" if reproduced else "Identity/object ownership assertions missing or not established; response differences alone are not proof",
+            severity=body.severity, impact_description=body.impact_description,
+            steps=["Replay authorized baseline", "Replay candidate attack", "Replay negative control", "Repeat the sequence"],
+            expected="Authenticated non-owner cannot read owner-bound object; unauthenticated control is denied",
+            actual=f"attack={rounds[-1]['attack']['status']} baseline={rounds[-1]['baseline']['status']}",
+            root_cause=body.root_cause, weakness=body.weakness, location=body.location,
+            poc_artifact_ids=[artifact_id],
+        )
+        if proof.reproduced:
+            current = final_core.get_engagement(run['engagement_id'])
+            from http_authorization_policy import digest
+            if (current['current_scope_snapshot_id'] != run['scope_snapshot_id']
+                    or digest(current['scope']) != business_boundary['scope_sha256']):
+                raise HTTPException(409, '项目授权或业务权限规则已变化，请重新复验')
+            from verification_receipts import issue_receipt
+            proof.receipt_id = issue_receipt(body.candidate_id, proof)
+            result = final_core.verify_candidate(body.candidate_id, proof)
+        elif independently_repaired and business_boundary['status'] == 'denied':
+            from verification_receipts import issue_fixed_receipt
+            result = issue_fixed_receipt(body.candidate_id, oracle, artifact_id, repair_checks)
+            final_core.add_event(run_id, "verification", "finding.verified_fixed",
+                                 "两轮身份边界负向复测均拒绝旧攻击，Finding 已确认修复",
+                                 {"finding_id": result["id"], "candidate_id": body.candidate_id,
+                                  "receipt_id": result["receipt_id"]})
+        else:
+            result = final_core.verify_candidate(body.candidate_id, proof)
+        result['business_boundary'] = business_boundary
+        return {"artifact_id": artifact_id, "observation_id": observation_id, "replay": artifact, "verification": result}
+    except Exception as error:
+        state = 'cancelled' if isinstance(error, VerificationCancelled) or type(error).__name__ == 'Cancelled' else 'failed'
+        checkpoint(state, error_type=type(error).__name__)
+        error.replay_checkpoint = checkpoint_result
+        raise
+
 
 
 def _run_http_replay_job(job_id: str, run_id: str, body: HttpReplayInput) -> None:

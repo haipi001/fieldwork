@@ -198,3 +198,91 @@ def test_cancel_before_first_request_and_changed_material_during_replay(client, 
     assert len(calls) == 4 and result['result']['requests_sent'] == 1
     assert result['status'] == 'awaiting_input'
     assert not result['result']['verification_executed']
+    checkpoint = result['result']['items'][0]['replay_checkpoint']
+    assert checkpoint['state'] == 'failed' and checkpoint['completed_responses'] == 1
+    assert checkpoint['promotion_eligible'] is False
+
+
+@pytest.mark.parametrize('stop_after', [1, 4, 10])
+def test_cancel_preserves_immutable_http_checkpoints(client, monkeypatch, object_server, stop_after):
+    import hashlib
+    import json
+    from pathlib import Path
+    import v5_http_transport as transport
+    from http_authorization_policy import receipt_boundary_valid
+    from http_independent_confirmation import valid
+    run_id, candidate, project, calls = prepared_live_candidate(client, monkeypatch, object_server)
+    captured = []
+    monkeypatch.setattr(guided, 'dispatch', lambda job_id, data: captured.append((job_id, data)))
+    path = workflow_path(run_id, candidate)
+    plan = client.get(path + '/execution-plan').json()
+    response = client.post(path + '/execute', json={'source_fingerprint': plan['source_fingerprint'], 'authorized': True})
+    assert response.status_code == 202
+    job_id, data = captured.pop()
+    original = transport.request_once
+    count = 0
+    def cancel_after_response(*args, **kwargs):
+        nonlocal count
+        response = original(*args, **kwargs)
+        count += 1
+        if count == stop_after:
+            assert client.post(f'/api/v1/guided-research/{job_id}/cancel').status_code == 200
+        return response
+    monkeypatch.setattr(transport, 'request_once', cancel_after_response)
+    guided.run_job(job_id, data)
+    job = client.get(f'/api/v1/guided-research/{job_id}').json()
+    assert job['status'] == 'cancelled' and job['result']['requests_sent'] == stop_after
+    assert len(calls) == 3 + stop_after
+    assert not job['result']['verification_executed']
+    item = next(item for item in job['result']['items'] if item['candidate_id'] == candidate['id'])
+    checkpoint = item['replay_checkpoint']
+    assert checkpoint['state'] == 'cancelled' and checkpoint['completed_responses'] == stop_after
+    assert checkpoint['promotion_eligible'] is False and checkpoint['verification_complete'] is False
+    assert 'auto_verification' not in item
+    with core.connect() as db:
+        row = db.execute('SELECT * FROM artifacts WHERE id=?', (checkpoint['artifact_id'],)).fetchone()
+        assert row['kind'] == 'http.replay.checkpoint'
+        raw = Path(row['uri']).read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == checkpoint['artifact_sha256'] == row['sha256']
+        material = json.loads(raw)
+        assert material['completed_responses'] == sum(len(group) for group in material['rounds']) == stop_after
+        assert not receipt_boundary_valid(material, project['scope'], candidate['target'])
+        assert not valid(material, project['scope'], candidate['target'], 'positive')
+        assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM verification_attempts').fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM verification_receipts_v5').fetchone()[0] == 0
+        previous = material['previous_artifact_id']
+        while previous:
+            row = db.execute('SELECT * FROM artifacts WHERE id=?', (previous,)).fetchone()
+            raw = Path(row['uri']).read_bytes()
+            assert hashlib.sha256(raw).hexdigest() == row['sha256']
+            previous = json.loads(raw)['previous_artifact_id']
+    assert all(key not in raw.decode() for key in ('_transient_body', 'body_preview', 'record', 'Authorization'))
+
+
+def test_startup_recovery_retains_last_durable_http_checkpoint(client, monkeypatch, object_server):
+    run_id, candidate, project, calls = prepared_live_candidate(client, monkeypatch, object_server)
+    captured = []
+    monkeypatch.setattr(guided, 'dispatch', lambda job_id, data: captured.append((job_id, data)))
+    path = workflow_path(run_id, candidate)
+    plan = client.get(path + '/execution-plan').json()
+    response = client.post(path + '/execute', json={'source_fingerprint': plan['source_fingerprint'], 'authorized': True})
+    assert response.status_code == 202
+    job_id, data = captured.pop()
+    original = guided.save
+    def simulate_process_exit(job_id, steps, result, phase, *args, **kwargs):
+        if result.get('requests_sent') == 1:
+            raise SystemExit('simulated supervisor exit after durable response')
+        return original(job_id, steps, result, phase, *args, **kwargs)
+    monkeypatch.setattr(guided, 'save', simulate_process_exit)
+    with pytest.raises(SystemExit):
+        guided.run_job(job_id, data)
+    before = client.get(f'/api/v1/guided-research/{job_id}').json()
+    assert before['status'] == 'running'
+    guided.init_guided_db()
+    after = client.get(f'/api/v1/guided-research/{job_id}').json()
+    assert after['status'] == 'interrupted'
+    assert after['result'] == before['result'] and after['result']['requests_sent'] == 1
+    assert len(calls) == 4
+    checkpoint = after['result']['items'][0]['replay_checkpoint']
+    assert checkpoint['completed_responses'] == 1 and checkpoint['promotion_eligible'] is False

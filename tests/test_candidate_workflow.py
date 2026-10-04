@@ -80,7 +80,7 @@ def test_exact_duplicate_dispatches_once_and_persists_reason(client, monkeypatch
         return item
     monkeypatch.setattr(guided, 'material_for', material)
     calls = []
-    def execute(record, binding, before, after):
+    def execute(record, binding, before, after, *, checkpoint_callback=None):
         calls.append(record['id'])
         return {'status': 'not_established', 'binding_hash': binding['binding_hash']}
     monkeypatch.setattr(guided_http, 'execute', execute)

@@ -3492,7 +3492,10 @@ def test_http_verification_job_can_be_cancelled_without_persisting_credentials(c
         if job['status'] == 'cancelled':
             break
         time.sleep(.01)
-    assert job['status'] == 'cancelled' and job['result'] is None
+    assert job['status'] == 'cancelled'
+    assert job['result']['replay_checkpoint']['state'] == 'cancelled'
+    assert job['result']['replay_checkpoint']['completed_responses'] == 1
+    assert job['result']['replay_checkpoint']['promotion_eligible'] is False
     assert 'owner-secret' not in json.dumps(job) and 'other-secret' not in json.dumps(job)
     with final_core.connect() as db:
         stored = json.dumps(dict(db.execute('SELECT * FROM verification_jobs WHERE id=?',(job['id'],)).fetchone()))

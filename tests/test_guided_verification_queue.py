@@ -21,10 +21,13 @@ def queue_fixture(client,monkeypatch,fail_first=False):
         return value
     monkeypatch.setattr(guided,'material_for',material)
     calls=[]
-    def execute(c,binding,before,after):
+    def execute(c,binding,before,after,*,checkpoint_callback=None):
         calls.append(c['id'])
         if fail_first and c['id']==row['id']:raise HTTPException(409,'Fixture unavailable')
-        for _ in range(10):after()
+        for index in range(10):
+            checkpoint_callback({"completed_responses": index + 1, "artifact_id": "fixture-checkpoint",
+                                 "required_requests": 10, "state": "in_progress", "promotion_eligible": False})
+            after()
         return {'status':'not_established','binding_hash':binding['binding_hash']}
     monkeypatch.setattr(guided_http,'execute',execute)
     return run,calls

@@ -84,10 +84,12 @@ def test_guided_job_consumes_generated_binding_when_enabled(client,monkeypatch):
     data=guided.snapshot(run['id']);data['exchanges']=records();data['identities']=identities()
     monkeypatch.setattr(guided,'snapshot',lambda *args:data.copy())
     called=[]
-    def execute(c,binding,before,after):
+    def execute(c,binding,before,after,*,checkpoint_callback=None):
         called.append(binding)
         for index in range(10):
             before(index//5,'fixture')
+            checkpoint_callback({'completed_responses': index + 1, 'artifact_id': 'fixture-checkpoint',
+                                 'required_requests': 10, 'state': 'in_progress', 'promotion_eligible': False})
             after()
         return dict(binding_hash=binding['binding_hash'],sources=binding['sources'],status='not_established',request_count=10,artifact_id='test-artifact',checks=[])
     monkeypatch.setattr(guided_http,'execute',execute)

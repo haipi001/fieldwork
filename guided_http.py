@@ -69,7 +69,7 @@ def plan(candidate, exchanges, identities):
     return result
 
 
-def execute(candidate, binding, before_request, after_response=None, *, isolated_transport=False):
+def execute(candidate, binding, before_request, after_response=None, *, isolated_transport=False, checkpoint_callback=None):
     import traditional_runtime as http
     import final_core as f
     from fastapi import HTTPException
@@ -115,7 +115,7 @@ def execute(candidate, binding, before_request, after_response=None, *, isolated
         from v5_http_receipts import capture_sources
         with f.connect() as db:
             source_snapshot = capture_sources(db, candidate['id'], binding)
-    result=http.execute_http_replay(candidate['run_id'],body,finalize=False,before_request=guarded_before,after_response=after_response,isolated_transport=isolated_transport,source_snapshot=source_snapshot)
+    result=http.execute_http_replay(candidate['run_id'],body,finalize=False,before_request=guarded_before,after_response=after_response,isolated_transport=isolated_transport,source_snapshot=source_snapshot,checkpoint_callback=checkpoint_callback)
     return {'binding_hash':binding['binding_hash'],'sources':binding['sources'],
             'artifact_id':result['artifact_id'],'status':result['verification']['status'],
             'checks':result['replay']['semantic_checks'], 'request_count':10,

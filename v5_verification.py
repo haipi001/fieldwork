@@ -5,7 +5,6 @@ import hashlib
 import ipaddress
 import json
 import os
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -765,7 +764,8 @@ def _run_local_verifier(execution_input: dict[str, Any], check_current=None) -> 
         canary.flush()
         stage = Path(directory).resolve()
         staged_script = stage / "verifier.py"
-        shutil.copyfile(CHILD_SCRIPT, staged_script)
+        from parent_bound_child import stage_child, spawn_child, close_lifetime
+        stage_child(CHILD_SCRIPT, staged_script)
         script_digest = hashlib.sha256(staged_script.read_bytes()).hexdigest()
         def quote(value: Path) -> str:
             return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -790,7 +790,7 @@ def _run_local_verifier(execution_input: dict[str, Any], check_current=None) -> 
         profile_digest = hashlib.sha256(profile.encode()).hexdigest()
         if check_current:
             check_current()
-        process = subprocess.Popen(
+        process = spawn_child(subprocess.Popen,
             [str(sandbox), "-p", profile, str(executable), "-I", str(staged_script)], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=directory,
             env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8",
@@ -813,9 +813,12 @@ def _run_local_verifier(execution_input: dict[str, Any], check_current=None) -> 
                 except subprocess.TimeoutExpired:
                     first = False
         finally:
-            if process.poll() is None:
-                process.kill()
-                process.communicate()
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+            finally:
+                close_lifetime(process)
         if hashlib.sha256(staged_script.read_bytes()).hexdigest() != script_digest:
             raise ValueError("isolated verifier script changed during replay")
     if process.returncode != 0 or len(stdout) > 8192:

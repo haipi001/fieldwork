@@ -5,7 +5,6 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import socket
 import selectors
@@ -13,6 +12,7 @@ import errno
 import sys
 import tempfile
 import time
+from parent_bound_child import stage_child, spawn_child, close_lifetime
 from urllib.parse import urlsplit
 
 
@@ -69,7 +69,7 @@ def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
     with tempfile.TemporaryDirectory(prefix='fieldwork-http-') as directory, tempfile.NamedTemporaryFile(dir=Path.home(), prefix='fieldwork-http-canary-') as canary:
         stage = Path(directory).resolve()
         script = stage / 'worker.py'
-        shutil.copyfile(CHILD_SCRIPT, script)
+        stage_child(CHILD_SCRIPT, script)
         script_sha = hashlib.sha256(script.read_bytes()).hexdigest()
         executable, runtime = Path(sys.executable).resolve(), Path(sys.prefix).resolve()
         if runtime in (Path('/'), Path.home()):
@@ -90,7 +90,7 @@ def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
             encoded = json.dumps(payload).encode()
             if len(encoded) > 131072:
                 raise ValueError('isolated HTTP input exceeds limit')
-            process = subprocess.Popen(['/usr/bin/sandbox-exec', '-p', profile, str(executable), '-I', str(script)],
+            process = spawn_child(subprocess.Popen, ['/usr/bin/sandbox-exec', '-p', profile, str(executable), '-I', str(script)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=directory,
                 pass_fds=(connected.fileno(),),
                 env={'PATH': '/usr/bin:/bin', 'HOME': str(stage), 'TMPDIR': str(stage), 'PYTHONDONTWRITEBYTECODE': '1',
@@ -136,6 +136,9 @@ def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
                         'observed_by': 'fieldwork_local_supervisor', 'scope': 'transport_only',
                         'network_grant': 'single_connected_socket', 'network_connect_denied': True}}
         finally:
-            if process.poll() is None:
-                process.kill()
-            process.communicate()
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+            finally:
+                close_lifetime(process)

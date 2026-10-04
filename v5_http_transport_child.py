@@ -44,8 +44,21 @@ def main():
         connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=8, context=ssl.create_default_context())
     else:
         connection = http.client.HTTPConnection(parsed.hostname, port, timeout=8)
-    # HTTPSConnection still verifies the original hostname and uses it for SNI.
-    connection._create_connection = lambda _endpoint, timeout, source_address=None: socket.create_connection((address, port), timeout, source_address)
+    inherited = socket.socket(fileno=payload['socket_fd'])
+    inherited.settimeout(8)
+    peer = inherited.getpeername()
+    if str(ipaddress.ip_address(peer[0])) != address or peer[1] != port:
+        raise ValueError('inherited connection does not match pinned endpoint')
+    try:
+        with socket.create_connection((address, port), timeout=1):
+            pass
+    except PermissionError:
+        network_connect_denied = True
+    else:
+        raise ValueError('worker can create unauthorized network connections')
+    # No reconnect or DNS resolution is available in this worker. TLS still verifies
+    # the original hostname and uses it for SNI over the one inherited connection.
+    connection.sock = ssl.create_default_context().wrap_socket(inherited, server_hostname=parsed.hostname) if parsed.scheme == 'https' else inherited
     try:
         path = parsed.path or '/'
         if parsed.query:
@@ -67,7 +80,7 @@ def main():
                 scalars[path] = hashlib.sha256(json.dumps(str(value), sort_keys=True, ensure_ascii=False).encode()).hexdigest() if type(value) in (str, int) and str(value) else None
             except (ValueError, TypeError, KeyError):
                 scalars[path] = None
-        result = {'pid': os.getpid(), 'ppid': os.getppid(), 'file_read_denied': True,
+        result = {'pid': os.getpid(), 'ppid': os.getppid(), 'file_read_denied': True, 'network_connect_denied': network_connect_denied,
                   'status': response.status, 'body': base64.b64encode(body).decode('ascii'),
                   'scalar_sha256': scalars,
                   'headers': {k: v for k, v in response.getheaders() if k.lower() in {'content-type', 'location', 'etag'}}}

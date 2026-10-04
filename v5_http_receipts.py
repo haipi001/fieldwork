@@ -147,7 +147,8 @@ def replay_input(db, request):
             proof = response.get('process_execution', {})
             if (proof.get('observed_by') != 'fieldwork_local_supervisor' or proof.get('file_read_denied') is not True
                     or proof.get('exit_code') != 0 or proof.get('sandbox') != 'macos-seatbelt'
-                    or proof.get('scope') != 'transport_only' or proof.get('network_grant') != 'loopback_exact_port'
+                    or proof.get('scope') != 'transport_only' or proof.get('network_grant') not in {'loopback_exact_port','single_connected_socket'}
+                    or (proof.get('network_grant') == 'single_connected_socket' and proof.get('network_connect_denied') is not True)
                     or not isinstance(proof.get('child_pid'), int) or proof['child_pid'] == proof.get('parent_pid')):
                 return None
             safe[role] = {key: response.get(key) for key in ('status', 'body_sha256', 'body_bytes', 'scalar_sha256')}

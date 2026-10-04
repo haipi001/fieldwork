@@ -321,19 +321,11 @@ def workflow_execution_plan(run_id, candidate_id):
         blockers.append('request_budget')
     requests = []
     if binding:
-        import ipaddress
         import sys
         from pathlib import Path
         if sys.platform != 'darwin' or not Path('/usr/bin/sandbox-exec').is_file():
             blockers.append('isolated_transport_unavailable')
         for target in (binding['target'], binding['identity_url']):
-            host = urlsplit(target).hostname
-            try:
-                local = ipaddress.ip_address(host).is_loopback
-            except ValueError:
-                local = host == 'localhost'
-            if not local:
-                blockers.append('isolated_transport_local_only')
             if not core().execution_policy_check(core().PolicyCheckInput(
                     engagement_id=engagement['id'], target=target, action='read'))['allowed']:
                 blockers.append('out_of_scope')

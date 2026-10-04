@@ -127,6 +127,48 @@ def _loopback_http_status(contract: dict) -> dict:
     }
 
 
+def _http_object_read(contract: dict) -> dict:
+    """Decide only from scalar hashes extracted by observed HTTP workers."""
+    rounds = contract.get('rounds', [])
+    principal, owner_field = contract.get('principal_field'), contract.get('owner_field')
+    rule = contract.get('rule', {})
+    if len(rounds) != 2 or rule.get('access') not in {'owner_only', 'allowlist', 'public'}:
+        raise ValueError('invalid object-read contract')
+    checks, repairs, principals = [], [], []
+    for group in rounds:
+        if set(group) != {'baseline', 'attack', 'negative_control', 'baseline_identity', 'attack_identity'}:
+            raise ValueError('missing replay roles')
+        a = group['baseline_identity']['scalar_sha256'].get(principal)
+        b = group['attack_identity']['scalar_sha256'].get(principal)
+        baseline_owner = group['baseline']['scalar_sha256'].get(owner_field)
+        attack_owner = group['attack']['scalar_sha256'].get(owner_field)
+        valid_hash = lambda v: isinstance(v, str) and len(v) == 64 and all(c in '0123456789abcdef' for c in v)
+        precondition = (all(group[k]['status'] == 200 for k in ('baseline_identity', 'attack_identity', 'baseline'))
+                        and valid_hash(a) and valid_hash(b) and a != b and baseline_owner == a
+                        and group['negative_control']['status'] in {401, 403})
+        principals.append((a, b))
+        denied_by_rule = rule['access'] != 'public' and b not in rule.get('allowed_principal_sha256', [])
+        checks.append({'preconditions_valid': precondition, 'business_access_denied': denied_by_rule,
+                       'same_object_read': group['attack']['status'] == 200 and attack_owner == a
+                       and group['attack']['body_sha256'] == group['baseline']['body_sha256']
+                       and group['attack']['body_bytes'] > 0})
+        repairs.append(precondition and denied_by_rule and group['attack']['status'] in {401, 403})
+    stable = principals[0] == principals[1] and rounds[0]['attack']['body_sha256'] == rounds[1]['attack']['body_sha256']
+    valid = stable and all(c['preconditions_valid'] for c in checks)
+    permitted = valid and all(not c['business_access_denied'] for c in checks)
+    positive = valid and all(c['business_access_denied'] and c['same_object_read'] for c in checks)
+    repaired = valid and all(repairs)
+    status = 'verified' if positive else 'refuted' if repaired or permitted else 'inconclusive'
+    classification = 'positive' if positive else 'repaired_negative' if repaired else 'healthy_negative' if permitted else 'invalid_precondition'
+    return {'status': status, 'classification': classification,
+            'summary': 'Two-round identity-bound object read checked against the frozen business rule',
+            'preconditions_valid': valid, 'counterevidence_checked': True, 'interrupted': False, 'attempts': 2,
+            'oracle': {'kind': 'http_object_read_v1', 'checks': checks, 'stable': stable,
+                       'source_artifact_sha256': contract['source_artifact_sha256'],
+                       'scope_sha256': contract['scope_sha256'], 'rule_sha256': contract['rule_sha256'],
+                       'owner_sha256': principals[0][0], 'principal_sha256': principals[0][1]}}
+
+
 def evaluate(contract: dict) -> dict:
     if not isinstance(contract, dict):
         raise ValueError("verifier input must be an object")
@@ -135,6 +177,8 @@ def evaluate(contract: dict) -> dict:
         result = _loopback_http_status(contract)
     elif kind == "package_applicability_v1":
         result = _package_applicability(contract)
+    elif kind == 'http_object_read_v1':
+        result = _http_object_read(contract)
     else:
         raise ValueError("unsupported local verifier contract")
     canary = os.environ.get("FIELDWORK_DENIED_CANARY")
@@ -148,7 +192,7 @@ def evaluate(contract: dict) -> dict:
     else:
         file_read_denied = False
     network_denied = None
-    if kind == "package_applicability_v1":
+    if kind in {"package_applicability_v1", "http_object_read_v1"}:
         try:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))

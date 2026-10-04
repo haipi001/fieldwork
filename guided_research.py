@@ -232,6 +232,17 @@ def hydrate(row):
     for name in ('steps', 'result'):
         value[name] = core().load(value[name], {})
     value['cancel_requested'] = bool(value['cancel_requested'])
+    for item in value.get('result', {}).get('items', []):
+        independent = item.get('auto_verification', {}).get('independent_verification', {})
+        if independent.get('receipt_id'):
+            try:
+                from v5_verification import get_receipt
+                receipt = get_receipt(independent['receipt_id'])
+                independent['current_inputs_match'] = receipt['integrity']['current_inputs_match']
+                independent['promotion_eligible'] = receipt['integrity']['promotion_eligible']
+            except Exception:
+                independent['current_inputs_match'] = False
+                independent['promotion_eligible'] = False
     return redact_structure(value)
 
 
@@ -506,6 +517,29 @@ def run_job(job_id, data):
                     steps[index]['count'] += 1
                     save(job_id,steps,result,'保存自动复验结果')
             elif index == 4:
+                if data.get('reviewed_execution'):
+                    from v5_http_receipts import request_for_job, canonical_for_receipt
+                    from v5_verification import local_verifier_tick, get_receipt
+                    for item in result['items']:
+                        outcome = item.get('auto_verification', {})
+                        if not outcome.get('artifact_id'):
+                            continue
+                        try:
+                            request = request_for_job(job_id, item['candidate_id'], outcome['artifact_id'])
+                            outcome['independent_verification'] = {**request, 'status': 'queued'}
+                            tick = local_verifier_tick(1, request['request_id'])
+                            completed = next((entry for entry in tick['completed'] if entry.get('receipt_id')), None)
+                            if completed:
+                                receipt = get_receipt(completed['receipt_id'])
+                                outcome['independent_verification'].update(status=receipt['result']['status'], receipt_id=receipt['id'])
+                                canonical_id = canonical_for_receipt(receipt['id'])
+                                if canonical_id:
+                                    outcome['independent_verification']['canonical_result_id'] = canonical_id
+                            elif tick['completed']:
+                                outcome['independent_verification']['status'] = 'failed_attempt'
+                        except Exception:
+                            outcome['independent_verification'] = {'status': 'not_completed'}
+                            item['gaps'].append({'code': 'independent_verification_failed', 'message': '独立判定尚未完成，已保留重放材料。', 'action': None})
                 result['pending_verifications']=sum(any(gap['code']=='round_limit' for gap in item['gaps']) for item in result['items'])
                 result['new_verifications']=sum('auto_verification' in item and not item['auto_verification'].get('reused') for item in result['items'])
                 result['reused_verifications']=sum(bool(item.get('auto_verification',{}).get('reused')) for item in result['items'])

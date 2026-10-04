@@ -562,7 +562,7 @@ def _job_cancel_requested(job_id: str) -> bool:
     return bool(row and row["cancel_requested"])
 
 
-def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False):
+def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False, source_snapshot=None):
     import final_core
     run, engagement, specs, names = prepare_http_replay(run_id, body)
     rate = max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
@@ -589,7 +589,8 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                         raise VerificationCancelled("用户取消了复验")
                     if before_request:
                         before_request(replay_index, name)
-                results[name] = isolated_request(spec, addresses, check_current)
+                fields = (body.authorization.principal_field, body.authorization.owner_field) if body.authorization else ()
+                results[name] = isolated_request(spec, addresses, check_current, scalar_fields=fields)
             else:
                 results[name] = request_once(spec)
             if after_response:
@@ -626,6 +627,8 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                 "business_boundary": business_boundary,
                 "assertion": {"principal_field": body.authorization.principal_field, "owner_field": body.authorization.owner_field} if body.authorization else None,
                 "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
+    if isolated_transport:
+        artifact['source_snapshot'] = source_snapshot
     artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
     with final_core.connect() as db:
         db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (

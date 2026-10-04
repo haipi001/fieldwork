@@ -218,13 +218,16 @@ def _inputs_current(db: sqlite3.Connection, binding: sqlite3.Row) -> bool:
         return False
     if _load(request["replay_contract_json"], {}).get("type") == "package_applicability_v1":
         return _package_replay_input(db, request) is not None
+    if _load(request['replay_contract_json'], {}).get('type') == 'http_object_read_v1':
+        from v5_http_receipts import replay_input
+        return replay_input(db, request) is not None
     return True
 
 
 def _process_observed(payload: dict[str, Any]) -> bool:
     environment = payload.get("environment", {})
     process_proof = environment.get("process_isolation", {})
-    package = environment.get("oracle") == "package_applicability_v1"
+    package = environment.get('attested', {}).get('oracle', environment.get('oracle')) in {'package_applicability_v1', 'http_object_read_v1'}
     return bool(
         environment.get("provenance") == "supervisor_observed_process"
         and process_proof.get("observed_by") == "fieldwork_local_supervisor"
@@ -266,6 +269,9 @@ def _get_receipt_value(db: sqlite3.Connection, receipt_id: str) -> dict[str, Any
             and oracle.get("observed_versions") == [fingerprint.get("version")]
             and all(oracle.get(key) == fingerprint.get(key) for key in ("ecosystem", "name", "version"))
         )
+    elif payload.get('replay_contract', {}).get('type') == 'http_object_read_v1':
+        request = db.execute('SELECT * FROM verification_requests_v5 WHERE id=?', (binding['request_id'],)).fetchone()
+        claim_oracle_current = _http_receipt_matches(db, request, result)
     eligible = bool(current and observed and claim_oracle_current
                     and result.get("status") in {"verified", "refuted"} and not result.get("interrupted"))
     domain = ("applicability_only" if payload.get("replay_contract", {}).get("type") == "package_applicability_v1"
@@ -667,10 +673,13 @@ def _local_replay_input(db: sqlite3.Connection, request: sqlite3.Row) -> dict[st
         return contract if _loopback_contract_allowed(db, request) else None
     if contract.get("type") == "package_applicability_v1":
         return _package_replay_input(db, request)
+    if contract.get('type') == 'http_object_read_v1':
+        from v5_http_receipts import replay_input
+        return replay_input(db, request)
     return None
 
 
-def _claim_local_verifier(db: sqlite3.Connection) -> tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]] | None:
+def _claim_local_verifier(db: sqlite3.Connection, request_id: str | None = None) -> tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]] | None:
     now = _now()
     runner = db.execute("SELECT * FROM runner_registry_v5 WHERE id=?", (LOCAL_VERIFIER_ID,)).fetchone()
     if not runner:
@@ -694,7 +703,7 @@ def _claim_local_verifier(db: sqlite3.Connection) -> tuple[sqlite3.Row, sqlite3.
     rows = db.execute(
         "SELECT t.*,v.id AS request_id FROM agent_tasks t JOIN verification_requests_v5 v "
         "ON v.verifier_task_id=t.id WHERE t.status='queued' AND t.attempt<t.max_attempts "
-        "ORDER BY t.priority DESC,t.created_at,t.id LIMIT 100",
+        "AND (? IS NULL OR v.id=?) ORDER BY t.priority DESC,t.created_at,t.id LIMIT 100", (request_id, request_id),
     ).fetchall()
     for task in rows:
         request = db.execute("SELECT * FROM verification_requests_v5 WHERE id=?", (task["request_id"],)).fetchone()
@@ -736,7 +745,7 @@ def _run_local_verifier(execution_input: dict[str, Any]) -> tuple[dict[str, Any]
         runtime = Path(sys.prefix).resolve()
         if runtime == Path.home() or runtime == Path("/"):
             raise RuntimeError("local verifier Python runtime is too broad for sandboxing")
-        package = execution_input.get("type") == "package_applicability_v1"
+        package = execution_input.get('type') in {'package_applicability_v1', 'http_object_read_v1'}
         profile = "\n".join([
             "(version 1)", "(allow default)", "(deny process-fork)",
             "(deny network*)",
@@ -787,14 +796,14 @@ def _run_local_verifier(execution_input: dict[str, Any]) -> tuple[dict[str, Any]
 
 
 @router.post("/local/tick")
-def local_verifier_tick(limit: int = 1):
+def local_verifier_tick(limit: int = 1, request_id: str | None = None):
     if limit < 1 or limit > 4:
         raise HTTPException(422, "local verifier tick limit must be 1-4")
     completed = []
     for _ in range(limit):
         with _core().connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            selected = _claim_local_verifier(db)
+            selected = _claim_local_verifier(db, request_id)
             if not selected:
                 return {"status": "idle", "completed": completed}
             task, request, execution_input = selected
@@ -802,14 +811,15 @@ def local_verifier_tick(limit: int = 1):
             evidence_ids = _load(request["input_node_ids_json"], [])
         try:
             result, proof = _run_local_verifier(execution_input)
-            package = contract.get("type") == "package_applicability_v1"
+            package = contract.get('type') in {'package_applicability_v1', 'http_object_read_v1'}
+            http_object = contract.get('type') == 'http_object_read_v1'
             receipt = _issue_receipt(task["id"], ReceiptIssue(
                 runner_id=LOCAL_VERIFIER_ID,
                 environment={"network": "none" if package else "loopback_http_only",
                              "oracle": contract.get("type")},
                 result=VerificationResult.model_validate(result),
                 evidence_ids=evidence_ids,
-                limitations=(["Only a hashed source-scan package/version and an explicit advisory version "
+                limitations=(["Only the selected identity-bound object read and frozen business rule were checked; code root cause, severity and broader impact remain unproven."] if http_object else ["Only a hashed source-scan package/version and an explicit advisory version "
                               "were compared; deployment, runtime reachability, and exploitability are unproven."]
                              if package else
                              ["Only the declared loopback HTTP status relationship was replayed; "
@@ -906,12 +916,24 @@ def validate_receipt_for_promotion(db: sqlite3.Connection, receipt_id: str, camp
                 or oracle.get("observed_versions") != [fingerprint.get("version")]
                 or any(oracle.get(key) != fingerprint.get(key) for key in ("ecosystem", "name", "version"))):
             raise HTTPException(409, "package applicability receipt does not match current source evidence")
+    if payload['replay_contract'].get('type') == 'http_object_read_v1':
+        request = db.execute('SELECT * FROM verification_requests_v5 WHERE id=?', (binding['request_id'],)).fetchone()
+        if not _http_receipt_matches(db, request, result):
+            raise HTTPException(409, 'HTTP receipt does not match current supervised evidence')
     if required_oracle_kind and (result.get("oracle", {}).get("kind") != required_oracle_kind
                                  or payload["replay_contract"].get("type") != required_oracle_kind):
         raise HTTPException(409, "verification receipt oracle does not match the required domain")
     if expected_outcome != result.get("status"):
         raise HTTPException(409, "canonical result must declare the receipt verification_outcome")
     return payload
+
+
+def _http_receipt_matches(db, request, result):
+    from v5_http_receipts import replay_input
+    current = replay_input(db, request) if request else None
+    oracle = result.get('oracle', {})
+    return bool(current and oracle.get('kind') == 'http_object_read_v1'
+                and all(oracle.get(key) == current[key] for key in ('source_artifact_sha256', 'scope_sha256', 'rule_sha256')))
 
 
 def node_is_receipt_locked(db: sqlite3.Connection, node_id: str) -> bool:

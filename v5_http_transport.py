@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 CHILD_SCRIPT = Path(__file__).with_name('v5_http_transport_child.py')
 
 
-def request_once(spec, addresses, check_current=None):
+def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
     import traditional_runtime as http
     from reporting import redact
     if sys.platform != 'darwin' or not Path('/usr/bin/sandbox-exec').is_file():
@@ -31,7 +31,7 @@ def request_once(spec, addresses, check_current=None):
     if not ipaddress.ip_address(address).is_loopback:
         raise RuntimeError('isolated HTTP transport currently supports loopback targets only')
     endpoint = f'localhost:{port}'
-    encoded = json.dumps({'url': spec.url, 'address': address, 'headers': spec.headers}).encode()
+    encoded = json.dumps({'url': spec.url, 'address': address, 'headers': spec.headers, 'scalar_fields': list(scalar_fields)}).encode()
     if len(encoded) > 131072:
         raise ValueError('isolated HTTP input exceeds limit')
     def quote(value):
@@ -89,7 +89,7 @@ def request_once(spec, addresses, check_current=None):
             # Raw output only lives in memory; artifacts receive the existing redacted representation.
             return {'status': value['status'], 'body_sha256': hashlib.sha256(body).hexdigest(), 'body_bytes': len(body),
                     'headers': {k: redact(v) for k, v in value['headers'].items()}, 'body_preview': http._safe_body_preview(text),
-                    '_transient_body': text, 'process_execution': {
+                    '_transient_body': text, 'scalar_sha256': value.get('scalar_sha256', {}), 'process_execution': {
                         'parent_pid': os.getpid(), 'child_pid': process.pid, 'exit_code': process.returncode,
                         'sandbox': 'macos-seatbelt', 'sandbox_profile_sha256': hashlib.sha256(profile.encode()).hexdigest(),
                         'script_sha256': script_sha, 'file_read_denied': True, 'pinned_address': address,

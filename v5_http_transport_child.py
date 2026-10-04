@@ -1,6 +1,7 @@
 """One authorized, pinned GET. Standalone stdlib worker; no application imports."""
 import base64
 import http.client
+import hashlib
 import ipaddress
 import json
 import os
@@ -54,8 +55,21 @@ def main():
         body = response.read(65537)
         if len(body) > 65536:
             raise ValueError('response exceeds limit')
+        fields = payload.get('scalar_fields', [])
+        if not isinstance(fields, list) or len(fields) > 2 or any(not isinstance(p, str) or len(p) > 160 for p in fields):
+            raise ValueError('invalid scalar fields')
+        scalars = {}
+        for path in fields:
+            try:
+                value = json.loads(body)
+                for part in path.split('.'):
+                    value = value[part]
+                scalars[path] = hashlib.sha256(json.dumps(str(value), sort_keys=True, ensure_ascii=False).encode()).hexdigest() if type(value) in (str, int) and str(value) else None
+            except (ValueError, TypeError, KeyError):
+                scalars[path] = None
         result = {'pid': os.getpid(), 'ppid': os.getppid(), 'file_read_denied': True,
                   'status': response.status, 'body': base64.b64encode(body).decode('ascii'),
+                  'scalar_sha256': scalars,
                   'headers': {k: v for k, v in response.getheaders() if k.lower() in {'content-type', 'location', 'etag'}}}
         print(json.dumps(result), flush=True)
     finally:

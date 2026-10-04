@@ -127,6 +127,12 @@ def test_reviewed_live_replay_requires_authorization_and_preserves_unconfirmed_r
     assert job['result']['requests_sent'] == 10 and len(calls) == 13
     assert job['result']['items'][0]['auto_verification']['status'] == 'reproduced'
     assert job['result']['items'][0]['auto_verification']['business_boundary']['status'] == 'denied'
+    independent = job['result']['items'][0]['auto_verification']['independent_verification']
+    assert independent['status'] == 'verified', independent
+    receipt = client.get('/api/v1/verification/receipts/' + independent['receipt_id']).json()
+    assert receipt['integrity']['promotion_eligible'] is True
+    assert receipt['environment']['process_isolation']['network_denied'] is True
+    assert receipt['result']['oracle']['kind'] == 'http_object_read_v1'
     persisted = client.get(f'/api/v1/runs/{run_id}/candidate-workflow').json()['execution_job']
     assert persisted['id'] == job['id'] and persisted['status'] == job['status']
     assert persisted['result']['reviewed_execution'] is True
@@ -181,8 +187,8 @@ def test_cancel_before_first_request_and_changed_material_during_replay(client, 
     job_id, data = captured.pop()
     import v5_http_transport as transport
     original = transport.request_once
-    def changing(spec, addresses, check_current=None):
-        result = original(spec, addresses, check_current)
+    def changing(spec, addresses, check_current=None, **kwargs):
+        result = original(spec, addresses, check_current, **kwargs)
         with core.connect() as db:
             db.execute("UPDATE observations SET summary='Modified during replay' WHERE run_id=?", (run_id,))
         return result

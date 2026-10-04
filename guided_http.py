@@ -110,7 +110,12 @@ def execute(candidate, binding, before_request, after_response=None, *, isolated
             raise HTTPException(409,'运行或候选状态已变化，自动复验停止')
         if any(not ready(f.get_identity(identity_id)) for identity_id in (binding['owner_identity_id'],binding['other_identity_id'])):
             raise HTTPException(409,'测试会话已失效，自动复验停止')
-    result=http.execute_http_replay(candidate['run_id'],body,finalize=False,before_request=guarded_before,after_response=after_response,isolated_transport=isolated_transport)
+    source_snapshot = None
+    if isolated_transport:
+        from v5_http_receipts import capture_sources
+        with f.connect() as db:
+            source_snapshot = capture_sources(db, candidate['id'], binding)
+    result=http.execute_http_replay(candidate['run_id'],body,finalize=False,before_request=guarded_before,after_response=after_response,isolated_transport=isolated_transport,source_snapshot=source_snapshot)
     return {'binding_hash':binding['binding_hash'],'sources':binding['sources'],
             'artifact_id':result['artifact_id'],'status':result['verification']['status'],
             'checks':result['replay']['semantic_checks'], 'request_count':10,

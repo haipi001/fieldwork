@@ -135,12 +135,22 @@ def run():
         assert not page.locator('#workflowAuthorized').is_checked()
         assert len(writes)==5
         page.locator('[data-workflow-close]').click()
+        proof={'status':'verified','receipt_id':'vreceipt-fixture','current_inputs_match':True,'promotion_eligible':True}
+        job.update(status='awaiting_input',result={'requests_sent':10,'items':[{'title':'Object read fixture',
+            'auto_verification':{'status':'reproduced','independent_verification':proof},'gaps':[]}]})
+        page.locator('#workflowRead').click()
+        page.get_by_text('Independently checked: selected read violates the business rule',exact=True).wait_for()
+        proof['current_inputs_match']=False
+        proof['promotion_eligible']=False
+        page.locator('#workflowRead').click()
+        page.get_by_text('Receipt inputs or authorization changed; review again.',exact=True).wait_for()
+        assert len(writes)==5
         page.evaluate("window.FieldworkReviewScope('project-fixture')")
         page.get_by_text('This scope is frozen.',exact=False).wait_for()
         assert page.locator('[data-field="target"]').is_disabled()
         assert not errors, errors
         browser.close()
-    print('PASS: draft rules, unsaved freeze gate, locale retention, reviewed execution, cancellation, stale-plan rejection, frozen scope, responsive themes')
+    print('PASS: draft rules, unsaved freeze gate, locale retention, reviewed execution, cancellation, stale-plan rejection, receipt status and stale inputs, frozen scope, responsive themes')
 
 
 if __name__=='__main__':

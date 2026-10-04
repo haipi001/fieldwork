@@ -2,6 +2,8 @@
 
 更新时间：2026-09-29
 
+2026-10-04 当前进度与实施顺序以 [阶段总计划](docs/DEVELOPMENT_STATUS_2026-10-04.md) 为准。0.68.1 增加只读分诊工作流入口；授权执行与独立确认的整体验收仍未完成。
+
 ## 产品目标
 
 Fieldwork V5 是 Evidence-first Autonomous Research & Verification OS。它在现有 FastAPI、SQLite、Traditional、Web3、AI Agent Audit、Evidence、Candidate、Verification 与报告能力上增加统一研究编排层，不进行整体重写。

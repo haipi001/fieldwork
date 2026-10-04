@@ -68,3 +68,12 @@ textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media(max-width:1100px){.monitor-workspace{grid-template-columns:1fr}.monitor-help ol{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.monitor-help li{margin:0 0 14px}.monitor-help{padding:20px}}
 @media(max-width:760px){:root{--page-padding:16px}.view{padding-top:20px}.page-heading h1{font-size:26px}.monitor-help ol{display:block}.monitor-help li{margin-bottom:20px}#monitorControl{padding:20px}.monitor-history>summary span{display:block;margin:6px 0 0}.monitor-workspace{gap:14px}}
 @media(min-width:1025px){body.rail .sidebar nav{padding-inline:8px}}
+/* Triage is a work queue, not another unqualified vulnerability counter. */
+.candidate-workflow{margin-bottom:24px;padding:24px;min-width:0}
+.candidate-workflow .task-toolbar{flex-wrap:wrap}
+.candidate-workflow select{max-width:100%;min-width:0}
+.candidate-workflow .task-toolbar label{min-width:0;flex:1 1 220px}
+.workflow-counts{display:flex;flex-wrap:wrap;gap:12px;margin:16px 0}
+.workflow-counts span{padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px}
+.workflow-items section{padding:16px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}
+.workflow-items h3{margin:0 0 8px;font-size:15px}.workflow-items p{margin:6px 0}

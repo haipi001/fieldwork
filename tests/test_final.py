@@ -2896,7 +2896,10 @@ def test_real_http_replay_oracle_with_negative_control(client):
         port = server.server_port
         created = client.post("/api/v1/engagements", json={
             "name": "Local HTTP oracle", "target": f"http://127.0.0.1:{port}", "mode": "traditional",
-            "scope": {"allow_private_ips": True}, "policy": {"max_requests_per_second": 200},
+            "scope": {"allow_private_ips": True, "http_object_read_rules": [{
+                "target": f"http://127.0.0.1:{port}/api/object/42", "access": "owner_only",
+                "source": "Local fixture contract: this object is private to its owner",
+            }]}, "policy": {"max_requests_per_second": 200},
         }).json()
         engagement = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
         run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()["id"]

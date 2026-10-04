@@ -512,13 +512,17 @@ def prepare_http_replay(run_id: str, body: HttpReplayInput):
 @router.post("/runs/{run_id}/http-replay/plan")
 def preview_http_replay(run_id: str, body: HttpReplayInput):
     _, engagement, specs, names = prepare_http_replay(run_id, body)
+    from http_authorization_policy import select_rule
+    rule, rule_reason = select_rule(engagement['scope'], body.attack.url)
     return {"oracle": "http-authorization-read-v2" if body.authorization else "http-state-replay-v1",
             "rounds": 2, "request_count": len(specs) * 2,
             "requests": [{"role": name, "method": spec.method, "url": redact(spec.url)} for name, spec in zip(names, specs)],
             "max_requests_per_second": engagement["policy"].get("max_requests_per_second", 1),
-            "can_prove": bool(body.authorization), "sends_requests": False,
+            "can_prove": bool(body.authorization and rule and rule['access'] != 'public'),
+            "business_rule_reason": rule_reason,
+            "business_rule_required": True, "sends_requests": False,
             "checks": ["两个已登录且不同的主体", "基线对象归属与主体一致", "另一主体读取同一对象", "未登录访问被拒绝", "两轮结果稳定"],
-            "limitation": "适用于 JSON 对象读取与身份归属检查；不支持写入、非 JSON 响应或通用业务授权推断。"}
+            "limitation": "适用于 JSON 对象读取与身份归属检查；确认还需已确认范围中的对象权限规则。共享或规则不明时进入复核。"}
 
 
 @router.post("/runs/{run_id}/http-replay")
@@ -599,12 +603,15 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
     repaired = bool(repair_checks) and all(check["passed"] for check in repair_checks)
     repaired = repaired and len({signature(r["attack"]) for r in rounds}) == 1
     oracle = "http-authorization-read-v2" if body.authorization else "http-state-replay-v1"
+    from http_authorization_policy import evaluate
+    business_boundary = evaluate(engagement['scope'], body.attack.url, rounds, body.authorization)
     for results in rounds:
         for response in results.values():
             response.pop("_transient_body", None)
     artifact = {"oracle": oracle, "rounds": rounds, "reproduced": reproduced, "repaired": repaired, "stable": stable,
                 "differential_match": differential_match, "semantic_checks": semantic_checks,
                 "repair_checks": repair_checks,
+                "business_boundary": business_boundary,
                 "assertion": {"principal_field": body.authorization.principal_field, "owner_field": body.authorization.owner_field} if body.authorization else None,
                 "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
     artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
@@ -637,7 +644,7 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                 'verification':{'status':'reproduced' if reproduced and stable else 'not_established',
                                 'formal_finding_created':False}}
     proof = final_core.VerificationInput(
-        oracle=oracle, attempts=2, reproduced=reproduced and stable,
+        oracle=oracle, attempts=2, reproduced=reproduced and stable and business_boundary['status'] == 'denied',
         counterevidence_checked=True, counterevidence_summary="Unauthenticated access denied; authenticated distinct principal read owner-bound object in both rounds" if reproduced else "Identity/object ownership assertions missing or not established; response differences alone are not proof",
         severity=body.severity, impact_description=body.impact_description,
         steps=["Replay authorized baseline", "Replay candidate attack", "Replay negative control", "Repeat the sequence"],
@@ -647,10 +654,15 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
         poc_artifact_ids=[artifact_id],
     )
     if proof.reproduced:
+        current = final_core.get_engagement(run['engagement_id'])
+        from http_authorization_policy import digest
+        if (current['current_scope_snapshot_id'] != run['scope_snapshot_id']
+                or digest(current['scope']) != business_boundary['scope_sha256']):
+            raise HTTPException(409, '项目授权或业务权限规则已变化，请重新复验')
         from verification_receipts import issue_receipt
         proof.receipt_id = issue_receipt(body.candidate_id, proof)
         result = final_core.verify_candidate(body.candidate_id, proof)
-    elif repaired:
+    elif repaired and business_boundary['status'] == 'denied':
         from verification_receipts import issue_fixed_receipt
         result = issue_fixed_receipt(body.candidate_id, oracle, artifact_id, repair_checks)
         final_core.add_event(run_id, "verification", "finding.verified_fixed",
@@ -659,6 +671,7 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                               "receipt_id": result["receipt_id"]})
     else:
         result = final_core.verify_candidate(body.candidate_id, proof)
+    result['business_boundary'] = business_boundary
     return {"artifact_id": artifact_id, "observation_id": observation_id, "replay": artifact, "verification": result}
 
 

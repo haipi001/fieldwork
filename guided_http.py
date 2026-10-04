@@ -114,4 +114,5 @@ def execute(candidate, binding, before_request, after_response=None):
     return {'binding_hash':binding['binding_hash'],'sources':binding['sources'],
             'artifact_id':result['artifact_id'],'status':result['verification']['status'],
             'checks':result['replay']['semantic_checks'], 'request_count':10,
+            'business_boundary':result['replay']['business_boundary'],
             'limitation':'已检验所选身份与对象字段；业务共享权限、实际影响及严重度仍待证据确认。'}

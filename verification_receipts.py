@@ -32,6 +32,8 @@ def issue_receipt(candidate_id, proof):
         scope = db.execute('SELECT * FROM scope_snapshots WHERE id=? AND confirmed_at IS NOT NULL', (run['scope_snapshot_id'],)).fetchone()
         if not scope or not proof.poc_artifact_ids:
             raise HTTPException(409, '复验缺少 Scope 或实际 Artifact')
+        if proof.oracle == 'http-authorization-read-v2':
+            _validate_current_http_scope(db, candidate, scope)
         artifacts = {}
         for artifact_id in set(proof.poc_artifact_ids):
             artifact = db.execute('SELECT * FROM artifacts WHERE id=? AND run_id=?', (artifact_id, run['id'])).fetchone()
@@ -40,6 +42,8 @@ def issue_receipt(candidate_id, proof):
             path = Path(artifact['uri'])
             if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != artifact['sha256']:
                 raise HTTPException(409, '复验证据缺失或已被修改')
+            if proof.oracle == 'http-authorization-read-v2':
+                _validate_http_business_boundary(path, core.load(scope['rules'], {}), candidate['target'])
             artifacts[artifact_id] = artifact['sha256']
         program_snapshot = None
         if proof.program_snapshot_id:
@@ -69,6 +73,8 @@ def validate_receipt(db, candidate, run, scope, proof):
                          (proof.receipt_id, candidate['id'])).fetchone() if proof.receipt_id else None
     if not receipt:
         raise HTTPException(409, '需要服务端真实复验收据；填写已复现字段不能生成 Verified Finding')
+    if proof.oracle == 'http-authorization-read-v2':
+        _validate_current_http_scope(db, candidate, scope)
     payload = core.load(receipt['result'], {})
     if (payload.get('schema') != 'verification-receipt/1' or payload.get('run_id') != run['id']
             or payload.get('candidate_fingerprint') != candidate_fingerprint(candidate)
@@ -92,7 +98,27 @@ def validate_receipt(db, candidate, run, scope, proof):
         path = Path(artifact['uri'])
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise HTTPException(409, '复验证据缺失或哈希校验失败')
+        if proof.oracle == 'http-authorization-read-v2':
+            _validate_http_business_boundary(path, core.load(scope['rules'], {}), candidate['target'])
     return receipt['id']
+
+
+def _validate_http_business_boundary(path, scope, target):
+    from http_authorization_policy import receipt_boundary_valid
+    try:
+        artifact = json.loads(path.read_text())
+        valid = isinstance(artifact, dict) and receipt_boundary_valid(artifact, scope, target)
+    except (ValueError, OSError, TypeError):
+        valid = False
+    if not valid:
+        raise HTTPException(409, 'HTTP 确认需要绑定已确认业务权限规则的实际复验证据')
+
+
+def _validate_current_http_scope(db, candidate, scope):
+    current = db.execute('SELECT current_scope_snapshot_id FROM engagements_v2 WHERE id=?',
+                         (candidate['engagement_id'],)).fetchone()
+    if not current or current['current_scope_snapshot_id'] != scope['id']:
+        raise HTTPException(409, '业务权限规则所属授权已变化，请重新复验')
 
 
 def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks):
@@ -127,6 +153,8 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks):
         digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
         if not digest or digest != artifact['sha256']:
             raise HTTPException(409, '修复复测 Artifact 缺失或哈希不一致')
+        _validate_current_http_scope(db, candidate, scope)
+        _validate_http_business_boundary(path, core.load(scope['rules'], {}), candidate['target'])
         receipt_id, timestamp = core.uid('receipt-fixed'), core.utcnow()
         payload = {
             'schema': 'fix-verification-receipt/1', 'finding_id': retest['finding_id'],

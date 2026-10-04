@@ -49,11 +49,13 @@ def object_server():
     ('changed', 'rejected', None),
     ('policy_changed', 'rejected', None),
     ('oracle_failed', 'rejected', None),
+    ('oracle_interrupted', 'rejected', None),
+    ('oracle_cancelled', 'rejected', None),
     ('auth_disallowed', 'rejected', None),
     ('evidence_changed', 'rejected', None),
     ('archived', 'rejected', None),
 ])
-def test_live_finalization_requires_business_boundary(client, object_server, monkeypatch, rule_case, expected, reason):
+def test_live_finalization_requires_business_boundary(client, object_server, monkeypatch, tmp_path, rule_case, expected, reason):
     origin, calls = object_server
     target = origin + '/object'
     rule = {'target': target, 'access': 'owner_only', 'source': 'Frozen local fixture ownership specification'}
@@ -91,14 +93,33 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
         severity='high', impact_description='Fixture record disclosure outside the configured permission',
         root_cause='Fixture missing object authorization', weakness='CWE-639', location=target)
     preview = http.preview_http_replay(run['id'], payload)
-    assert preview['can_prove'] == (rule_case in ('owner_only', 'allowlist_denied', 'shared', 'changed', 'policy_changed', 'oracle_failed', 'evidence_changed', 'archived'))
+    assert preview['can_prove'] == (rule_case in ('owner_only', 'allowlist_denied', 'shared', 'changed', 'policy_changed', 'oracle_failed', 'evidence_changed', 'archived', 'oracle_interrupted', 'oracle_cancelled'))
     assert calls == []
-    if rule_case == "oracle_failed":
+    if rule_case in {"oracle_failed", "oracle_interrupted"}:
         import v5_verification
         original_verifier = v5_verification._run_local_verifier
-        def fail_confirmation(_):
+        def fail_confirmation(_, **kwargs):
             raise RuntimeError("isolated oracle unavailable")
         monkeypatch.setattr(v5_verification, "_run_local_verifier", fail_confirmation)
+    if rule_case == 'oracle_cancelled':
+        import v5_verification
+        script = tmp_path / 'waiting-verifier.py'
+        script.write_text('import sys, time\nsys.stdin.buffer.read()\ntime.sleep(30)\n')
+        monkeypatch.setattr(v5_verification, 'CHILD_SCRIPT', script)
+        original_verifier = v5_verification._run_local_verifier
+        def cancel_during_verifier(execution_input, **kwargs):
+            with final_core.connect() as db:
+                job_id = db.execute('SELECT id FROM verification_jobs WHERE candidate_id=?', (candidate['id'],)).fetchone()['id']
+            responses = []
+            timer = threading.Timer(.35, lambda: responses.append(client.post(f'/api/v1/verification-jobs/{job_id}/cancel').status_code))
+            timer.start()
+            try:
+                return original_verifier(execution_input, **kwargs)
+            finally:
+                timer.cancel()
+                timer.join()
+                assert responses == [200]
+        monkeypatch.setattr(v5_verification, '_run_local_verifier', cancel_during_verifier)
     def after_response():
         if rule_case in {'evidence_changed', 'archived'} and len(calls) == 1:
             with final_core.connect() as db:
@@ -118,8 +139,8 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
                            (final_core.dump(scope), engagement['current_scope_snapshot_id']))
     if expected == 'rejected':
         from fastapi import HTTPException
-        error_type = HTTPException
-        message = '独立判定未完成' if rule_case == 'oracle_failed' else '执行策略已变化' if rule_case == 'policy_changed' else '未显式允许身份验证' if rule_case == 'auth_disallowed' else '证据材料已变化' if rule_case == 'evidence_changed' else '状态不允许复验' if rule_case == 'archived' else '业务权限规则已变化'
+        error_type = http.VerificationCancelled if rule_case == "oracle_cancelled" else HTTPException
+        message = '取消' if rule_case == 'oracle_cancelled' else '独立判定未完成' if rule_case in {'oracle_failed', 'oracle_interrupted'} else '执行策略已变化' if rule_case == 'policy_changed' else '未显式允许身份验证' if rule_case == 'auth_disallowed' else '证据材料已变化' if rule_case == 'evidence_changed' else '状态不允许复验' if rule_case == 'archived' else '业务权限规则已变化'
         with pytest.raises(error_type, match=message):
             http.execute_http_replay(run['id'], payload, after_response=after_response)
     else:
@@ -143,7 +164,7 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
                 task = db.execute('SELECT status FROM agent_tasks WHERE id=?', (result['independent_verification']['task_id'],)).fetchone()
                 assert task['status'] == 'succeeded'
     assert len(calls) == (0 if rule_case == 'auth_disallowed' else 1 if rule_case in {'policy_changed', 'evidence_changed', 'archived'} else 10)
-    if rule_case == 'oracle_failed':
+    if rule_case in {'oracle_failed', 'oracle_interrupted'}:
         from v5_verification import local_verifier_tick, get_receipt
         with final_core.connect() as db:
             job = db.execute('SELECT * FROM verification_jobs WHERE candidate_id=?', (candidate['id'],)).fetchone()
@@ -151,11 +172,26 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
             assert job['status'] == 'failed'
             checkpoint = final_core.load(job['result'])['replay_checkpoint']
             assert checkpoint['completed_responses'] == 10 and checkpoint['final_artifact_id']
+        if rule_case == 'oracle_interrupted':
+            with final_core.connect() as db:
+                db.execute("UPDATE verification_jobs SET status='running' WHERE id=?", (job['id'],))
+            final_core.init_final_db()
+            with final_core.connect() as db:
+                recovered = db.execute('SELECT * FROM verification_jobs WHERE id=?', (job['id'],)).fetchone()
+                assert recovered['status'] == 'interrupted' and recovered['result'] == job['result']
         monkeypatch.setattr(v5_verification, '_run_local_verifier', original_verifier)
         retried = local_verifier_tick(1, pending['request_id'])
         receipt = get_receipt(retried['completed'][0]['receipt_id'])
         assert receipt['integrity']['promotion_eligible'] and len(calls) == 10
 
+    if rule_case == 'oracle_cancelled':
+        with final_core.connect() as db:
+            job = db.execute('SELECT * FROM verification_jobs WHERE candidate_id=?', (candidate['id'],)).fetchone()
+            assert job['status'] == 'cancelled'
+            task = db.execute('SELECT status FROM agent_tasks').fetchone()
+            assert task['status'] == 'cancelled'
+            assert db.execute('SELECT count(*) FROM verification_receipts_v5').fetchone()[0] == 0
+            assert final_core.load(job['result'])['replay_checkpoint']['completed_responses'] == 10
     with final_core.connect() as db:
         assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0] == int(expected == 'verified')
         assert db.execute("SELECT count(*) FROM verification_attempts WHERE status='machine_receipt'").fetchone()[0] == int(expected == 'verified')

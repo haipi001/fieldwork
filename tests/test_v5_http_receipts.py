@@ -109,8 +109,8 @@ def test_receipt_stales_and_promotion_rejects_current_input_changes(client, monk
 def test_changed_evidence_between_oracle_and_issue_cannot_mint_receipt(client, monkeypatch, controlled_server):
     import v5_verification as verifier
     original = verifier._run_local_verifier
-    def changed(execution_input):
-        result, proof = original(execution_input)
+    def changed(execution_input, **kwargs):
+        result, proof = original(execution_input, **kwargs)
         with core.connect() as db:
             db.execute("UPDATE observations SET summary='Changed after independent oracle'")
         return result, proof

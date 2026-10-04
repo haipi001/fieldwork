@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -723,7 +724,35 @@ def _claim_local_verifier(db: sqlite3.Connection, request_id: str | None = None)
     return None
 
 
-def _run_local_verifier(execution_input: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+class LocalVerificationStopped(Exception):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _check_local_execution(task_id, request_id, execution_input):
+    with _core().connect() as db:
+        task = db.execute('SELECT * FROM agent_tasks WHERE id=?', (task_id,)).fetchone()
+        request = db.execute('SELECT * FROM verification_requests_v5 WHERE id=?', (request_id,)).fetchone()
+        if task and task['status'] == 'cancelled':
+            raise LocalVerificationStopped('cancelled')
+        if (not task or not request or task['status'] != 'running' or task['lease_owner'] != LOCAL_VERIFIER_ID
+                or not task['lease_expires_at'] or task['lease_expires_at'] <= _now()):
+            raise LocalVerificationStopped('lease_lost')
+        contract = _load(request['replay_contract_json'], {})
+        if contract.get('type') == 'http_object_read_v1':
+            traditional = 'verification_job_id' in contract
+            table, key = ('verification_jobs', 'verification_job_id') if traditional else ('guided_research_jobs', 'guided_job_id')
+            source = db.execute(f'SELECT cancel_requested FROM {table} WHERE id=?', (contract.get(key),)).fetchone()
+            if source and source['cancel_requested']:
+                raise LocalVerificationStopped('cancelled')
+        binding = {'request_id': request_id, 'verifier_task_id': task_id}
+        if (not _inputs_current(db, binding)
+                or _sha(_local_replay_input(db, request)) != _sha(execution_input)):
+            raise LocalVerificationStopped('inputs_changed')
+
+
+def _run_local_verifier(execution_input: dict[str, Any], check_current=None) -> tuple[dict[str, Any], dict[str, Any]]:
     encoded = _dump(execution_input).encode()
     if len(encoded) > 65_536:
         raise ValueError("local verifier input exceeds 64 KB")
@@ -759,6 +788,8 @@ def _run_local_verifier(execution_input: dict[str, Any]) -> tuple[dict[str, Any]
             f"(allow file-write* (subpath {quote(stage)}))",
         ])
         profile_digest = hashlib.sha256(profile.encode()).hexdigest()
+        if check_current:
+            check_current()
         process = subprocess.Popen(
             [str(sandbox), "-p", profile, str(executable), "-I", str(staged_script)], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=directory,
@@ -767,11 +798,24 @@ def _run_local_verifier(execution_input: dict[str, Any]) -> tuple[dict[str, Any]
                  "FIELDWORK_DENIED_CANARY": canary.name},
         )
         try:
-            stdout, _ = process.communicate(encoded, timeout=25)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            raise TimeoutError("isolated verifier timed out") from None
+            deadline = time.monotonic() + 25
+            first = True
+            while True:
+                if check_current:
+                    check_current()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('isolated verifier timed out')
+                try:
+                    stdout, _ = process.communicate(encoded if first else None, timeout=.2)
+                    if check_current:
+                        check_current()
+                    break
+                except subprocess.TimeoutExpired:
+                    first = False
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
         if hashlib.sha256(staged_script.read_bytes()).hexdigest() != script_digest:
             raise ValueError("isolated verifier script changed during replay")
     if process.returncode != 0 or len(stdout) > 8192:
@@ -810,7 +854,9 @@ def local_verifier_tick(limit: int = 1, request_id: str | None = None):
             contract = _load(request["replay_contract_json"], {})
             evidence_ids = _load(request["input_node_ids_json"], [])
         try:
-            result, proof = _run_local_verifier(execution_input)
+            check_current = lambda: _check_local_execution(task['id'], request['id'], execution_input)
+            result, proof = _run_local_verifier(execution_input, check_current=check_current)
+            check_current()
             package = contract.get('type') in {'package_applicability_v1', 'http_object_read_v1'}
             http_object = contract.get('type') == 'http_object_read_v1'
             receipt = _issue_receipt(task["id"], ReceiptIssue(
@@ -826,6 +872,16 @@ def local_verifier_tick(limit: int = 1, request_id: str | None = None):
                               "this does not establish a broader authorization vulnerability."]),
             ), process_attestation=proof)
             completed.append({"task_id": task["id"], "status": "succeeded", "receipt_id": receipt["id"]})
+        except LocalVerificationStopped as error:
+            with _core().connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current = db.execute('SELECT * FROM agent_tasks WHERE id=?', (task['id'],)).fetchone()
+                if current and current['status'] == 'running' and current['lease_owner'] == LOCAL_VERIFIER_ID:
+                    db.execute("UPDATE agent_tasks SET status=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,error_json=?,updated_at=? WHERE id=?",
+                               ('cancelled' if error.reason == 'cancelled' else 'failed',
+                                _dump({'code': 'local_verifier_stopped', 'reason': error.reason}), _now(), task['id']))
+                _sync_runner_jobs(db, LOCAL_VERIFIER_ID)
+            completed.append({'task_id': task['id'], 'status': 'stopped', 'reason': error.reason})
         except Exception as error:
             with _core().connect() as db:
                 db.execute("BEGIN IMMEDIATE")

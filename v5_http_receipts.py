@@ -59,7 +59,7 @@ def replay_input(db, request):
     if (not candidate or not job or not campaign or campaign['status'] != 'active'
             or candidate['status'] in {'archived', 'graveyard'} or campaign['engagement_id'] != candidate['engagement_id']
             or job['run_id'] != candidate['run_id'] or job['cancel_requested']
-            or job['status'] not in ({'running', 'completed', 'failed'} if traditional else {'running', 'completed', 'awaiting_input'})):
+            or job['status'] not in ({'running', 'completed', 'failed', 'interrupted'} if traditional else {'running', 'completed', 'awaiting_input'})):
         return None
     recorded = _load(job['result'], {})
     if traditional:

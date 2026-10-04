@@ -197,7 +197,7 @@ def test_local_verifier_child_failure_requeues_without_receipt(client, monkeypat
     try:
         base = f"http://127.0.0.1:{server.server_port}"
         request, _ = _request(client, base)
-        monkeypatch.setattr(v5_verification, "_run_local_verifier", lambda _contract: (_ for _ in ()).throw(TimeoutError()))
+        monkeypatch.setattr(v5_verification, "_run_local_verifier", lambda _contract, **kwargs: (_ for _ in ()).throw(TimeoutError()))
         tick = client.post("/api/v1/verification/local/tick")
         assert tick.status_code == 200
         assert tick.json()["completed"][0]["status"] == "failed_attempt"
@@ -246,3 +246,35 @@ def test_observed_receipt_loses_promotion_eligibility_after_scope_rotation(clien
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_waiting_real_sandbox_child_is_killed_and_reaped_on_cancel(monkeypatch, tmp_path):
+    import time
+    script = tmp_path / 'waiting-verifier.py'
+    script.write_text('import sys, time\nsys.stdin.buffer.read()\ntime.sleep(30)\n')
+    monkeypatch.setattr(v5_verification, 'CHILD_SCRIPT', script)
+    stopped = threading.Event()
+    processes, timers = [], []
+    original = v5_verification.subprocess.Popen
+    def observe_process(*args, **kwargs):
+        process = original(*args, **kwargs)
+        processes.append(process)
+        timer = threading.Timer(.35, stopped.set)
+        timer.start()
+        timers.append(timer)
+        return process
+    monkeypatch.setattr(v5_verification.subprocess, 'Popen', observe_process)
+    def current():
+        if stopped.is_set():
+            raise v5_verification.LocalVerificationStopped('cancelled')
+    started = time.monotonic()
+    try:
+        with pytest.raises(v5_verification.LocalVerificationStopped, match='cancelled'):
+            v5_verification._run_local_verifier({'type': 'package_applicability_v1'}, check_current=current)
+    finally:
+        for timer in timers:
+            timer.cancel()
+            timer.join()
+    assert time.monotonic() - started < 3
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert processes[0].returncode < 0

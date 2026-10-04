@@ -775,6 +775,10 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
                 tick = local_verifier_tick(1, request['request_id'])
                 completed = next((entry for entry in tick['completed'] if entry.get('receipt_id')), None)
                 if not completed:
+                    if tick['completed']:
+                        ledger_request.update(status=tick['completed'][0]['status'], reason=tick['completed'][0].get('reason'))
+                    if job_id and _job_cancel_requested(job_id):
+                        raise VerificationCancelled('用户取消了复验')
                     raise HTTPException(409, '独立判定未完成，已保存材料与验证任务')
                 independent = get_receipt(completed['receipt_id'])
                 ledger_request.update(receipt_id=independent['id'], status=independent['result']['status'])

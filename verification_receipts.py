@@ -48,6 +48,8 @@ def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
                 raise HTTPException(409, '复验证据缺失或已被修改')
             if proof.oracle == 'http-authorization-read-v2':
                 _validate_http_business_boundary(path, core.load(scope['rules'], {}), candidate['target'])
+                if not v5_receipt_id:
+                    _validate_independent_http(path, core.load(scope['rules'], {}), candidate['target'], 'positive')
             artifacts[artifact_id] = artifact['sha256']
         program_snapshot = None
         if proof.program_snapshot_id:
@@ -181,6 +183,8 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_
             raise HTTPException(409, '修复复测 Artifact 缺失或哈希不一致')
         _validate_current_http_scope(db, candidate, scope)
         _validate_http_business_boundary(path, core.load(scope['rules'], {}), candidate['target'])
+        if not v5_receipt_id:
+            _validate_independent_http(path, core.load(scope['rules'], {}), candidate['target'], 'repaired_negative')
         receipt_id, timestamp = core.uid('receipt-fixed'), core.utcnow()
         payload = {
             'schema': 'fix-verification-receipt/1', 'finding_id': retest['finding_id'],
@@ -209,3 +213,13 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_
         db.execute("UPDATE candidate_findings SET status='verified_fixed',updated_at=? WHERE id=?", (timestamp, candidate_id))
     return {'id': retest['finding_id'], 'candidate_id': candidate_id, 'status': 'verified_fixed',
             'receipt_id': receipt_id, 'lifecycle_status': 'verified_fixed'}
+
+
+def _validate_independent_http(path, scope, target, classification):
+    from http_independent_confirmation import valid
+    try:
+        accepted = valid(json.loads(path.read_text()), scope, target, classification)
+    except (ValueError, OSError, TypeError):
+        accepted = False
+    if not accepted:
+        raise HTTPException(409, "HTTP 收据需要独立沙箱确认及当前材料绑定")

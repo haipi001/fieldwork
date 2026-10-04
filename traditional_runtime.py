@@ -565,6 +565,29 @@ def _job_cancel_requested(job_id: str) -> bool:
 def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False, source_snapshot=None):
     import final_core
     run, engagement, specs, names = prepare_http_replay(run_id, body)
+    # Formal HTTP results must always use supervised transport, even if a caller
+    # explicitly supplies isolated_transport=False.
+    isolated_transport = isolated_transport or finalize
+    if finalize:
+        from http_authorization_policy import digest
+        from verification_receipts import candidate_fingerprint
+        with final_core.connect() as db:
+            original_candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (body.candidate_id,)).fetchone()
+        original_candidate_sha = candidate_fingerprint(original_candidate)
+        def check_formal_inputs():
+            current = final_core.get_engagement(run['engagement_id'])
+            if (current['current_scope_snapshot_id'] != run['scope_snapshot_id']
+                    or digest(current['scope']) != digest(engagement['scope'])):
+                raise HTTPException(409, '项目授权或业务权限规则已变化，请重新复验')
+            if (current['current_policy_id'] != run['policy_id']
+                    or digest(current['policy']) != digest(engagement['policy'])):
+                raise HTTPException(409, '执行策略已变化，请重新复验')
+            with final_core.connect() as db:
+                candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (body.candidate_id,)).fetchone()
+            if (not candidate or candidate_fingerprint(candidate) != original_candidate_sha
+                    or candidate['status'] in {'verified', 'archived', 'graveyard'}):
+                raise HTTPException(409, '候选材料或状态已变化，请重新复验')
+        check_formal_inputs()
     rate = max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
     interval = 1 / rate
     rounds = []
@@ -576,6 +599,8 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                 raise VerificationCancelled("用户取消了复验")
             if job_id:
                 _job_update(job_id, phase=f"第 {replay_index + 1} 轮 · {name}")
+            if finalize:
+                check_formal_inputs()
             if before_request:
                 before_request(replay_index, name)
             addresses = network_guard(engagement, spec)
@@ -585,6 +610,8 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
             if isolated_transport:
                 from v5_http_transport import request_once as isolated_request
                 def check_current():
+                    if finalize:
+                        check_formal_inputs()
                     if job_id and _job_cancel_requested(job_id):
                         raise VerificationCancelled("用户取消了复验")
                     if before_request:
@@ -629,6 +656,14 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                 "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
     if isolated_transport:
         artifact['source_snapshot'] = source_snapshot
+    if finalize:
+        check_formal_inputs()
+    if finalize and body.authorization:
+        from http_independent_confirmation import confirm
+        artifact["independent_confirmation"] = confirm(artifact, engagement["scope"], body.attack.url)
+        check_formal_inputs()
+        if job_id and _job_cancel_requested(job_id):
+            raise VerificationCancelled("用户取消了复验")
     artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
     with final_core.connect() as db:
         db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
@@ -658,8 +693,11 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
         return {'artifact_id':artifact_id,'observation_id':observation_id,'replay':artifact,
                 'verification':{'status':'reproduced' if reproduced and stable else 'not_established',
                                 'formal_finding_created':False}}
+    from http_independent_confirmation import valid as independently_valid
+    independently_positive = independently_valid(artifact, engagement["scope"], body.attack.url, "positive")
+    independently_repaired = independently_valid(artifact, engagement["scope"], body.attack.url, "repaired_negative")
     proof = final_core.VerificationInput(
-        oracle=oracle, attempts=2, reproduced=reproduced and stable and business_boundary['status'] == 'denied',
+        oracle=oracle, attempts=2, reproduced=independently_positive and business_boundary['status'] == 'denied',
         counterevidence_checked=True, counterevidence_summary="Unauthenticated access denied; authenticated distinct principal read owner-bound object in both rounds" if reproduced else "Identity/object ownership assertions missing or not established; response differences alone are not proof",
         severity=body.severity, impact_description=body.impact_description,
         steps=["Replay authorized baseline", "Replay candidate attack", "Replay negative control", "Repeat the sequence"],
@@ -677,7 +715,7 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
         from verification_receipts import issue_receipt
         proof.receipt_id = issue_receipt(body.candidate_id, proof)
         result = final_core.verify_candidate(body.candidate_id, proof)
-    elif repaired and business_boundary['status'] == 'denied':
+    elif independently_repaired and business_boundary['status'] == 'denied':
         from verification_receipts import issue_fixed_receipt
         result = issue_fixed_receipt(body.candidate_id, oracle, artifact_id, repair_checks)
         final_core.add_event(run_id, "verification", "finding.verified_fixed",

@@ -3464,12 +3464,13 @@ def test_http_verification_job_can_be_cancelled_without_persisting_credentials(c
         'observation_ids':[obs['id']]}).json()
     entered, release = threading.Event(), threading.Event()
 
-    def delayed_request(_):
+    def delayed_request(*args, **kwargs):
         entered.set(); release.wait(2)
         return {'status': 200, 'body_sha256':'fixture', 'body_bytes':2,
                 'headers':{}, 'body_preview':'{}', '_transient_body':'{}'}
 
-    monkeypatch.setattr(traditional_runtime, 'request_once', delayed_request)
+    import v5_http_transport
+    monkeypatch.setattr(v5_http_transport, 'request_once', delayed_request)
     payload = {
         'candidate_id':candidate['id'],
         'baseline':{'url':candidate['target'],'headers':{'Authorization':'Bearer owner-secret'}},

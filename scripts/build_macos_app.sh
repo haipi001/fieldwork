@@ -10,6 +10,22 @@ ICONSET="$BUILD_ROOT/$APP_NAME.iconset"
 
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" "$ICONSET"
 cp "$PROJECT_ROOT/macos/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+python3 - "$PROJECT_ROOT" "$APP_BUNDLE/Contents/Info.plist" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from version import APP_VERSION, BUILD_NUMBER
+
+path = Path(sys.argv[2])
+with path.open('rb') as stream:
+    metadata = plistlib.load(stream)
+metadata['CFBundleShortVersionString'] = APP_VERSION
+metadata['CFBundleVersion'] = str(BUILD_NUMBER)
+with path.open('wb') as stream:
+    plistlib.dump(metadata, stream, sort_keys=False)
+PY
 
 swiftc "$PROJECT_ROOT/macos/FieldworkApp.swift" \
   -target arm64-apple-macos13.0 \

@@ -2870,22 +2870,25 @@ def test_web3_verified_finding_requires_program_gates_and_immunefi_ready(client)
     assert client.get(f"/api/v1/findings?run_id={run_id}").json()["verified"] == []
 
 
-def test_real_http_replay_oracle_with_negative_control(client):
+@pytest.mark.parametrize("changed_principal", [None, "reader", "owner"])
+def test_real_http_replay_oracle_with_negative_control(client, changed_principal):
     class Handler(BaseHTTPRequestHandler):
         fixed = False
+        owner = "tenant-a"
+        reader = "tenant-b"
         def do_GET(self):
             role = self.headers.get("X-Role")
             if not role:
                 self.send_response(401); self.end_headers(); self.wfile.write(b'{"error":"unauthenticated"}')
             elif self.path == "/me":
                 self.send_response(200); self.end_headers()
-                self.wfile.write(json.dumps({"id": "tenant-a" if role == "owner" else "tenant-b"}).encode())
+                self.wfile.write(json.dumps({"id": Handler.owner if role == "owner" else Handler.reader}).encode())
             elif self.path == "/api/object/42":
                 if role == "other" and Handler.fixed:
                     self.send_response(403); self.end_headers(); self.wfile.write(b'{"error":"forbidden"}')
                     return
                 self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
-                self.wfile.write(b'{"owner":"tenant-a","id":42}')
+                self.wfile.write(json.dumps({'owner': Handler.owner, 'id': 42}).encode())
             else:
                 self.send_response(404); self.end_headers(); self.wfile.write(b'{"error":"not found"}')
         def log_message(self, *_):
@@ -2896,7 +2899,7 @@ def test_real_http_replay_oracle_with_negative_control(client):
         port = server.server_port
         created = client.post("/api/v1/engagements", json={
             "name": "Local HTTP oracle", "target": f"http://127.0.0.1:{port}", "mode": "traditional",
-            "scope": {"allow_private_ips": True, "http_object_read_rules": [{
+            "scope": {"allow_private_ips": True, "allow_authentication": True, "http_object_read_rules": [{
                 "target": f"http://127.0.0.1:{port}/api/object/42", "access": "owner_only",
                 "source": "Local fixture contract: this object is private to its owner",
             }]}, "policy": {"max_requests_per_second": 200},
@@ -3000,6 +3003,7 @@ def test_real_http_replay_oracle_with_negative_control(client):
             actual_proof = json.loads(bundle.read(proof_path))
             assert len(actual_proof['rounds']) == 2
             assert actual_proof['stable'] is True
+            assert 'proof/v5-verification.json' in bundle.namelist()
             assert 'proof/environment.json' in bundle.namelist()
             assert 'proof/steps.md' in bundle.namelist()
             assert 'proof/expected.json' in bundle.namelist()
@@ -3027,6 +3031,17 @@ def test_real_http_replay_oracle_with_negative_control(client):
         assert planned.status_code == 201 and planned.json()['candidate_id'].startswith('candidate-')
         Handler.fixed = True
         fixed_payload = {**payload, 'candidate_id': planned.json()['candidate_id']}
+        if changed_principal:
+            if changed_principal == 'reader':
+                Handler.reader = 'different-reader'
+            else:
+                Handler.owner = 'different-owner'
+            rejected_fix = client.post(f'/api/v1/traditional/runs/{retest_run}/http-replay', json=fixed_payload)
+            assert rejected_fix.status_code == 409 and '旧所有者' in rejected_fix.json()['detail']
+            assert client.get(f'/api/v1/findings/{finding_id}/lifecycle').json()['status'] == 'retest_required'
+            with final_core.connect() as db:
+                assert db.execute("SELECT count(*) FROM verification_attempts WHERE status='machine_negative_receipt'").fetchone()[0] == 0
+            Handler.owner, Handler.reader = 'tenant-a', 'tenant-b'
         fixed = client.post(f'/api/v1/traditional/runs/{retest_run}/http-replay', json=fixed_payload)
         assert fixed.status_code == 200, fixed.text
         assert fixed.json()['verification']['status'] == 'verified_fixed'
@@ -3040,9 +3055,10 @@ def test_real_http_replay_oracle_with_negative_control(client):
                 (planned.json()['candidate_id'],),
             ).fetchone()
         assert negative is not None and final_core.load(negative['result'], {})['schema'] == 'fix-verification-receipt/1'
+        assert final_core.load(negative['result'])['v5_verification_receipt_id'] == fixed.json()['independent_verification']['receipt_id']
         (traditional_runtime.ARTIFACT_ROOT/f"{data['artifact_id']}.json").write_text('tampered')
         rejected = client.post(f'/api/v1/findings/{finding_id}/reports/hackerone/export')
-        assert rejected.status_code == 409 and '哈希' in rejected.json()['detail']
+        assert rejected.status_code == 409 and ('哈希' in rejected.json()['detail'] or 'inputs changed' in rejected.json()['detail'])
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
@@ -3451,7 +3467,7 @@ def test_authorization_oracle_rejects_normal_and_ambiguous_responses():
 def test_http_verification_job_can_be_cancelled_without_persisting_credentials(client, monkeypatch):
     created = client.post("/api/v1/engagements", json={
         "name": "Cancelable verification", "target": "http://127.0.0.1:8123", "mode": "traditional",
-        "scope": {"allow_private_ips": True}, "policy": {"max_requests_per_second": 200},
+        "scope": {"allow_private_ips": True, "allow_authentication": True}, "policy": {"max_requests_per_second": 200},
     }).json()
     ready = client.post(f"/api/v1/engagements/{created['id']}/confirm").json()
     run_id = client.post(f"/api/v1/engagements/{ready['id']}/start").json()['id']

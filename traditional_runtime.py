@@ -521,7 +521,7 @@ def preview_http_replay(run_id: str, body: HttpReplayInput):
             "rounds": 2, "request_count": len(specs) * 2,
             "requests": [{"role": name, "method": spec.method, "url": redact(spec.url)} for name, spec in zip(names, specs)],
             "max_requests_per_second": engagement["policy"].get("max_requests_per_second", 1),
-            "can_prove": bool(body.authorization and rule and rule['access'] != 'public'),
+            "can_prove": bool(body.authorization and engagement["scope"].get("allow_authentication") and rule and rule['access'] != 'public'),
             "business_rule_reason": rule_reason,
             "business_rule_required": True, "sends_requests": False,
             "checks": ["两个已登录且不同的主体", "基线对象归属与主体一致", "另一主体读取同一对象", "未登录访问被拒绝", "两轮结果稳定"],
@@ -562,13 +562,47 @@ def _job_cancel_requested(job_id: str) -> bool:
     return bool(row and row["cancel_requested"])
 
 
-def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False, source_snapshot=None, checkpoint_callback=None):
+def execute_http_replay(run_id, body, job_id=None, **options):
+    """Give synchronous formal replays the same durable job lineage as async ones."""
+    import final_core as f
+    owned = job_id is None and options.get('finalize', True) and body.authorization is not None
+    if owned:
+        prepare_http_replay(run_id, body)
+        with f.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM verification_jobs WHERE candidate_id=? AND status IN ('queued','running','cancelling')", (body.candidate_id,)).fetchone():
+                raise HTTPException(409, '这条候选已有正在执行的复验')
+            job_id, now = f.uid('verify-job'), f.utcnow()
+            db.execute('INSERT INTO verification_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       (job_id, body.candidate_id, run_id, 'http-authorization-read-v2', 'running',
+                        '准备独立复验', 0, 10, 0, None, None, now, now, None))
+    try:
+        result = _execute_http_replay(run_id, body, job_id, **options)
+    except Exception as error:
+        if owned:
+            _job_update(job_id, status='cancelled' if isinstance(error, VerificationCancelled) else 'failed',
+                        phase='复验未完成，已保留材料', error=type(error).__name__, completed=True)
+        raise
+    if owned:
+        _job_update(job_id, status='completed', phase='复验完成', result=result, completed=True)
+    return result
+
+
+def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None = None, *, finalize: bool = True, before_request=None, after_response=None, isolated_transport: bool = False, source_snapshot=None, checkpoint_callback=None):
     import final_core
     run, engagement, specs, names = prepare_http_replay(run_id, body)
     # Formal HTTP results must always use supervised transport, even if a caller
     # explicitly supplies isolated_transport=False.
     isolated_transport = isolated_transport or finalize
     if finalize:
+        if body.authorization and not engagement['scope'].get('allow_authentication'):
+            raise HTTPException(409, '冻结 Scope 未显式允许身份验证')
+        if body.authorization:
+            allowed_hosts = {(urlparse(engagement['normalized_target']).hostname or '').lower().rstrip('.'),
+                             *(str(host).lower().rstrip('.') for host in engagement['scope'].get('auth_allowed_hosts', []))}
+            for spec in specs:
+                if spec.headers and (urlparse(spec.url).hostname or '').lower().rstrip('.') not in allowed_hosts:
+                    raise HTTPException(409, '认证请求域名未列入冻结 Scope')
         from http_authorization_policy import digest
         from verification_receipts import candidate_fingerprint
         with final_core.connect() as db:
@@ -576,6 +610,10 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
         original_candidate_sha = candidate_fingerprint(original_candidate)
         def check_formal_inputs():
             current = final_core.get_engagement(run['engagement_id'])
+            with final_core.connect() as db:
+                current_run = db.execute('SELECT status FROM analysis_runs WHERE id=?', (run_id,)).fetchone()
+            if current['status'] == 'archived' or not current_run or current_run['status'] not in {'running', 'paused', 'completed'}:
+                raise HTTPException(409, '项目或运行状态不允许复验')
             if (current['current_scope_snapshot_id'] != run['scope_snapshot_id']
                     or digest(current['scope']) != digest(engagement['scope'])):
                 raise HTTPException(409, '项目授权或业务权限规则已变化，请重新复验')
@@ -587,21 +625,39 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
             if (not candidate or candidate_fingerprint(candidate) != original_candidate_sha
                     or candidate['status'] in {'verified', 'archived', 'graveyard'}):
                 raise HTTPException(409, '候选材料或状态已变化，请重新复验')
+            if source_snapshot is not None and body.authorization:
+                from v5_http_receipts import capture_sources
+                with final_core.connect() as db:
+                    current_sources = capture_sources(db, body.candidate_id,
+                        {'principal_field': body.authorization.principal_field, 'owner_field': body.authorization.owner_field},
+                        traditional=True)
+                if digest(current_sources) != digest(source_snapshot):
+                    raise HTTPException(409, '候选证据材料已变化，请重新复验')
         check_formal_inputs()
+        if body.authorization:
+            from v5_http_receipts import capture_sources
+            with final_core.connect() as db:
+                source_snapshot = capture_sources(db, body.candidate_id,
+                    {'principal_field': body.authorization.principal_field, 'owner_field': body.authorization.owner_field},
+                    traditional=True)
     rate = max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
     interval = 1 / rate
     rounds = []
     completed_requests = 0
     checkpoint_result = None
+    ledger_request = None
     def checkpoint(state, *, error_type=None, final_artifact_id=None):
         nonlocal checkpoint_result
+        if final_artifact_id is None and checkpoint_result:
+            final_artifact_id = checkpoint_result.get('final_artifact_id')
         from http_replay_checkpoints import persist
         checkpoint_result = persist(run, body.candidate_id, rounds, len(specs) * 2,
                                     previous=checkpoint_result['artifact_id'] if checkpoint_result else None,
                                     state=state, error_type=error_type, final_artifact_id=final_artifact_id)
         if job_id:
             _job_update(job_id, completed_requests=completed_requests,
-                        result={'replay_checkpoint': checkpoint_result})
+                        result={'replay_checkpoint': checkpoint_result,
+                                **({'independent_verification': ledger_request} if ledger_request else {})})
         if checkpoint_callback:
             checkpoint_callback(checkpoint_result)
     try:
@@ -668,16 +724,13 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
                     "business_boundary": business_boundary,
                     "assertion": {"principal_field": body.authorization.principal_field, "owner_field": body.authorization.owner_field} if body.authorization else None,
                     "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
+        if finalize and body.authorization:
+            artifact['review_notes'] = redact_structure({'severity': body.severity, 'impact_description': body.impact_description,
+                                                       'root_cause': body.root_cause, 'machine_verified': False})
         if isolated_transport:
             artifact['source_snapshot'] = source_snapshot
         if finalize:
             check_formal_inputs()
-        if finalize and body.authorization:
-            from http_independent_confirmation import confirm
-            artifact["independent_confirmation"] = confirm(artifact, engagement["scope"], body.attack.url)
-            check_formal_inputs()
-            if job_id and _job_cancel_requested(job_id):
-                raise VerificationCancelled("用户取消了复验")
         artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
         with final_core.connect() as db:
             db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
@@ -708,9 +761,29 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
             return {'artifact_id':artifact_id,'observation_id':observation_id,'replay':artifact,
                     'verification':{'status':'reproduced' if reproduced and stable else 'not_established',
                                     'formal_finding_created':False}}
-        from http_independent_confirmation import valid as independently_valid
-        independently_positive = independently_valid(artifact, engagement["scope"], body.attack.url, "positive")
-        independently_repaired = independently_valid(artifact, engagement["scope"], body.attack.url, "repaired_negative")
+        independent = None
+        if body.authorization:
+            from http_authorization_policy import select_rule
+            rule, _ = select_rule(engagement['scope'], body.attack.url)
+            if rule:
+                from v5_http_receipts import request_for_job, canonical_for_receipt
+                from v5_verification import local_verifier_tick, get_receipt
+                check_formal_inputs()
+                request = request_for_job(job_id, body.candidate_id, artifact_id, traditional=True)
+                ledger_request = {**request, 'status': 'queued'}
+                _job_update(job_id, result={'replay_checkpoint': checkpoint_result, 'independent_verification': ledger_request})
+                tick = local_verifier_tick(1, request['request_id'])
+                completed = next((entry for entry in tick['completed'] if entry.get('receipt_id')), None)
+                if not completed:
+                    raise HTTPException(409, '独立判定未完成，已保存材料与验证任务')
+                independent = get_receipt(completed['receipt_id'])
+                ledger_request.update(receipt_id=independent['id'], status=independent['result']['status'])
+                check_formal_inputs()
+                if job_id and _job_cancel_requested(job_id):
+                    raise VerificationCancelled('用户取消了复验')
+                canonical_for_receipt(independent['id'])
+        independently_positive = bool(independent and independent['result']['classification'] == 'positive')
+        independently_repaired = bool(independent and independent['result']['classification'] == 'repaired_negative')
         proof = final_core.VerificationInput(
             oracle=oracle, attempts=2, reproduced=independently_positive and business_boundary['status'] == 'denied',
             counterevidence_checked=True, counterevidence_summary="Unauthenticated access denied; authenticated distinct principal read owner-bound object in both rounds" if reproduced else "Identity/object ownership assertions missing or not established; response differences alone are not proof",
@@ -722,25 +795,22 @@ def execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None =
             poc_artifact_ids=[artifact_id],
         )
         if proof.reproduced:
-            current = final_core.get_engagement(run['engagement_id'])
-            from http_authorization_policy import digest
-            if (current['current_scope_snapshot_id'] != run['scope_snapshot_id']
-                    or digest(current['scope']) != business_boundary['scope_sha256']):
-                raise HTTPException(409, '项目授权或业务权限规则已变化，请重新复验')
-            from verification_receipts import issue_receipt
-            proof.receipt_id = issue_receipt(body.candidate_id, proof)
-            result = final_core.verify_candidate(body.candidate_id, proof)
+            from v5_http_receipts import finding_plan, promote_finding
+            plan = finding_plan(independent['id'])
+            result = promote_finding(independent['id'], plan['source_fingerprint'])
         elif independently_repaired and business_boundary['status'] == 'denied':
-            from verification_receipts import issue_fixed_receipt
-            result = issue_fixed_receipt(body.candidate_id, oracle, artifact_id, repair_checks)
-            final_core.add_event(run_id, "verification", "finding.verified_fixed",
-                                 "两轮身份边界负向复测均拒绝旧攻击，Finding 已确认修复",
-                                 {"finding_id": result["id"], "candidate_id": body.candidate_id,
-                                  "receipt_id": result["receipt_id"]})
+            from v5_http_receipts import fixed_plan, confirm_fixed
+            plan = fixed_plan(independent['id'])
+            result = confirm_fixed(independent['id'], plan['source_fingerprint'])
         else:
             result = final_core.verify_candidate(body.candidate_id, proof)
         result['business_boundary'] = business_boundary
-        return {"artifact_id": artifact_id, "observation_id": observation_id, "replay": artifact, "verification": result}
+        outcome = {"artifact_id": artifact_id, "observation_id": observation_id, "replay": artifact, "verification": result,
+                   "replay_checkpoint": checkpoint_result}
+        if independent:
+            outcome['independent_verification'] = {'receipt_id': independent['id'], 'request_id': request['request_id'],
+                                                  'task_id': request['task_id'], 'status': independent['result']['status']}
+        return outcome
     except Exception as error:
         state = 'cancelled' if isinstance(error, VerificationCancelled) or type(error).__name__ == 'Cancelled' else 'failed'
         checkpoint(state, error_type=type(error).__name__)

@@ -49,6 +49,9 @@ def object_server():
     ('changed', 'rejected', None),
     ('policy_changed', 'rejected', None),
     ('oracle_failed', 'rejected', None),
+    ('auth_disallowed', 'rejected', None),
+    ('evidence_changed', 'rejected', None),
+    ('archived', 'rejected', None),
 ])
 def test_live_finalization_requires_business_boundary(client, object_server, monkeypatch, rule_case, expected, reason):
     origin, calls = object_server
@@ -63,7 +66,7 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
     rules = [] if rule_case == 'missing' else [rule, rule] if rule_case == 'ambiguous' else [rule]
     response = client.post('/api/v1/engagements', json={
         'name': 'Business boundary fixture', 'target': origin, 'mode': 'traditional',
-        'scope': {'allow_private_ips': True, 'allow_authentication': True, 'http_object_read_rules': rules},
+        'scope': {'allow_private_ips': True, 'allow_authentication': rule_case != 'auth_disallowed', 'http_object_read_rules': rules},
         'policy': {'max_requests_per_second': 1000},
     })
     assert response.status_code == 201
@@ -88,14 +91,21 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
         severity='high', impact_description='Fixture record disclosure outside the configured permission',
         root_cause='Fixture missing object authorization', weakness='CWE-639', location=target)
     preview = http.preview_http_replay(run['id'], payload)
-    assert preview['can_prove'] == (rule_case in ('owner_only', 'allowlist_denied', 'shared', 'changed', 'policy_changed', 'oracle_failed'))
+    assert preview['can_prove'] == (rule_case in ('owner_only', 'allowlist_denied', 'shared', 'changed', 'policy_changed', 'oracle_failed', 'evidence_changed', 'archived'))
     assert calls == []
     if rule_case == "oracle_failed":
         import v5_verification
+        original_verifier = v5_verification._run_local_verifier
         def fail_confirmation(_):
             raise RuntimeError("isolated oracle unavailable")
         monkeypatch.setattr(v5_verification, "_run_local_verifier", fail_confirmation)
     def after_response():
+        if rule_case in {'evidence_changed', 'archived'} and len(calls) == 1:
+            with final_core.connect() as db:
+                if rule_case == 'evidence_changed':
+                    db.execute("UPDATE observations SET summary='Evidence revised during replay' WHERE id=?", (observation['id'],))
+                else:
+                    db.execute("UPDATE engagements_v2 SET status='archived' WHERE id=?", (engagement['id'],))
         if rule_case == "policy_changed" and len(calls) == 1:
             with final_core.connect() as db:
                 db.execute("UPDATE execution_policies SET policy=? WHERE id=?",
@@ -108,8 +118,8 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
                            (final_core.dump(scope), engagement['current_scope_snapshot_id']))
     if expected == 'rejected':
         from fastapi import HTTPException
-        error_type = RuntimeError if rule_case == 'oracle_failed' else HTTPException
-        message = 'oracle unavailable' if rule_case == 'oracle_failed' else '执行策略已变化' if rule_case == 'policy_changed' else '业务权限规则已变化'
+        error_type = HTTPException
+        message = '独立判定未完成' if rule_case == 'oracle_failed' else '执行策略已变化' if rule_case == 'policy_changed' else '未显式允许身份验证' if rule_case == 'auth_disallowed' else '证据材料已变化' if rule_case == 'evidence_changed' else '状态不允许复验' if rule_case == 'archived' else '业务权限规则已变化'
         with pytest.raises(error_type, match=message):
             http.execute_http_replay(run['id'], payload, after_response=after_response)
     else:
@@ -118,35 +128,34 @@ def test_live_finalization_requires_business_boundary(client, object_server, mon
         assert result['verification']['status'] == expected
         assert result['replay']['business_boundary']['reason'] == reason
         if rule_case == 'owner_only':
-            import copy
-            from http_independent_confirmation import valid
-            from verification_receipts import _validate_independent_http
-            confirmation = result['replay']['independent_confirmation']
-            process = confirmation['process_execution']
-            assert process['network_denied'] is True and process['file_read_denied'] is True
-            transport_pids = {response['process_execution']['child_pid']
-                              for group in result['replay']['rounds'] for response in group.values()}
-            assert process['child_pid'] not in transport_pids
-            assert valid(result['replay'], engagement['scope'], target, 'positive')
-            for mutation in ('missing', 'input', 'network', 'classification', 'material'):
-                altered = copy.deepcopy(result['replay'])
-                if mutation == 'missing':
-                    altered.pop('independent_confirmation')
-                elif mutation == 'input':
-                    altered['independent_confirmation']['process_execution']['input_sha256'] = '0' * 64
-                elif mutation == 'network':
-                    altered['independent_confirmation']['process_execution']['network_denied'] = False
-                elif mutation == 'classification':
-                    altered['independent_confirmation']['result']['classification'] = 'repaired_negative'
-                else:
-                    altered['rounds'][0]['attack']['body_sha256'] = '0' * 64
-                assert not valid(altered, engagement['scope'], target, 'positive')
-                altered_path = http.ARTIFACT_ROOT / 'altered-confirmation.json'
-                altered_path.write_text(json.dumps(altered))
-                from fastapi import HTTPException
-                with pytest.raises(HTTPException, match='独立沙箱确认'):
-                    _validate_independent_http(altered_path, engagement['scope'], target, 'positive')
-    assert len(calls) == (1 if rule_case == 'policy_changed' else 10)
+            from v5_verification import get_receipt
+            receipt = get_receipt(result['independent_verification']['receipt_id'])
+            assert receipt['result']['classification'] == 'positive'
+            assert receipt['integrity']['promotion_eligible']
+            finding = final_core.get_finding(result['verification']['id'])
+            assert finding['severity'] == 'unknown'
+            assert 'source implementation has not been examined' in finding['verification']['root_cause']
+            assert result['replay']['review_notes']['severity'] == 'high'
+            assert result['replay']['review_notes']['machine_verified'] is False
+            with final_core.connect() as db:
+                machine = db.execute("SELECT result FROM verification_attempts WHERE status='machine_receipt'").fetchone()
+                assert final_core.load(machine['result'])['v5_verification_receipt_id'] == receipt['id']
+                task = db.execute('SELECT status FROM agent_tasks WHERE id=?', (result['independent_verification']['task_id'],)).fetchone()
+                assert task['status'] == 'succeeded'
+    assert len(calls) == (0 if rule_case == 'auth_disallowed' else 1 if rule_case in {'policy_changed', 'evidence_changed', 'archived'} else 10)
+    if rule_case == 'oracle_failed':
+        from v5_verification import local_verifier_tick, get_receipt
+        with final_core.connect() as db:
+            job = db.execute('SELECT * FROM verification_jobs WHERE candidate_id=?', (candidate['id'],)).fetchone()
+            pending = final_core.load(job['result'])['independent_verification']
+            assert job['status'] == 'failed'
+            checkpoint = final_core.load(job['result'])['replay_checkpoint']
+            assert checkpoint['completed_responses'] == 10 and checkpoint['final_artifact_id']
+        monkeypatch.setattr(v5_verification, '_run_local_verifier', original_verifier)
+        retried = local_verifier_tick(1, pending['request_id'])
+        receipt = get_receipt(retried['completed'][0]['receipt_id'])
+        assert receipt['integrity']['promotion_eligible'] and len(calls) == 10
+
     with final_core.connect() as db:
         assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0] == int(expected == 'verified')
         assert db.execute("SELECT count(*) FROM verification_attempts WHERE status='machine_receipt'").fetchone()[0] == int(expected == 'verified')

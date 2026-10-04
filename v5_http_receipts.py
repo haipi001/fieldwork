@@ -10,7 +10,7 @@ KIND = 'http_object_read_v1'
 TABLES = {'evidence_v2', 'observations', 'http_exchanges', 'identity_profiles', 'identities'}
 
 
-def capture_sources(db, candidate_id, binding):
+def capture_sources(db, candidate_id, binding, *, traditional=False):
     import final_core as f
     from verification_receipts import candidate_fingerprint
     from v5_verification import _sha
@@ -29,15 +29,16 @@ def capture_sources(db, candidate_id, binding):
     for identifier in f.load(candidate['evidence_ids'], []):
         evidence = add('evidence_v2', identifier)
         add('observations', evidence['observation_id'])
-    for identifier in binding['sources']:
-        add('http_exchanges', identifier)
-    for identifier in (binding['owner_identity_id'], binding['other_identity_id']):
-        add('identity_profiles', identifier)
-        add('identities', identifier)
+    if not traditional:
+        for identifier in binding['sources']:
+            add('http_exchanges', identifier)
+        for identifier in (binding['owner_identity_id'], binding['other_identity_id']):
+            add('identity_profiles', identifier)
+            add('identities', identifier)
     return {'candidate_id': candidate_id, 'candidate_sha256': candidate_fingerprint(candidate),
             'run_id': run['id'], 'scope_snapshot_id': run['scope_snapshot_id'], 'policy_id': run['policy_id'],
             'scope_row_sha256': _sha(scope['rules']), 'policy_row_sha256': _sha(policy['policy']),
-            'binding': binding, 'refs': refs}
+            'binding': binding, 'refs': refs, 'producer_kind': 'traditional_http' if traditional else 'guided_http'}
 
 
 def replay_input(db, request):
@@ -47,22 +48,32 @@ def replay_input(db, request):
     from http_authorization_policy import select_rule, digest
     from v5_verification import _load, _sha
     contract = _load(request['replay_contract_json'], {})
-    if set(contract) != {'type', 'candidate_id', 'artifact_id', 'guided_job_id'} or contract.get('type') != KIND:
+    traditional = 'verification_job_id' in contract
+    job_key = 'verification_job_id' if traditional else 'guided_job_id'
+    if set(contract) != {'type', 'candidate_id', 'artifact_id', job_key} or contract.get('type') != KIND:
         return None
     candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (contract['candidate_id'],)).fetchone()
-    job = db.execute('SELECT * FROM guided_research_jobs WHERE id=?', (contract['guided_job_id'],)).fetchone()
+    table = 'verification_jobs' if traditional else 'guided_research_jobs'
+    job = db.execute(f'SELECT * FROM {table} WHERE id=?', (contract[job_key],)).fetchone()
     campaign = db.execute('SELECT engagement_id,status FROM research_campaigns WHERE id=?', (request['campaign_id'],)).fetchone()
     if (not candidate or not job or not campaign or campaign['status'] != 'active'
             or candidate['status'] in {'archived', 'graveyard'} or campaign['engagement_id'] != candidate['engagement_id']
             or job['run_id'] != candidate['run_id'] or job['cancel_requested']
-            or job['status'] not in {'running', 'completed', 'awaiting_input'}):
+            or job['status'] not in ({'running', 'completed', 'failed'} if traditional else {'running', 'completed', 'awaiting_input'})):
         return None
     recorded = _load(job['result'], {})
-    if (recorded.get('reviewed_execution') is not True or recorded.get('requests_sent') != 10
+    if traditional:
+        checkpoint = recorded.get('replay_checkpoint', {})
+        if (job['candidate_id'] != candidate['id'] or job['oracle'] != 'http-authorization-read-v2'
+                or job['completed_requests'] != 10 or job['total_requests'] != 10
+                or checkpoint.get('state') not in {'responses_complete', 'failed'} or checkpoint.get('completed_responses') != 10
+                or checkpoint.get('final_artifact_id') != contract['artifact_id']):
+            return None
+    elif ((recorded.get('reviewed_execution') is not True or recorded.get('requests_sent') != 10
             or recorded.get('verification_executed') is not True) or not any(
         item.get('candidate_id') == candidate['id'] and item.get('auto_verification', {}).get('artifact_id') == contract['artifact_id']
         for item in recorded.get('items', [])
-    ):
+    )):
         return None
     artifact = db.execute("SELECT * FROM artifacts WHERE id=? AND run_id=? AND kind='http.replay'", (contract['artifact_id'], candidate['run_id'])).fetchone()
     if not artifact:
@@ -91,6 +102,8 @@ def replay_input(db, request):
         return None
     sources = replay.get('source_snapshot', {})
     if not isinstance(sources, dict):
+        return None
+    if traditional and sources.get('producer_kind') != 'traditional_http':
         return None
     if (sources.get('candidate_id') != candidate['id'] or sources.get('candidate_sha256') != candidate_fingerprint(candidate)
             or sources.get('run_id') != candidate['run_id']):
@@ -159,11 +172,12 @@ def replay_input(db, request):
             'rule': {'access': rule['access'], 'allowed_principal_sha256': [digest(p) for p in rule.get('allowed_principals', [])]}}
 
 
-def request_for_job(job_id, candidate_id, artifact_id):
+def request_for_job(job_id, candidate_id, artifact_id, *, traditional=False):
     import final_core as f
     import v5_graph as graph
     import v5_verification as verifier
-    contract = {'type': KIND, 'candidate_id': candidate_id, 'artifact_id': artifact_id, 'guided_job_id': job_id}
+    job_key = 'verification_job_id' if traditional else 'guided_job_id'
+    contract = {'type': KIND, 'candidate_id': candidate_id, 'artifact_id': artifact_id, job_key: job_id}
     with f.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (candidate_id,)).fetchone()
@@ -184,7 +198,7 @@ def request_for_job(job_id, candidate_id, artifact_id):
         claim_id, _ = graph._bridge_node(db, campaign_id, source_type='reviewed_http_claim', source_ref=artifact_id,
             node_type='claim', title='Selected object read violates the frozen business rule', body='Bounded claim; severity and code root cause remain unproven.',
             status='active', run_id=candidate['run_id'], attributes={'claim_kind': 'http_object_read', 'candidate_id': candidate_id,
-                'verification_contract_sha256': verifier._sha(contract), 'producer_runner_ref': 'guided-http-supervisor'})
+                'verification_contract_sha256': verifier._sha(contract), 'producer_runner_ref': 'traditional-http-supervisor' if traditional else 'guided-http-supervisor'})
         graph._bridge_edge(db, campaign_id, claim_id, evidence_id, 'tested_by')
         claim = db.execute('SELECT * FROM research_nodes WHERE id=?', (claim_id,)).fetchone()
         request, task, _ = verifier._create_request_transaction(db, claim, verifier.VerifyRequest(

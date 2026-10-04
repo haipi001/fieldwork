@@ -240,6 +240,10 @@ def hydrate(row):
                 receipt = get_receipt(independent['receipt_id'])
                 independent['current_inputs_match'] = receipt['integrity']['current_inputs_match']
                 independent['promotion_eligible'] = receipt['integrity']['promotion_eligible']
+                with core().connect() as db:
+                    finding = db.execute('SELECT id FROM canonical_findings WHERE candidate_id=?', (item['candidate_id'],)).fetchone()
+                if finding:
+                    independent['finding_id'] = finding['id']
             except Exception:
                 independent['current_inputs_match'] = False
                 independent['promotion_eligible'] = False

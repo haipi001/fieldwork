@@ -64,6 +64,8 @@ def test_three_clean_real_http_runs_and_negative_controls(client, monkeypatch, c
     run, candidate, project, job, proof, receipt = execute(client, monkeypatch, controlled_server, fixed)
     assert receipt['result']['status'] == status
     assert receipt['result']['classification'] == classification
+    if fixed:
+        assert client.get('/api/v1/verification/receipts/' + proof['receipt_id'] + '/http-finding-plan').status_code == 409
     assert receipt['environment']['process_isolation']['network_denied'] is True
     assert receipt['environment']['process_isolation']['child_pid'] != receipt['environment']['process_isolation']['parent_pid']
     with core.connect() as db:
@@ -124,3 +126,37 @@ def test_changed_evidence_between_oracle_and_issue_cannot_mint_receipt(client, m
     with core.connect() as db:
         assert db.execute('SELECT count(*) FROM verification_receipts_v5').fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM research_nodes WHERE node_type='canonical_result'").fetchone()[0] == 0
+
+
+def test_reviewed_v5_result_promotes_idempotently_and_exports_bound_proof(client, monkeypatch, controlled_server):
+    run, candidate, project, job, proof, receipt = execute(client, monkeypatch, controlled_server)
+    base = '/api/v1/verification/receipts/' + proof['receipt_id']
+    plan = client.get(base + '/http-finding-plan')
+    assert plan.status_code == 200, plan.text
+    material = plan.json()
+    assert material['sends_requests'] is False and material['severity'] == 'unknown'
+    assert client.post(base + '/promote-http', json={'source_fingerprint': material['source_fingerprint']}).status_code == 422
+    assert client.post(base + '/promote-http', json={'authorized': True, 'source_fingerprint': '0'*64}).status_code == 409
+    response = client.post(base + '/promote-http', json={'authorized': True, 'source_fingerprint': material['source_fingerprint']})
+    assert response.status_code == 200, response.text
+    identifier = response.json()['id']
+    again = client.post(base + '/promote-http', json={'authorized': True, 'source_fingerprint': material['source_fingerprint']})
+    assert again.status_code == 200 and again.json()['id'] == identifier
+    finding = client.get('/api/v1/findings/' + identifier).json()
+    assert finding['severity'] == 'unknown' and finding['impact']['demonstrated'] is True
+    preview = client.post('/api/v1/findings/' + identifier + '/reports/hackerone/preview')
+    assert preview.status_code == 200, preview.text
+    assert 'Broader data access and severity are unproven' in preview.json()['content']
+    with core.connect() as db:
+        stored = db.execute('SELECT result FROM verification_attempts WHERE id=?', (finding['verification']['receipt_id'],)).fetchone()
+        assert core.load(stored['result'], {})['v5_verification_receipt_id'] == proof['receipt_id']
+        assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0] == 1
+    attachments = core.build_proof_attachments(*core.finding_report_inputs(identifier))
+    assert 'v5-verification.json' in str(attachments)
+    assert len(controlled_server[0][1]) == 13
+    with core.connect() as db:
+        db.execute("UPDATE observations SET summary='Changed material' WHERE run_id=?", (run,))
+    assert client.get(base + '/http-finding-plan').status_code == 409
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        core.build_proof_attachments(*core.finding_report_inputs(identifier))

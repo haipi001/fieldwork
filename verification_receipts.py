@@ -17,7 +17,7 @@ def candidate_fingerprint(candidate):
     return _digest({key: candidate[key] for key in ('id', 'run_id', 'target', 'category', 'title', 'hypothesis')})
 
 
-def issue_receipt(candidate_id, proof):
+def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
     """Called only after a registered runtime has executed and persisted its proof."""
     import final_core as core
     if proof.oracle not in {'http-state-replay-v1', 'http-authorization-read-v2', 'forge-property-replay-v1'} and not proof.oracle.startswith('ptai:'):
@@ -34,6 +34,8 @@ def issue_receipt(candidate_id, proof):
             raise HTTPException(409, '复验缺少 Scope 或实际 Artifact')
         if proof.oracle == 'http-authorization-read-v2':
             _validate_current_http_scope(db, candidate, scope)
+        if v5_receipt_id:
+            _validate_v5_http_binding(db, candidate, proof, v5_receipt_id)
         artifacts = {}
         for artifact_id in set(proof.poc_artifact_ids):
             artifact = db.execute('SELECT * FROM artifacts WHERE id=? AND run_id=?', (artifact_id, run['id'])).fetchone()
@@ -60,6 +62,8 @@ def issue_receipt(candidate_id, proof):
             'program_snapshot': program_snapshot,
             'expires_at': (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
         }
+        if v5_receipt_id:
+            payload['v5_verification_receipt_id'] = v5_receipt_id
         db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (
             receipt_id, candidate_id, proof.oracle, 'machine_receipt', proof.attempts,
             core.dump(payload), core.utcnow(), core.utcnow()))
@@ -76,6 +80,8 @@ def validate_receipt(db, candidate, run, scope, proof):
     if proof.oracle == 'http-authorization-read-v2':
         _validate_current_http_scope(db, candidate, scope)
     payload = core.load(receipt['result'], {})
+    if payload.get('v5_verification_receipt_id'):
+        _validate_v5_http_binding(db, candidate, proof, payload['v5_verification_receipt_id'])
     if (payload.get('schema') != 'verification-receipt/1' or payload.get('run_id') != run['id']
             or payload.get('candidate_fingerprint') != candidate_fingerprint(candidate)
             or payload.get('scope_snapshot_id') != scope['id'] or payload.get('scope_sha256') != _digest(scope['rules'])):
@@ -101,6 +107,17 @@ def validate_receipt(db, candidate, run, scope, proof):
         if proof.oracle == 'http-authorization-read-v2':
             _validate_http_business_boundary(path, core.load(scope['rules'], {}), candidate['target'])
     return receipt['id']
+
+
+def _validate_v5_http_binding(db, candidate, proof, receipt_id):
+    from v5_verification import _validated_receipt, validate_receipt_for_promotion
+    row, payload, _ = _validated_receipt(db, receipt_id)
+    validate_receipt_for_promotion(db, receipt_id, row['campaign_id'], row['claim_node_id'], 'verified', 'http_object_read_v1')
+    contract = payload['replay_contract']
+    if (candidate['mode'] != 'traditional' or contract.get('candidate_id') != candidate['id']
+            or proof.oracle != 'http-authorization-read-v2'
+            or proof.poc_artifact_ids != [contract.get('artifact_id')] or proof.attempts != 2):
+        raise HTTPException(409, 'V5 回执与正式结果的候选、证据或 Oracle 不一致')
 
 
 def _validate_http_business_boundary(path, scope, target):

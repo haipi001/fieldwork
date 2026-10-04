@@ -217,3 +217,47 @@ def canonical_for_receipt(receipt_id):
                 body=receipt['result']['summary'], status='recorded', attributes={'verification_receipt_id': receipt_id})
             graph._bridge_edge(db, receipt['campaign_id'], counter_id, receipt['claim_node_id'], 'contradicts')
         return node_id
+
+
+def finding_plan(receipt_id):
+    import final_core as f
+    import v5_verification as verifier
+    with f.connect() as db:
+        row, payload, _ = verifier._validated_receipt(db, receipt_id)
+        verifier.validate_receipt_for_promotion(db, receipt_id, row['campaign_id'], row['claim_node_id'], 'verified', KIND)
+        contract = payload['replay_contract']
+        candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (contract['candidate_id'],)).fetchone()
+        current_input = replay_input(db, db.execute('SELECT * FROM verification_requests_v5 WHERE id=(SELECT request_id FROM verification_receipt_bindings_v5 WHERE receipt_id=?)', (receipt_id,)).fetchone())
+        quantity = current_input['rounds'][0]['attack']['body_bytes']
+        proof = f.VerificationInput(oracle='http-authorization-read-v2', attempts=2, reproduced=True,
+            counterevidence_checked=True, counterevidence_summary='Both rounds authenticated distinct principals, bound the object to its owner, and denied the anonymous control. The frozen business rule denied the other principal.',
+            severity='unknown', impact_description=f'The selected non-owner read {quantity} bytes of the same owner-bound object in both observed rounds, contrary to the frozen business rule. Broader data access and severity are unproven.',
+            steps=['Review the frozen exact object rule and two authorized identities', 'Run owner, non-owner, anonymous and identity GET checks twice in isolated transport workers', 'Independently evaluate the observed scalar hashes in a network-denied process'],
+            expected='The selected non-owner and anonymous identity cannot read this object under the frozen rule',
+            actual=f'Two owner and non-owner responses were identical; each non-owner response contained {quantity} bytes; anonymous responses were denied. Observation receipt: {receipt_id}.',
+            root_cause='Observed object-read authorization enforcement did not satisfy the frozen rule; source implementation has not been examined.',
+            weakness='CWE-639', location=candidate['target'], poc_artifact_ids=[contract['artifact_id']])
+        fingerprint = verifier._sha({'receipt_sha256': row['receipt_sha256'], 'proof': proof.model_dump()})
+        return {'receipt_id': receipt_id, 'candidate_id': candidate['id'], 'source_fingerprint': fingerprint,
+                'sends_requests': False, 'severity': 'unknown', 'impact_description': proof.impact_description,
+                'root_cause': proof.root_cause, 'proof': proof.model_dump()}
+
+
+def promote_finding(receipt_id, source_fingerprint):
+    import final_core as f
+    from fastapi import HTTPException
+    from verification_receipts import issue_receipt
+    plan = finding_plan(receipt_id)
+    if source_fingerprint != plan['source_fingerprint']:
+        raise HTTPException(409, '正式结果计划已变化，请重新核对')
+    with f.connect() as db:
+        existing = db.execute('SELECT * FROM canonical_findings WHERE candidate_id=?', (plan['candidate_id'],)).fetchone()
+        if existing:
+            verification = f.load(existing['verification'], {})
+            machine = db.execute('SELECT result FROM verification_attempts WHERE id=?', (verification.get('receipt_id'),)).fetchone()
+            if machine and f.load(machine['result'], {}).get('v5_verification_receipt_id') == receipt_id:
+                return f.get_finding(existing['id'])
+            raise HTTPException(409, '候选已有其他正式结果，不能用本回执覆盖')
+    proof = f.VerificationInput.model_validate(plan['proof'])
+    proof.receipt_id = issue_receipt(plan['candidate_id'], proof, v5_receipt_id=receipt_id)
+    return f.verify_candidate(plan['candidate_id'], proof)

@@ -2881,6 +2881,13 @@ def build_proof_attachments(finding, evidence, scope_id):
         if not row:
             raise HTTPException(409, "历史结论没有机器复验收据，请重新验证后导出证明包")
         receipt = load(row["result"], {})
+        if receipt.get('v5_verification_receipt_id'):
+            from verification_receipts import _validate_v5_http_binding
+            from v5_verification import _validated_receipt
+            _validate_v5_http_binding(db, candidate, VerificationInput.model_validate(receipt['proof']), receipt['v5_verification_receipt_id'])
+            _, v5_payload, _ = _validated_receipt(db, receipt['v5_verification_receipt_id'])
+        else:
+            v5_payload = None
         # A historical proof may be exported after its promotion window expires, but its
         # source bytes, scope and original assertions must remain intact.
         artifact_ids = set(finding["verification"].get("poc_artifact_ids", []))
@@ -2896,6 +2903,8 @@ def build_proof_attachments(finding, evidence, scope_id):
             "proof/steps.md": "# Reproduction steps\n\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(finding["verification"].get("steps", []), 1)),
         }
         artifact_files = {}
+        if v5_payload:
+            files['proof/v5-verification.json'] = v5_payload
         for artifact_id in sorted(artifact_ids):
             artifact = db.execute("SELECT * FROM artifacts WHERE id=? AND run_id=?", (artifact_id, run["id"])).fetchone()
             if not artifact:

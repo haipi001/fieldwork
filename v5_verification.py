@@ -936,6 +936,23 @@ def _http_receipt_matches(db, request, result):
                 and all(oracle.get(key) == current[key] for key in ('source_artifact_sha256', 'scope_sha256', 'rule_sha256')))
 
 
+class HttpFindingPromotion(BaseModel):
+    authorized: Literal[True]
+    source_fingerprint: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+@router.get('/receipts/{receipt_id}/http-finding-plan')
+def http_finding_plan(receipt_id: str):
+    from v5_http_receipts import finding_plan
+    return finding_plan(receipt_id)
+
+
+@router.post('/receipts/{receipt_id}/promote-http')
+def promote_http_finding(receipt_id: str, body: HttpFindingPromotion):
+    from v5_http_receipts import promote_finding
+    return promote_finding(receipt_id, body.source_fingerprint)
+
+
 def node_is_receipt_locked(db: sqlite3.Connection, node_id: str) -> bool:
     if db.execute("SELECT 1 FROM verification_receipts_v5 WHERE claim_node_id=? LIMIT 1", (node_id,)).fetchone():
         return True

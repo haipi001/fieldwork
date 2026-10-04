@@ -51,6 +51,10 @@ def run():
             elif path.endswith('/cancel'):
                 job.update(status='cancelled', cancel_requested=True)
                 route.fulfill(json=job)
+            elif path.endswith('/promote-http'):
+                assert payload == {'authorized': True, 'source_fingerprint': 'b' * 64}
+                job['result']['items'][0]['auto_verification']['independent_verification']['finding_id']='finding-fixture'
+                route.fulfill(json={'id':'finding-fixture','status':'verified'})
             else:
                 raise AssertionError(f'Unexpected write: {path}')
         elif path == '/v5': route.fulfill(path=str(ROOT / 'templates/v5.html'), content_type='text/html')
@@ -63,6 +67,9 @@ def run():
               'draft':{'verification_method':'http_object_read'}, 'triage':{'lane':'verification_ready','blockers':[]}}],
               'next_cursor':None, 'execution_job':job if started[0] else None})
         elif path.endswith('/execution-plan'): route.fulfill(json=plan)
+        elif path.endswith('/http-finding-plan'): route.fulfill(json={'source_fingerprint':'b'*64,
+             'impact_description':'Selected object read only; broader access is unproven.',
+             'root_cause':'Observed boundary failure; source implementation unexamined.'})
         elif path == '/api/v1/guided-research/job-fixture': route.fulfill(json=job)
         elif path in ('/api/v1/capabilities', '/api/v1/agent-audit/audits'): route.fulfill(json=[])
         else: route.fulfill(status=503, json={'detail':'Outside isolated fixture'})
@@ -140,11 +147,20 @@ def run():
             'auto_verification':{'status':'reproduced','independent_verification':proof},'gaps':[]}]})
         page.locator('#workflowRead').click()
         page.get_by_text('Independently checked: selected read violates the business rule',exact=True).wait_for()
+        page.locator('[data-workflow-promote]').click()
+        page.locator('[data-confirm-finding]').wait_for()
+        modal=page.locator('dialog').filter(has=page.locator('[data-confirm-finding]'))
+        assert modal.locator('[type=submit]').is_disabled() and len(writes)==5
+        modal.locator('[data-confirm-finding]').check()
+        modal.locator('[type=submit]').click()
+        page.get_by_text('Formal Finding saved',exact=True).wait_for()
+        page.locator('dialog').filter(has=page.get_by_text('Formal Finding saved',exact=True)).get_by_role('button',name='Close',exact=True).click()
+        page.get_by_text('Formal Finding: finding-fixture',exact=True).wait_for()
         proof['current_inputs_match']=False
         proof['promotion_eligible']=False
         page.locator('#workflowRead').click()
         page.get_by_text('Receipt inputs or authorization changed; review again.',exact=True).wait_for()
-        assert len(writes)==5
+        assert len(writes)==6
         page.evaluate("window.FieldworkReviewScope('project-fixture')")
         page.get_by_text('This scope is frozen.',exact=False).wait_for()
         assert page.locator('[data-field="target"]').is_disabled()

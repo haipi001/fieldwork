@@ -1,5 +1,7 @@
 # 给接力 AI 的交接说明
 
+2026-10-04 现行入口：先读 [最新开发状态](docs/DEVELOPMENT_STATUS_2026-10-04.md) 和 [V5-FE-01 本轮验收](docs/acceptance/2026-10-04-v5-fe-01-http-workflow.md)。源码 0.68.3 / build 81 / schema 25，全量699通过/3跳过；V5 业务规则和单候选受控复验已接通，独立进程 HTTP 确认仍待开发。上一安装检查点0.68.2，本轮未覆盖App。规划按用户指定的 `/Users/lizekai/Downloads/fieldwork_v5_1_master_bundle`，下一Task为V5-ORCH-02。以下2026-09-11内容为历史记录，旧版本和风险状态须以现行入口复核。
+
 更新：2026-09-11。
 
 ## 项目位置

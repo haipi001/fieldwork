@@ -241,10 +241,107 @@ def candidate_workflow(run_id: str, after_candidate_id: str | None = None):
     data = snapshot(run_id, after_candidate_id=after_candidate_id)
     items = [material_for(candidate, data) for candidate in data['candidates']]
     counts = annotate_workflow(data['candidates'], items)
+    with core().connect() as db:
+        latest = db.execute("""SELECT * FROM guided_research_jobs WHERE run_id=?
+            AND json_extract(result,'$.reviewed_execution')=1 ORDER BY created_at DESC,id DESC LIMIT 1""", (run_id,)).fetchone()
     return {'run_id': run_id, 'counts': counts, 'items': items,
             'next_cursor': data['next_cursor'], 'truncated': data['truncated'],
             'source_fingerprint': fingerprint(data), 'automatic_execution': False,
+            'execution_job': hydrate(latest) if latest else None,
             'boundary': 'Readiness is not authorization or a vulnerability verdict.'}
+
+
+class WorkflowExecutionInput(BaseModel):
+    source_fingerprint: str = Field(min_length=64, max_length=64, pattern=r'^[a-f0-9]{64}$')
+    authorized: bool = False
+
+
+def workflow_execution_plan(run_id, candidate_id):
+    """No network traffic or credential resolution while reviewing a plan."""
+    from http_authorization_policy import select_rule
+    from guided_http import scalar
+    data = snapshot(run_id, candidate_id)
+    candidate = data['candidates'][0]
+    item = material_for(candidate, data)
+    annotate_workflow(data['candidates'], [item])
+    engagement = core().get_engagement(candidate['engagement_id'])
+    rule, rule_reason = select_rule(engagement['scope'], candidate['target'])
+    binding = item['draft'].get('http_binding')
+    blockers = list(item['triage']['blockers'])
+    if not item['triage']['dispatch_eligible']:
+        blockers.append('triage_not_ready')
+    if not engagement.get('confirmed_at'):
+        blockers.append('scope_unconfirmed')
+    if not engagement['scope'].get('allow_authentication'):
+        blockers.append('authentication_not_authorized')
+    context = data['runtime_context']
+    if context['run_scope'] != context['scope_id'] or context['run_policy'] != context['policy_id']:
+        blockers.append('authority_changed')
+    if context['run_status'] not in ('running', 'paused', 'completed'):
+        blockers.append('run_not_executable')
+    if rule is None:
+        blockers.append('business_rule_' + rule_reason)
+    elif rule['access'] == 'public':
+        blockers.append('business_access_permitted')
+    elif binding and rule['access'] == 'allowlist':
+        probe = next((row for row in data['exchanges'] if row['id'] == binding['sources'][2]), None)
+        principal = scalar(probe['response_body_preview'], binding['principal_field']) if probe else None
+        if principal is None:
+            blockers.append('business_principal_unknown')
+        elif principal in rule.get('allowed_principals', []):
+            blockers.append('business_access_permitted')
+    budget = context.get('budget') or {}
+    remaining = max(0, budget.get('request_limit', 0) - budget.get('requests_used', 0))
+    if remaining < 10:
+        blockers.append('request_budget')
+    requests = []
+    if binding:
+        for target in (binding['target'], binding['identity_url']):
+            if not core().execution_policy_check(core().PolicyCheckInput(
+                    engagement_id=engagement['id'], target=target, action='read'))['allowed']:
+                blockers.append('out_of_scope')
+        auth_hosts = engagement['scope'].get('auth_allowed_hosts', [])
+        if any(urlsplit(target).hostname not in auth_hosts for target in (binding['target'], binding['identity_url'])):
+            blockers.append('authentication_host')
+        requests = [
+            {'role': 'owner', 'url': binding['target'], 'identity_id': binding['owner_identity_id']},
+            {'role': 'other', 'url': binding['target'], 'identity_id': binding['other_identity_id']},
+            {'role': 'anonymous', 'url': binding['target'], 'identity_id': None},
+            {'role': 'owner_identity', 'url': binding['identity_url'], 'identity_id': binding['owner_identity_id']},
+            {'role': 'other_identity', 'url': binding['identity_url'], 'identity_id': binding['other_identity_id']},
+        ]
+    with core().connect() as db:
+        if db.execute("SELECT 1 FROM guided_research_jobs WHERE run_id=? AND status IN ('queued','running')", (run_id,)).fetchone():
+            blockers.append('active_job')
+        if db.execute("SELECT 1 FROM verification_jobs WHERE candidate_id=? AND status IN ('queued','running','cancelling')", (candidate_id,)).fetchone():
+            blockers.append('active_job')
+    return redact_structure({
+        'run_id': run_id, 'candidate_id': candidate_id, 'engagement_id': engagement['id'],
+        'title': candidate['title'], 'source_fingerprint': fingerprint(data),
+        'scope_snapshot_id': engagement['current_scope_snapshot_id'],
+        'business_rule': rule, 'binding': binding, 'rounds': 2, 'request_count': 10,
+        'remaining_requests': remaining, 'requests': requests,
+        'blockers': sorted(set(blockers)), 'can_execute': not blockers,
+        'sends_requests': False, 'automatic_promotion': False,
+    })
+
+
+@router.get('/runs/{run_id}/candidate-workflow/{candidate_id}/execution-plan')
+def preview_workflow_execution(run_id: str, candidate_id: str):
+    return workflow_execution_plan(run_id, candidate_id)
+
+
+@router.post('/runs/{run_id}/candidate-workflow/{candidate_id}/execute', status_code=202)
+def execute_workflow(run_id: str, candidate_id: str, body: WorkflowExecutionInput):
+    if not body.authorized:
+        raise HTTPException(422, '请先核对复验计划并确认测试授权')
+    plan = workflow_execution_plan(run_id, candidate_id)
+    if plan['source_fingerprint'] != body.source_fingerprint:
+        raise HTTPException(409, '候选材料、身份或授权已变化，请重新检查执行计划')
+    if not plan['can_execute']:
+        raise HTTPException(409, {'message': '复验前置条件尚未满足', 'blockers': plan['blockers']})
+    return create_job(run_id, StartInput(candidate_id=candidate_id, execute_ready=True),
+                      expected_fingerprint=body.source_fingerprint)
 
 
 @router.get('/guided-research/{job_id}')
@@ -297,6 +394,7 @@ def save(job_id, steps, result, phase, status='running'):
 def run_job(job_id, data):
     steps = [{'id': key, 'label': label, 'status': 'pending', 'count': 0} for key,label in STAGES]
     result = {'items': [], 'discovered': [], 'requests_sent': 0, 'verification_executed': False,
+              'reviewed_execution': data.get('reviewed_execution', False),
               'remaining_candidates': data['remaining_candidates'], 'truncated': data['truncated'],
               'after_candidate_id':data.get('after_candidate_id'), 'next_cursor':data.get('next_cursor'),
               'continue_from':data.get('continue_from'), 'pending_verifications':0,
@@ -372,6 +470,10 @@ def run_job(job_id, data):
                     candidate=next(c for c in data['candidates'] if c['id']==item['candidate_id'])
                     def before_request(round_index, role):
                         save(job_id,steps,result,f'自动复验第 {min(round_index+1,2)} 轮 · {role}')
+                        if data.get('reviewed_execution'):
+                            current = snapshot(data['run_id'], candidate['id'])
+                            if verification_input_digest(current['candidates'][0], current, binding) != input_digest:
+                                raise HTTPException(409, '复验材料或授权已变化，任务停止')
                     try:
                         executed += 1
                         def after_response():
@@ -442,9 +544,13 @@ def next_automation_input(job_id, data, result):
     return None
 
 
-def create_job(run_id, body, initial_only=False):
+def create_job(run_id, body, initial_only=False, expected_fingerprint=None):
     f = core()
     data = snapshot(run_id, body.candidate_id, body.after_candidate_id) if body.after_candidate_id else snapshot(run_id, body.candidate_id)
+    if expected_fingerprint is not None:
+        if fingerprint(data) != expected_fingerprint:
+            raise HTTPException(409, '执行计划已变化，请重新核对')
+        data['reviewed_execution'] = True
     data['execute_ready'] = body.execute_ready
     data['read_pages'] = body.read_pages
     data['auto_continue'] = body.auto_continue
@@ -472,6 +578,8 @@ def create_job(run_id, body, initial_only=False):
                 raise HTTPException(409, '分析尚未完成，自动衔接等待中')
         active = db.execute("SELECT * FROM guided_research_jobs WHERE run_id=? AND status IN ('queued','running')", (run_id,)).fetchone()
         if active:
+            if expected_fingerprint is not None:
+                raise HTTPException(409, '已有任务正在执行，请刷新当前任务状态')
             return {**hydrate(active), 'reused': True}
         existing = db.execute("SELECT * FROM guided_research_jobs WHERE run_id=? AND fingerprint=? AND status IN ('completed','awaiting_input') ORDER BY created_at DESC LIMIT 1", (run_id,digest)).fetchone()
         if existing:
@@ -489,7 +597,8 @@ def create_job(run_id, body, initial_only=False):
         job_id, now = f.uid('guided'), f.utcnow()
         steps = [{'id': key, 'label': label, 'status': 'pending', 'count': 0} for key,label in STAGES]
         db.execute('INSERT INTO guided_research_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                   (job_id,run_id,body.candidate_id,digest,'queued','等待整理',f.dump(steps),'{}',0,None,now,now))
+                   (job_id,run_id,body.candidate_id,digest,'queued','等待整理',f.dump(steps),
+                    f.dump({'reviewed_execution': True}) if expected_fingerprint is not None else '{}',0,None,now,now))
     try:
         dispatch(job_id, data)
     except Exception:

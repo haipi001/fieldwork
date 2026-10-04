@@ -509,6 +509,23 @@ class EngagementUpdateInput(BaseModel):
     name: str = Field(min_length=2, max_length=160)
 
 
+class HttpReadRuleInput(BaseModel):
+    target: str = Field(min_length=8, max_length=2048)
+    access: Literal["owner_only", "allowlist", "public"]
+    source: str = Field(min_length=3, max_length=2000)
+    allowed_principals: list[str] = Field(default_factory=list, max_length=100)
+
+
+class HttpReadRulesInput(BaseModel):
+    scope_snapshot_id: str = Field(min_length=1, max_length=100)
+    rules: list[HttpReadRuleInput] = Field(default_factory=list, max_length=100)
+    allow_authentication: bool = False
+
+
+class ScopeConfirmInput(BaseModel):
+    scope_snapshot_id: str | None = Field(default=None, max_length=100)
+
+
 class FindingUpdateInput(BaseModel):
     title: str | None = Field(default=None, min_length=2, max_length=240)
     hypothesis: str | None = Field(default=None, min_length=2, max_length=4000)
@@ -1449,14 +1466,78 @@ def get_engagement(engagement_id: str):
 
 
 @router.post("/engagements/{engagement_id}/confirm")
-def confirm_engagement(engagement_id: str):
+def confirm_engagement(engagement_id: str, body: ScopeConfirmInput | None = None):
     timestamp = utcnow()
     with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         engagement = db.execute("SELECT * FROM engagements_v2 WHERE id=?", (engagement_id,)).fetchone()
         if not engagement:
             raise HTTPException(404, "Engagement 不存在")
+        if body and body.scope_snapshot_id and body.scope_snapshot_id != engagement["current_scope_snapshot_id"]:
+            raise HTTPException(409, "Scope 已变化，请重新审阅当前快照")
+        if engagement["status"] == "archived":
+            raise HTTPException(409, "已归档项目不能确认 Scope")
         db.execute("UPDATE scope_snapshots SET confirmed_at=? WHERE id=? AND confirmed_at IS NULL", (timestamp, engagement["current_scope_snapshot_id"]))
         db.execute("UPDATE engagements_v2 SET status='ready',updated_at=? WHERE id=?", (timestamp, engagement_id))
+    return get_engagement(engagement_id)
+
+
+@router.put("/engagements/{engagement_id}/http-read-rules")
+def update_http_read_rules(engagement_id: str, body: HttpReadRulesInput):
+    """Revise only a draft; confirmed snapshots and historical runs stay bound."""
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("""SELECT e.*,s.rules,s.version,s.confirmed_at FROM engagements_v2 e
+            JOIN scope_snapshots s ON s.id=e.current_scope_snapshot_id WHERE e.id=?""", (engagement_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Engagement 不存在")
+        if row['mode'] != 'traditional' or row['status'] != 'draft' or row['confirmed_at']:
+            raise HTTPException(409, "仅 Traditional 草稿可编辑业务规则；已确认范围需要新建研究草稿")
+        if row['current_scope_snapshot_id'] != body.scope_snapshot_id:
+            raise HTTPException(409, "Scope 已变化，请重新读取草稿后保存")
+        if db.execute('SELECT 1 FROM analysis_runs WHERE engagement_id=? LIMIT 1', (engagement_id,)).fetchone():
+            raise HTTPException(409, "已有运行的项目不能修改此草稿范围")
+        scope = load(row['rules'], {})
+        targets = scope.get('allowed_targets', [])
+        rules, seen = [], set()
+        for value in body.rules:
+            rule = value.model_dump()
+            target = rule['target'].strip()
+            try:
+                parsed = urlparse(target)
+                valid = (parsed.scheme in ('http', 'https') and parsed.hostname and parsed.port != 0
+                         and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+                         and not any(char.isspace() for char in target))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise HTTPException(422, "对象 URL 必须是无凭据、查询参数或片段的 HTTP(S) 地址")
+            if not any(isinstance(item, str) and (target == item or target.startswith(item.rstrip('/') + '/')) for item in targets):
+                raise HTTPException(422, "对象 URL 不属于草稿的允许目标")
+            if target in seen:
+                raise HTTPException(422, "同一对象 URL 只能配置一条规则")
+            seen.add(target)
+            rule['target'], rule['source'] = target, rule['source'].strip()
+            principals = [value.strip() for value in rule['allowed_principals']]
+            if len(rule['source']) < 3 or any(not value or len(value) > 200 for value in principals):
+                raise HTTPException(422, "规则依据或主体标识无效")
+            if rule['access'] != 'allowlist' and principals:
+                raise HTTPException(422, "仅 allowlist 规则允许填写共享主体")
+            rule['allowed_principals'] = sorted(set(principals))
+            rules.append(rule)
+        hosts = sorted({urlparse(target).hostname for target in targets
+                        if isinstance(target, str) and urlparse(target).scheme in ('http', 'https') and urlparse(target).hostname})
+        if body.allow_authentication and not hosts:
+            raise HTTPException(422, "测试账号登录需要明确的 HTTP(S) 允许目标")
+        scope.update(http_object_read_rules=rules, allow_authentication=body.allow_authentication,
+                     auth_allowed_hosts=hosts if body.allow_authentication else [])
+        if dump(scope) == row['rules']:
+            return get_engagement(engagement_id)
+        scope_id, timestamp = uid('scope'), utcnow()
+        db.execute('INSERT INTO scope_snapshots VALUES(?,?,?,?,?,?,?,?)',
+                   (scope_id, engagement_id, row['version'] + 1, 'traditional', dump(scope), 'v5_business_rule_review', None, timestamp))
+        db.execute('UPDATE engagements_v2 SET current_scope_snapshot_id=?,updated_at=? WHERE id=?',
+                   (scope_id, timestamp, engagement_id))
     return get_engagement(engagement_id)
 
 

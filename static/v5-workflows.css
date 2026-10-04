@@ -100,6 +100,14 @@ html[data-theme=light] .primary-button{color:#fff!important}
 .workflow-dialog header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
 .workflow-dialog h2{margin:2px 0 0;font-size:20px}
 .workflow-dialog footer{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
+.http-rule-editor{border-top:1px solid var(--border);padding-top:16px;min-width:0}
+.http-rule-editor fieldset{border:1px solid var(--border);border-radius:8px;padding:14px;margin:16px 0;min-width:0;display:grid;gap:12px}
+.http-rule-editor label{display:grid;gap:6px}
+.http-rule-editor .check-line{display:flex;align-items:flex-start}
+.http-rule-editor input:not([type=checkbox]),.http-rule-editor textarea,.http-rule-editor select{width:100%;max-width:100%;box-sizing:border-box}
+.rule-actions{display:flex;gap:8px;flex-wrap:wrap}
+.workflow-requests,.workflow-job{border-top:1px solid var(--border);padding-top:12px;overflow-wrap:anywhere}
+#workflowExecutionDialog dd{margin:4px 0 12px;overflow-wrap:anywhere}
 .review-list{display:grid;gap:0;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface-2);max-height:42vh;overflow:auto}
 .review-line{display:grid;grid-template-columns:135px minmax(0,1fr);gap:12px;padding:9px 12px;border-bottom:1px solid var(--line);font-size:12px}
 .review-line:last-child{border-bottom:0}

@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -58,6 +60,7 @@ SPECS = {
 }
 
 _INVENTORY_CACHE: tuple[float, list[dict]] | None = None
+_INVENTORY_LOCK = threading.Lock()
 
 
 def resolve_executable(name: str) -> str | None:
@@ -103,10 +106,14 @@ def detect(capability_id: str) -> Capability:
     domain, command, license_name, detail = SPECS[capability_id]
     executable = None
     version = None
+    deadline = time.monotonic() + 8
     for candidate in executable_candidates(command):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             version_arg = "-version" if capability_id == "httpx" else "--version"
-            result = subprocess.run([candidate, version_arg], capture_output=True, text=True, timeout=8)
+            result = subprocess.run([candidate, version_arg], capture_output=True, text=True, timeout=remaining)
             output = (result.stdout + "\n" + result.stderr).strip()
             if capability_id == "httpx" and not any(marker in output.lower() for marker in ("projectdiscovery", "current version", "httpx version")):
                 continue
@@ -124,12 +131,14 @@ def detect(capability_id: str) -> Capability:
 def inventory(refresh: bool = False) -> list[dict]:
     """Return a short-lived version probe snapshot so plan dialogs stay responsive."""
     global _INVENTORY_CACHE
-    now = time.monotonic()
-    if not refresh and _INVENTORY_CACHE and now - _INVENTORY_CACHE[0] < 60:
-        return [dict(item) for item in _INVENTORY_CACHE[1]]
-    values = [asdict(detect(name)) for name in SPECS]
-    _INVENTORY_CACHE = (now, values)
-    return [dict(item) for item in values]
+    with _INVENTORY_LOCK:
+        now = time.monotonic()
+        if not refresh and _INVENTORY_CACHE and now - _INVENTORY_CACHE[0] < 60:
+            return [dict(item) for item in _INVENTORY_CACHE[1]]
+        with ThreadPoolExecutor(max_workers=8, thread_name_prefix='fieldwork-version') as probes:
+            values = [asdict(value) for value in probes.map(detect, SPECS)]
+        _INVENTORY_CACHE = (time.monotonic(), values)
+        return [dict(item) for item in values]
 
 
 def execute(capability_id: str, args: list[str], cwd: Path, timeout: int = 120) -> ToolResultEnvelope:

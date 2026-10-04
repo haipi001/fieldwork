@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="${0:A:h:h}"
 APP_NAME="Fieldwork"
-BUILD_ROOT="$PROJECT_ROOT/build/macos"
+BUILD_ROOT="${FIELDWORK_BUILD_OUTPUT:-$PROJECT_ROOT/build/macos}"
 APP_BUNDLE="$BUILD_ROOT/$APP_NAME.app"
 ICON_SOURCE="$PROJECT_ROOT/static/fieldwork-magnifier-icon.png"
 ICONSET="$BUILD_ROOT/$APP_NAME.iconset"
@@ -12,6 +12,8 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" "$ICONSET
 cp "$PROJECT_ROOT/macos/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 python3 - "$PROJECT_ROOT" "$APP_BUNDLE/Contents/Info.plist" <<'PY'
 import plistlib
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -23,6 +25,22 @@ with path.open('rb') as stream:
     metadata = plistlib.load(stream)
 metadata['CFBundleShortVersionString'] = APP_VERSION
 metadata['CFBundleVersion'] = str(BUILD_NUMBER)
+launch_root = Path(os.environ.get('FIELDWORK_BUILD_PROJECT_ROOT', sys.argv[1])).resolve()
+if not (launch_root / 'desktop_server.py').is_file():
+    raise ValueError('launch source root is missing desktop_server.py')
+python_path = Path(os.environ.get('FIELDWORK_BUILD_PYTHON', sys.executable)).absolute()
+if not python_path.is_file() or not os.access(python_path, os.X_OK):
+    raise ValueError('launch Python must be an executable file')
+port = int(os.environ.get('FIELDWORK_BUILD_PORT', '8000'))
+if not 1 <= port <= 65535:
+    raise ValueError('invalid launch port')
+metadata['FieldworkProjectRoot'] = str(launch_root)
+metadata['FieldworkPythonExecutable'] = str(python_path)
+metadata['FieldworkPort'] = port
+identifier = os.environ.get('FIELDWORK_BUILD_IDENTIFIER', metadata['CFBundleIdentifier'])
+if not re.fullmatch(r'[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)+', identifier):
+    raise ValueError('invalid bundle identifier')
+metadata['CFBundleIdentifier'] = identifier
 with path.open('wb') as stream:
     plistlib.dump(metadata, stream, sort_keys=False)
 PY

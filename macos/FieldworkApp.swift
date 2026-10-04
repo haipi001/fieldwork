@@ -7,9 +7,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var window: NSWindow!
     private var webView: WKWebView!
     private var serverProcess: Process?
-    private let projectRoot = "/Users/lizekai/Documents/ChatGPT/SRC漏洞"
-    private let python = "/Users/lizekai/anaconda3/bin/python3"
-    private let appURL = URL(string: "http://127.0.0.1:8000/v5")!
+    private var serverLifetime: Pipe?
+    private let projectRoot = Bundle.main.object(forInfoDictionaryKey: "FieldworkProjectRoot") as? String ?? ""
+    private let python = Bundle.main.object(forInfoDictionaryKey: "FieldworkPythonExecutable") as? String ?? ""
+    private let serverPort = (Bundle.main.object(forInfoDictionaryKey: "FieldworkPort") as? NSNumber)?.intValue ?? 8000
+    private var appURL: URL { URL(string: "http://127.0.0.1:\(serverPort)/v5")! }
     private let desktopInstance = UUID().uuidString.lowercased()
     private let sessionToken: String = {
         var bytes = [UInt8](repeating: 0, count: 48)
@@ -50,6 +52,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         NSApp.activate(ignoringOtherApps: true)
 
         showStartingPage()
+        guard projectRoot.hasPrefix("/"), python.hasPrefix("/"), (1...65535).contains(serverPort),
+              FileManager.default.fileExists(atPath: projectRoot + "/desktop_server.py"),
+              FileManager.default.isExecutableFile(atPath: python) else {
+            showError("构建包的本地启动配置无效，请重新构建 Fieldwork。")
+            return
+        }
         installSessionCookie {
             self.ensureServerThenLoad(attempt: 0)
         }
@@ -106,7 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func serverIsReady(_ completion: @escaping (ServerProbe) -> Void) {
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:8000/health")!)
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(serverPort)/health")!)
         request.timeoutInterval = 2
         URLSession.shared.dataTask(with: request) { _, response, _ in
             guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
@@ -130,18 +138,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = ["-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "8000"]
+        process.arguments = ["-m", "desktop_server", "--port", String(serverPort)]
         process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
         var environment = ProcessInfo.processInfo.environment
         environment["FIELDWORK_SESSION_TOKEN"] = sessionToken
         environment["FIELDWORK_DESKTOP_INSTANCE"] = desktopInstance
-        environment["FIELDWORK_PORT"] = "8000"
+        environment["FIELDWORK_PORT"] = String(serverPort)
+        environment["FIELDWORK_DESKTOP_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         process.environment = environment
+        let lifetime = Pipe()
+        process.standardInput = lifetime
         process.standardOutput = logHandle
         process.standardError = logHandle
         do {
             try process.run()
             serverProcess = process
+            serverLifetime = lifetime
+            lifetime.fileHandleForReading.closeFile()
         } catch {
             showError("无法启动本地服务：\(error.localizedDescription)")
         }
@@ -156,7 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     return
                 }
                 if probe == .foreign {
-                    self.showError("端口 8000 已被其他或旧版服务占用。为保护本机会话，Fieldwork 不会连接该服务。")
+                    self.showError("端口 \(self.serverPort) 已被其他或旧版服务占用。为保护本机会话，Fieldwork 不会连接该服务。")
                     return
                 }
                 if attempt == 0 { self.startServer() }
@@ -184,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             decisionHandler(.cancel)
             return
         }
-        if url.scheme == "about" || (url.scheme == "http" && url.host == "127.0.0.1" && url.port == 8000) {
+        if url.scheme == "about" || (url.scheme == "http" && url.host == "127.0.0.1" && url.port == serverPort) {
             decisionHandler(.allow)
             return
         }
@@ -233,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        serverLifetime?.fileHandleForWriting.closeFile()
         if let process = serverProcess, process.isRunning {
             process.terminate()
         }

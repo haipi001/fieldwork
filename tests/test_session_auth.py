@@ -116,8 +116,10 @@ def test_desktop_contract_keeps_session_out_of_url_javascript_and_argv():
     assert '.name: "fieldwork_session"' in source
     assert '.init(rawValue: "HttpOnly"): "TRUE"' in source
     assert 'X-Fieldwork-Instance' in source and 'X-Fieldwork-Version' in source
-    assert 'process.arguments = ["-m", "uvicorn"' in source
+    assert 'process.arguments = ["-m", "desktop_server"' in source
+    assert 'process.standardInput = lifetime' in source
+    assert 'environment["FIELDWORK_DESKTOP_PARENT_PID"]' in source
     arguments = source.split('process.arguments = ', 1)[1].split('\n', 1)[0]
     assert "sessionToken" not in arguments and "desktopInstance" not in arguments
-    app_url = source.split('private let appURL = ', 1)[1].split('\n', 1)[0]
+    app_url = source.split('private var appURL:', 1)[1].split('\n', 1)[0]
     assert "session" not in app_url.lower() and "token" not in app_url.lower()

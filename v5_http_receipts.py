@@ -28,7 +28,8 @@ def capture_sources(db, candidate_id, binding, *, traditional=False):
         return row
     for identifier in f.load(candidate['evidence_ids'], []):
         evidence = add('evidence_v2', identifier)
-        add('observations', evidence['observation_id'])
+        if evidence['observation_id']:
+            add('observations', evidence['observation_id'])
     if not traditional:
         for identifier in binding['sources']:
             add('http_exchanges', identifier)
@@ -39,6 +40,46 @@ def capture_sources(db, candidate_id, binding, *, traditional=False):
             'run_id': run['id'], 'scope_snapshot_id': run['scope_snapshot_id'], 'policy_id': run['policy_id'],
             'scope_row_sha256': _sha(scope['rules']), 'policy_row_sha256': _sha(policy['policy']),
             'binding': binding, 'refs': refs, 'producer_kind': 'traditional_http' if traditional else 'guided_http'}
+
+
+def _evidence_set_current(db, candidate, sources, replay, artifact, traditional):
+    import final_core as f
+    listed = f.load(candidate['evidence_ids'], [])
+    if not isinstance(listed, list) or any(not isinstance(identifier, str) for identifier in listed) or len(listed) != len(set(listed)):
+        return False
+    expected = {ref['id'] for ref in sources.get('refs', []) if ref.get('table') == 'evidence_v2'}
+    if not traditional:
+        identifier = replay.get('result_evidence_id')
+        # Historical guided artifacts lack the marker. Accept only their unique
+        # generated replay evidence, never an arbitrary additional reference.
+        rows = db.execute("SELECT e.* FROM evidence_v2 e JOIN observations o ON o.id=e.observation_id WHERE e.run_id=? AND e.evidence_type='http.replay' AND e.artifact_id=? AND o.raw_ref=? AND o.observation_type='http.replay_result'",
+                          (candidate['run_id'], artifact['id'], artifact['id'])).fetchall()
+        rows = [row for row in rows if row['summary'] == '自动执行两轮对象读取正反对照'
+                and row['polarity'] == ('supporting' if replay.get('reproduced') and replay.get('stable') else 'counterevidence')]
+        if len(rows) != 1 or (identifier and rows[0]['id'] != identifier):
+            return False
+        expected.add(rows[0]['id'])
+    return set(listed) == expected
+
+
+def _counterevidence_current(db, request, attributes):
+    from v5_verification import _load, _sha
+    rows = db.execute("SELECT e.*,n.source_type,n.source_ref,n.node_type,n.title,n.body,n.status,n.attributes_json AS node_attributes_json FROM research_edges e JOIN research_nodes n ON n.id=e.source_id WHERE e.target_id=? AND e.relation_type='contradicts' ORDER BY e.id", (request['claim_node_id'],)).fetchall()
+    context = []
+    for row in rows:
+        # The canonical refuted result produces its own receipt-derived counter
+        # node after issuance. Only that exact derivation is exempt.
+        receipt = db.execute("SELECT r.result_json FROM verification_receipts_v5 r JOIN verification_receipt_bindings_v5 b ON b.receipt_id=r.id WHERE r.id=? AND b.request_id=?", (row['source_ref'], request['id'])).fetchone()
+        result = _load(receipt['result_json'], {}) if receipt else {}
+        if (receipt and result.get('status') == 'refuted' and row['source_type'] == 'http_counterevidence'
+                and row['node_type'] == 'counterevidence' and row['status'] == 'recorded'
+                and row['title'] == 'Object-read claim refuted by observed controls'
+                and row['body'] == result.get('summary')
+                and _load(row['node_attributes_json'], {}) == {'verification_receipt_id': row['source_ref']}
+                and _load(row['attributes_json'], {}) == {}):
+            continue
+        context.append(dict(row))
+    return _sha(context) == attributes.get('counterevidence_sha256', _sha([]))
 
 
 def replay_input(db, request):
@@ -129,6 +170,8 @@ def replay_input(db, request):
     refs = sources.get('refs', [])
     if not isinstance(refs, list) or not refs or len(refs) > 300:
         return None
+    if not _evidence_set_current(db, candidate, sources, replay, artifact, traditional):
+        return None
     evidence_ids = set(f.load(candidate['evidence_ids'], []))
     for ref in refs:
         if not isinstance(ref, dict) or ref.get('table') not in TABLES:
@@ -145,7 +188,8 @@ def replay_input(db, request):
             return None
     claim = db.execute('SELECT attributes_json FROM research_nodes WHERE id=?', (request['claim_node_id'],)).fetchone()
     attributes = _load(claim['attributes_json'], {}) if claim else {}
-    if attributes.get('claim_kind') != 'http_object_read' or attributes.get('verification_contract_sha256') != _sha(contract):
+    if (attributes.get('claim_kind') != 'http_object_read' or attributes.get('verification_contract_sha256') != _sha(contract)
+            or not _counterevidence_current(db, request, attributes)):
         return None
     binding = sources.get('binding', {})
     rounds = replay.get('rounds', [])
@@ -198,7 +242,7 @@ def request_for_job(job_id, candidate_id, artifact_id, *, traditional=False):
         claim_id, _ = graph._bridge_node(db, campaign_id, source_type='reviewed_http_claim', source_ref=artifact_id,
             node_type='claim', title='Selected object read violates the frozen business rule', body='Bounded claim; severity and code root cause remain unproven.',
             status='active', run_id=candidate['run_id'], attributes={'claim_kind': 'http_object_read', 'candidate_id': candidate_id,
-                'verification_contract_sha256': verifier._sha(contract), 'producer_runner_ref': 'traditional-http-supervisor' if traditional else 'guided-http-supervisor'})
+                'verification_contract_sha256': verifier._sha(contract), 'counterevidence_sha256': verifier._sha([]), 'producer_runner_ref': 'traditional-http-supervisor' if traditional else 'guided-http-supervisor'})
         graph._bridge_edge(db, campaign_id, claim_id, evidence_id, 'tested_by')
         claim = db.execute('SELECT * FROM research_nodes WHERE id=?', (claim_id,)).fetchone()
         request, task, _ = verifier._create_request_transaction(db, claim, verifier.VerifyRequest(

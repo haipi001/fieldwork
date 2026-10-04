@@ -76,11 +76,30 @@ def test_three_clean_real_http_runs_and_negative_controls(client, monkeypatch, c
         assert db.execute('SELECT count(*) FROM research_nodes WHERE node_type=?', ('counterevidence',)).fetchone()[0] == int(fixed)
 
 
-@pytest.mark.parametrize('change', ['observation', 'identity', 'scope', 'policy', 'candidate', 'artifact', 'cancelled_job'])
+@pytest.mark.parametrize('change', ['observation', 'identity', 'scope', 'policy', 'candidate', 'artifact', 'cancelled_job', 'evidence_added', 'evidence_removed', 'evidence_duplicate', 'counteredge'])
 def test_receipt_stales_and_promotion_rejects_current_input_changes(client, monkeypatch, controlled_server, change):
     run, candidate, project, job, proof, receipt = execute(client, monkeypatch, controlled_server)
     with core.connect() as db:
-        if change == 'observation':
+        if change in {'evidence_added', 'evidence_removed', 'evidence_duplicate'}:
+            row = db.execute('SELECT evidence_ids FROM candidate_findings WHERE id=?', (candidate['id'],)).fetchone()
+            identifiers = core.load(row['evidence_ids'])
+            if change == 'evidence_added':
+                new_id = core.uid('evidence')
+                db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)',
+                           (new_id, None, run, 'counterevidence', 'New contradictory material requires review', None, 'counter', core.utcnow()))
+                identifiers.append(new_id)
+            elif change == 'evidence_removed':
+                identifiers.pop()
+            else:
+                identifiers.append(identifiers[0])
+            db.execute('UPDATE candidate_findings SET evidence_ids=? WHERE id=?', (core.dump(identifiers), candidate['id']))
+            if change == 'evidence_added':
+                from v5_http_receipts import capture_sources
+                artifact = db.execute("SELECT uri FROM artifacts WHERE run_id=? AND kind='http.replay'", (run,)).fetchone()
+                binding = json.loads(Path(artifact['uri']).read_text())['source_snapshot']['binding']
+                refreshed = capture_sources(db, candidate['id'], binding)
+                assert any(ref['table'] == 'evidence_v2' and ref['id'] == new_id for ref in refreshed['refs'])
+        elif change == 'observation':
             db.execute("UPDATE observations SET summary='Changed evidence' WHERE run_id=?", (run,))
         elif change == 'identity':
             db.execute("UPDATE identity_profiles SET session_status='expired'")
@@ -92,9 +111,15 @@ def test_receipt_stales_and_promotion_rejects_current_input_changes(client, monk
             db.execute("UPDATE candidate_findings SET hypothesis='Changed claim' WHERE id=?", (candidate['id'],))
         elif change == 'cancelled_job':
             db.execute("UPDATE guided_research_jobs SET status='cancelled',cancel_requested=1 WHERE id=?", (job['id'],))
-        else:
+        elif change == 'artifact':
             artifact = db.execute("SELECT uri FROM artifacts WHERE run_id=? AND kind='http.replay'", (run,)).fetchone()
             Path(artifact['uri']).write_text('{}')
+    if change == 'counteredge':
+        counter = client.post('/api/v1/research/nodes', json={'campaign_id': proof['campaign_id'],
+            'node_type': 'counterevidence', 'title': 'New contradiction', 'body': 'New evidence requires reviewing the selected claim'}).json()
+        edge = client.post('/api/v1/research/edges', json={'campaign_id': proof['campaign_id'],
+            'source_id': counter['id'], 'target_id': proof['claim_id'], 'relation_type': 'contradicts'})
+        assert edge.status_code == 201
     current = client.get('/api/v1/verification/receipts/' + proof['receipt_id']).json()
     assert not current['integrity']['current_inputs_match']
     assert not current['integrity']['promotion_eligible']
@@ -128,7 +153,8 @@ def test_changed_evidence_between_oracle_and_issue_cannot_mint_receipt(client, m
         assert db.execute("SELECT count(*) FROM research_nodes WHERE node_type='canonical_result'").fetchone()[0] == 0
 
 
-def test_reviewed_v5_result_promotes_idempotently_and_exports_bound_proof(client, monkeypatch, controlled_server):
+@pytest.mark.parametrize('change', ['observation', 'evidence_added', 'counteredge'])
+def test_reviewed_v5_result_promotes_idempotently_and_exports_bound_proof(client, monkeypatch, controlled_server, change):
     run, candidate, project, job, proof, receipt = execute(client, monkeypatch, controlled_server)
     base = '/api/v1/verification/receipts/' + proof['receipt_id']
     plan = client.get(base + '/http-finding-plan')
@@ -155,7 +181,20 @@ def test_reviewed_v5_result_promotes_idempotently_and_exports_bound_proof(client
     assert 'v5-verification.json' in str(attachments)
     assert len(controlled_server[0][1]) == 13
     with core.connect() as db:
-        db.execute("UPDATE observations SET summary='Changed material' WHERE run_id=?", (run,))
+        if change == 'observation':
+            db.execute("UPDATE observations SET summary='Changed material' WHERE run_id=?", (run,))
+        elif change == 'evidence_added':
+            row = db.execute('SELECT evidence_ids FROM candidate_findings WHERE id=?', (candidate['id'],)).fetchone()
+            new_id = core.uid('evidence')
+            db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)',
+                       (new_id, None, run, 'counterevidence', 'New counterevidence after formal promotion', None, 'counter', core.utcnow()))
+            db.execute('UPDATE candidate_findings SET evidence_ids=? WHERE id=?',
+                       (core.dump(core.load(row['evidence_ids']) + [new_id]), candidate['id']))
+    if change == 'counteredge':
+        counter = client.post('/api/v1/research/nodes', json={'campaign_id': proof['campaign_id'],
+            'node_type': 'counterevidence', 'title': 'New report contradiction', 'body': 'Review new evidence before export'}).json()
+        assert client.post('/api/v1/research/edges', json={'campaign_id': proof['campaign_id'],
+            'source_id': counter['id'], 'target_id': proof['claim_id'], 'relation_type': 'contradicts'}).status_code == 201
     assert client.get(base + '/http-finding-plan').status_code == 409
     from fastapi import HTTPException
     with pytest.raises(HTTPException):
@@ -212,3 +251,19 @@ def test_v5_fixed_receipt_closes_only_bound_retest_and_is_idempotent(client, mon
         assert db.execute('SELECT status FROM finding_lifecycle WHERE finding_id=?',(finding['id'],)).fetchone()[0]=='verified_fixed'
         row=db.execute("SELECT result FROM verification_attempts WHERE status='machine_negative_receipt'").fetchone()
         assert core.load(row['result'],{})['v5_verification_receipt_id']==negative['receipt_id']
+
+
+@pytest.mark.parametrize('change', ['body', 'edge_attributes'])
+def test_modified_receipt_derived_counterevidence_invalidates_negative_receipt(client, monkeypatch, controlled_server, change):
+    run, candidate, project, job, proof, receipt = execute(client, monkeypatch, controlled_server, fixed=True)
+    assert receipt['integrity']['promotion_eligible']
+    with core.connect() as db:
+        counter = db.execute("SELECT id FROM research_nodes WHERE source_type='http_counterevidence' AND source_ref=?", (proof['receipt_id'],)).fetchone()
+        if change == 'body':
+            db.execute("UPDATE research_nodes SET body='New contradictory material, not the derived summary' WHERE id=?", (counter['id'],))
+        else:
+            db.execute('UPDATE research_edges SET attributes_json=? WHERE source_id=? AND target_id=?',
+                       (core.dump({'additional_counterevidence': True}), counter['id'], proof['claim_id']))
+    current = client.get('/api/v1/verification/receipts/' + proof['receipt_id']).json()
+    assert current['result']['classification'] == 'repaired_negative'
+    assert not current['integrity']['current_inputs_match'] and not current['integrity']['promotion_eligible']

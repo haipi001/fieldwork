@@ -705,6 +705,7 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
             raise VerificationCancelled("用户取消了复验")
         stable = len({signature(r["attack"]) for r in rounds}) == 1
         artifact_id = final_core.uid("artifact")
+        result_evidence_id = final_core.uid("evidence") if not finalize else None
         ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
         artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
         semantic_checks = [authorization_round(r, body.authorization) for r in rounds] if body.authorization else []
@@ -724,6 +725,8 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
                     "business_boundary": business_boundary,
                     "assertion": {"principal_field": body.authorization.principal_field, "owner_field": body.authorization.owner_field} if body.authorization else None,
                     "limitation": "仅证明所选身份与对象归属字段的读取边界；业务授权规则与影响仍需审阅。"}
+        if result_evidence_id:
+            artifact['result_evidence_id'] = result_evidence_id
         if finalize and body.authorization:
             artifact['review_notes'] = redact_structure({'severity': body.severity, 'impact_description': body.impact_description,
                                                        'root_cause': body.root_cause, 'machine_verified': False})
@@ -750,7 +753,7 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
                 current = db.execute("SELECT status,evidence_ids FROM candidate_findings WHERE id=? AND run_id=?", (body.candidate_id,run_id)).fetchone()
                 if not current or current['status'] in ('verified','archived','graveyard'):
                     raise HTTPException(409, "候选状态已变化，停止自动更新")
-                evidence_id=final_core.uid('evidence')
+                evidence_id=result_evidence_id
                 db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)',
                            (evidence_id,observation_id,run_id,'http.replay',
                             '自动执行两轮对象读取正反对照',artifact_id,'supporting' if reproduced and stable else 'counterevidence',final_core.utcnow()))

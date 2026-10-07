@@ -109,7 +109,13 @@ def list_events(db: sqlite3.Connection, *, after_id: int = 0, limit: int = 100,
 
 
 def normalize_runner(row: sqlite3.Row) -> dict[str, Any]:
-    kind = "local" if row["kind"].startswith("local") else row["kind"]
+    legacy_kind = row["kind"]
+    if legacy_kind == "worker" or legacy_kind == "local" or legacy_kind.startswith("local-"):
+        kind = "local"
+    elif legacy_kind in {"container", "remote", "cloud"}:
+        kind = legacy_kind
+    else:
+        raise ValueError("runner placement kind is unknown")
     return {
         "runner_id": row["id"], "node_id": None, "kind": kind,
         "capabilities": _list(row["capabilities_json"]),

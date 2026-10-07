@@ -29,11 +29,26 @@ Integration branch: `codex/v6-final-control-plane`.
 
 ## Overall release state
 
-V6 is in development. P0.2 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
+V6 is in development. P0.2 is in progress; P0.3 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
+
+## P0.2 passive ActionIntent capture
+
+- Source is now 0.68.21 / build 99 / schema 29. `v6_schema.py` adds only `action_intents_v6` and metadata, with update/delete triggers; older runtime, budget, and evidence tables are not copied or rewritten.
+- `/api/v1/v6/action-intents` accepts metadata-only proposals. It binds a task to a real, current Run, Campaign, confirmed Scope snapshot and Policy; only the hashes and IDs of Scope/Policy are stored. Missing Run and stale context fail closed. Caller text is restricted to opaque Agent ID, capability/operation names, a query-free resource identifier, a SHA256 argument hash, and a fixed reason code.
+- The principal is the server-side local session principal; the Agent ID is explicitly marked as claimed. The record status is only `proposed`, with no dispatch or authorization side effect.
+- Isolated 28→29 migration test proves backup/recovery and historical row retention. Intent tests prove immutability, redaction constraints, stale context denial, and no model-call or event write.
+- Repository-wide regression after ActionIntent/schema changes: 846 passed, 4 skipped, 1 existing deprecation warning in 222.18 seconds. A subsequent Runner kind normalization adjustment passed the focused orchestration/intent/bridge suite: 18 passed. Compilation and diff checks passed.
+- Source version/schema changed; the main user database, installed app, and running service were not upgraded or validated in this slice.
+
+### Remaining P0.2 work
+
+- Bind a verified research-worker AgentIdentity and distinguish it from the local operator session. Current endpoint records an Agent claim only.
+- Add passive capture at the existing execution entry points behind a compatibility flag. Current V5 executions do not automatically create ActionIntent rows.
+- Document the canonical contract's optional Run behavior for historical tasks with null `run_id`; new V6 proposals currently require a Run rather than inventing one.
 
 ## Next implementation order
 
-1. P0.2: define immutable, passive ActionIntent capture with explicit principal, resource, verb, scope and policy binding. Resolve the current schema mismatch where `ActionIntent.schema.json` requires `run_id` but existing `agent_tasks.run_id` may be null; do not fabricate a run.
+1. Finish P0.2: bind trusted worker identity and capture intents at existing execution entry points. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
 2. P0.3–P0.4: add time-bound CapabilityGrant and deterministic policy decisions. A Runner's advertised capabilities must never authorize an action.
 3. P0.5–P0.6: wire the existing model and read-only HTTP execution boundaries to these decisions and emit actual execution transitions. Preserve the current `runtime_calls` budget ledger and existing domain guards.
 4. Continue through evidence, evals, packs, incident handling, and the measured V6.5 scale ladder in the source roadmap. Do not mark V6 complete before its release gates pass.

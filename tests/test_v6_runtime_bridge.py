@@ -63,6 +63,13 @@ def test_runner_view_does_not_treat_advertisement_as_authorization(db):
     assert runner["capabilities"] == ["http.read", "model.call"]
     assert runner["attestation"] is None
     assert "hidden" not in str(runner)
+    db.execute("INSERT INTO runner_registry_v5 VALUES(?,?,?,?,?,?,?)", (
+        "worker-1", "worker", '[]', '{}', 1, "online", None,
+    ))
+    assert {item["kind"] for item in list_runners(db)} == {"local"}
+    db.execute("UPDATE runner_registry_v5 SET kind='unsupported' WHERE id='worker-1'")
+    with pytest.raises(ValueError, match="placement kind is unknown"):
+        list_runners(db)
 
 
 def test_call_snapshot_and_agent_identity_do_not_invent_provenance(db):

@@ -129,9 +129,9 @@ def reserve_call(decision_id: str, task_id: str, runner_id: str, attempt: int) -
         db.execute('INSERT INTO runtime_calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
             call_id, decision_id, task_id, attempt, runner_id, task['campaign_id'], task['group_id'],
             decision['profile_id'], provider['id'], tokens, cost, runtime_ms, deadline, 'reserved', None, now, now))
-        if capsule.get('team_plan'):
-            from v6_model_gateway import bind_research_call
-            bind_research_call(db, call_id=call_id, task=task, route=decision, runner_id=runner_id)
+        if capsule.get('team_plan') or capsule.get('native_discovery'):
+            from v6_model_gateway import bind_first_party_call
+            bind_first_party_call(db, call_id=call_id, task=task, route=decision, runner_id=runner_id)
         r._emit(db, call_id, 'call.reserved', {'task_id': task_id, 'reserved_tokens': tokens}, task['campaign_id'])
         return dict(db.execute('SELECT * FROM runtime_calls WHERE id=?', (call_id,)).fetchone())
 
@@ -152,9 +152,9 @@ def start_call(call_id: str) -> None:
         if not provider or r._provider_config_hash(provider) != r._load(decision['request_json'], {}).get('provider_configuration_sha256'):
             raise HTTPException(409, 'model provider changed before dispatch')
         capsule = r._load(task['context_capsule_json'], {})
-        if capsule.get('team_plan'):
-            from v6_model_gateway import authorize_research_start
-            allowed, reason = authorize_research_start(db, row, task)
+        if capsule.get('team_plan') or capsule.get('native_discovery'):
+            from v6_model_gateway import authorize_first_party_start
+            allowed, reason = authorize_first_party_start(db, row, task)
             if not allowed:
                 denial = reason
                 db.execute("UPDATE runtime_calls SET state='released',updated_at=? WHERE id=?", (r._now(), call_id))

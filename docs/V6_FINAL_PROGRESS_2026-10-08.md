@@ -83,9 +83,16 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 ### Remaining P0.5 work
 
-- Gate structured and native model-call paths, plus any other first-party model execution route, using the same authoritative identity and decision contract.
+- Gate the structured local model-call path and any other first-party model execution route using the same authoritative identity and decision contract; validate the native path through a complete browser-backed execution when that environment is available.
 - Cover cancellation, provider failure and unknown usage recovery at the gateway, and expose complete immutable model-call lineage in the UI.
 - Keep historical tasks without a Run on the legacy path until an explicit migration rule exists.
+
+### P0.5 native model extension
+
+- Source is now 0.68.25 / build 103 / schema 32. The native discovery model path uses the same reservation, intent, one-use Grant, policy decision and atomic `calling` transition as the research Worker. Its principal and Agent IDs are distinct from the research Worker and are assigned by the built-in code path.
+- Native binding requires the registered built-in Runner, current Run/Scope/Policy and the existing observation/artifact input guard. The Runner registration rejects an occupied ID and marks the built-in identity explicitly. A direct native model gateway test covers reservation, start, one-use consumption and replay denial without requiring a browser installation.
+- Focused gateway/native/research/runtime/policy/Grant tests: 28 passed, 1 skipped. Repository-wide regression: 860 passed, 4 skipped, 1 existing deprecation warning in 225.65 seconds. Python compilation and diff checks passed.
+- The structured local model path and other first-party execution routes still need gateway integration. The full browser execution test depends on the local Playwright/Chrome environment and remains separate from the direct model gateway test.
 
 ## Next implementation order
 

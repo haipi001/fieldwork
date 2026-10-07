@@ -7,8 +7,12 @@ from fastapi import HTTPException
 import final_core
 import lifecycle
 import v5_research_worker as research
+import v5_native_discovery as native_discovery
+import v5_orchestration as orchestration
+import v5_runtime as runtime
 from tests.test_final import client
 from tests.test_v5_research_worker import create, team
+from tests.test_v5_native_discovery import prepare as prepare_native
 from v5_runtime_calls import fail_call, reserve_call, start_call
 from v6_schema import V6_SCHEMA_STATEMENTS, V6_SCHEMA_VERSION, apply_v6_schema
 from version import SCHEMA_VERSION
@@ -93,6 +97,60 @@ def test_model_start_consumes_one_grant_in_the_calling_transaction(client):
     fail_call(call["id"])
     with final_core.connect() as db:
         assert db.execute("SELECT state FROM runtime_calls WHERE id=?", (call["id"],)).fetchone()[0] == "unknown"
+
+
+def test_native_model_start_uses_separate_worker_identity_and_one_use_grant(client):
+    with final_core.connect() as db:
+        now = final_core.utcnow()
+        db.execute("INSERT INTO runtime_providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            "native-gateway-model", "llama_cpp", "Native gateway fixture", "http://127.0.0.1:1",
+            "fixture", None, 1, '{"location":"local"}', "healthy", now, now, now,
+        ))
+    profile = client.put("/api/v1/runtime/config", json={"name": "Native gateway profile", "mode": "local",
+        "config": {"local_provider_ids": ["native-gateway-model"]}})
+    assert profile.status_code == 201, profile.text
+    engagement = prepare_native(client, "https://native-gateway.example.test", profile.json()["id"])
+    run_id = "native-discovery-run"
+    with final_core.connect() as db:
+        now = final_core.utcnow()
+        db.execute("INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            "native-gateway-campaign", engagement["id"], "Native gateway", "Model fixture", "active",
+            "business_logic", 12, 0, 1, .85, now, now,
+        ))
+    created = orchestration.create_task(orchestration.TaskCreate(
+        campaign_id="native-gateway-campaign", run_id=run_id, role="explorer",
+        objective="Choose a bounded read-only navigation", route_requirement={"kind": "native-discovery"},
+        idempotency_key="native-gateway-task", max_attempts=1,
+        context_capsule={"native_discovery": True, "native_input_hashes": {},
+            "scope_snapshot_id": engagement["current_scope_snapshot_id"],
+            "policy_id": engagement["current_policy_id"]},
+        budget={"max_tokens": 8000, "max_runtime_ms": 45000, "max_cost_micros": 0},
+    ))
+    with final_core.connect() as db:
+        now = final_core.utcnow()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+        db.execute("INSERT INTO runner_registry_v5 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            native_discovery.RUNNER, "Native built-in", "native-discovery", "online",
+            '["native_discovery"]', '{"location":"local"}', 1, 1,
+            now, '{"builtin":true}', now, now,
+        ))
+        db.execute("UPDATE agent_tasks SET status='running',attempt=1,lease_owner=?,"
+                   "lease_expires_at=?,heartbeat_at=? WHERE id=?",
+                   (native_discovery.RUNNER, expires, now, created["id"]))
+    route = runtime.route_task(runtime.RouteRequest(task_id=created["id"],
+        task_type="native_discovery", profile_id=profile.json()["id"], sensitivity="secret",
+        mode="local", estimated_tokens=8000))
+    assert route["status"] == "selected"
+    call = reserve_call(route["id"], created["id"], native_discovery.RUNNER, 1)
+    start_call(call["id"])
+    with final_core.connect() as db:
+        binding = db.execute("SELECT * FROM model_gateway_bindings_v6 WHERE call_id=?", (call["id"],)).fetchone()
+        assert binding["principal_id"] == "fieldwork:native-discovery-worker"
+        assert binding["agent_id"] == "fieldwork:native-discovery-agent-v1"
+        assert db.execute("SELECT COUNT(*) FROM model_gateway_starts_v6 WHERE call_id=?", (call["id"],)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM capability_uses_v6 WHERE action_id=?", (call["id"],)).fetchone()[0] == 1
+    with pytest.raises(HTTPException, match="cannot be started or replayed"):
+        start_call(call["id"])
 
 
 def test_gateway_schema_upgrade_preserves_prior_intent_rows(tmp_path):

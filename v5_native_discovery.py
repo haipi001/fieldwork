@@ -108,9 +108,12 @@ def decision_for_run(run, profile_id, turn, context):
             budget={'max_tokens': 8000, 'max_runtime_ms': 45000, 'max_cost_micros': 0}))
         with f.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            occupied = db.execute('SELECT metadata_json FROM runner_registry_v5 WHERE id=?', (RUNNER,)).fetchone()
+            if occupied and r._load(occupied['metadata_json'], {}).get('builtin') is not True:
+                raise HTTPException(409, 'built-in native runner identity is occupied')
             db.execute('INSERT INTO runner_registry_v5 VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=\'online\',heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at', (
                 RUNNER, 'Native discovery model runner', 'native-discovery', 'online', f.dump(['native_discovery']),
-                '{"location":"local"}', 1, 0, now, '{}', now, now))
+                '{"location":"local"}', 1, 0, now, '{"builtin":true}', now, now))
             task = db.execute('SELECT * FROM agent_tasks WHERE id=?', (created['id'],)).fetchone()
             if task['status'] != 'queued' or task['attempt']:
                 raise HTTPException(409, 'native decision already attempted; resume requires checkpoint review')

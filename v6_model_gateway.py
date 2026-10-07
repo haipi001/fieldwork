@@ -13,6 +13,8 @@ from v6_policy import record_policy_decision
 
 RESEARCH_PRINCIPAL = "fieldwork:research-worker"
 RESEARCH_AGENT = "fieldwork:research-agent-v1"
+NATIVE_PRINCIPAL = "fieldwork:native-discovery-worker"
+NATIVE_AGENT = "fieldwork:native-discovery-agent-v1"
 
 
 def _load_object(value: str) -> dict:
@@ -23,23 +25,42 @@ def _load_object(value: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def bind_research_call(db: sqlite3.Connection, *, call_id: str, task: sqlite3.Row,
-                       route: sqlite3.Row, runner_id: str) -> None:
-    """Capture trusted research intent/grant with the original call reservation."""
+def _identity_and_guard(db: sqlite3.Connection, task: sqlite3.Row, runner_id: str) -> tuple[str, str, str, bool]:
+    """Recognize only a first-party worker code path, then apply its legacy guard."""
+    capsule = _load_object(task["context_capsule_json"])
+    from v5_orchestration import _continuous_scope_current
+    if capsule.get("team_plan") is True:
+        from v5_research_worker import RUNNER_ID
+        if runner_id != RUNNER_ID:
+            return "", "", "", False
+        return RESEARCH_PRINCIPAL, RESEARCH_AGENT, "research-worker", _continuous_scope_current(db, task)
+    if capsule.get("native_discovery") is True:
+        from v5_native_discovery import RUNNER, inputs_current
+        if runner_id != RUNNER:
+            return "", "", "", False
+        try:
+            inputs_current(db, task)
+        except Exception:
+            return NATIVE_PRINCIPAL, NATIVE_AGENT, "native-discovery", False
+        return NATIVE_PRINCIPAL, NATIVE_AGENT, "native-discovery", True
+    return "", "", "", False
+
+
+def bind_first_party_call(db: sqlite3.Connection, *, call_id: str, task: sqlite3.Row,
+                          route: sqlite3.Row, runner_id: str) -> None:
+    """Capture trusted model intent/grant with the original call reservation."""
     if not db.in_transaction:
         raise ValueError("gateway binding requires the reservation transaction")
     capsule = _load_object(task["context_capsule_json"])
+    principal, agent, runner_kind, legacy_allowed = _identity_and_guard(db, task, runner_id)
     runner = db.execute("SELECT kind,metadata_json FROM runner_registry_v5 WHERE id=?", (runner_id,)).fetchone()
     call = db.execute("SELECT * FROM runtime_calls WHERE id=?", (call_id,)).fetchone()
-    if (not capsule.get("team_plan") or not task["run_id"] or not runner
-            or runner["kind"] != "research-worker" or not runner_id.startswith("builtin-research-")
+    if (not principal or not legacy_allowed or not task["run_id"] or not runner
+            or runner["kind"] != runner_kind
             or _load_object(runner["metadata_json"]).get("builtin") is not True
             or not call or call["task_id"] != task["id"] or call["runner_id"] != runner_id
             or route["id"] != call["decision_id"] or route["status"] != "selected"):
-        raise ValueError("research model gateway identity or reservation is invalid")
-    from v5_orchestration import _continuous_scope_current
-    if not _continuous_scope_current(db, task):
-        raise ValueError("research model scope or input context is stale")
+        raise ValueError("first-party model gateway identity or reservation is invalid")
     authority = db.execute("""
         SELECT e.current_scope_snapshot_id,e.current_policy_id,s.rules,p.policy,
                r.scope_snapshot_id run_scope_id,r.policy_id run_policy_id
@@ -53,51 +74,54 @@ def bind_research_call(db: sqlite3.Connection, *, call_id: str, task: sqlite3.Ro
             or authority["current_policy_id"] != authority["run_policy_id"]
             or capsule.get("scope_snapshot_id") != authority["current_scope_snapshot_id"]
             or capsule.get("policy_id") != authority["current_policy_id"]):
-        raise ValueError("research model Run scope or policy mismatch")
+        raise ValueError("first-party model Run scope or policy mismatch")
     now = datetime.now(timezone.utc).isoformat()
     intent_id, grant_id = f"intent-{uuid.uuid4().hex}", f"grant-{uuid.uuid4().hex}"
     arguments_hash = hashlib.sha256((route["id"] + "|" + route["request_json"]).encode()).hexdigest()
     db.execute("INSERT INTO action_intents_v6 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-        intent_id, task["campaign_id"], task["run_id"], task["id"], RESEARCH_AGENT,
-        RESEARCH_PRINCIPAL, "first_party_research_worker_code_path", "model.call", "call",
-        f"route:{route['id']}", arguments_hash, None, "research", 0,
+        intent_id, task["campaign_id"], task["run_id"], task["id"], agent,
+        principal, "first_party_worker_code_path", "model.call", "call",
+        f"route:{route['id']}", arguments_hash, None, "research" if capsule.get("team_plan") else "investigation", 0,
         authority["current_scope_snapshot_id"], _sha256(authority["rules"]),
         authority["current_policy_id"], _sha256(authority["policy"]), "proposed", now,
     ))
     intent = db.execute("SELECT * FROM action_intents_v6 WHERE id=?", (intent_id,)).fetchone()
     if not _intent_current(db, intent):
-        raise ValueError("research model intent context is stale")
+        raise ValueError("first-party model intent context is stale")
     constraints = json.dumps({"operation": "call", "side_effect": False}, sort_keys=True, separators=(",", ":"))
     db.execute("INSERT INTO capability_grants_v6 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-        grant_id, intent_id, RESEARCH_PRINCIPAL, "model.call", "call", intent["resource"],
+        grant_id, intent_id, principal, "model.call", "call", intent["resource"],
         task["campaign_id"], task["run_id"], task["id"], intent["scope_snapshot_id"],
         intent["scope_sha256"], intent["policy_id"], intent["policy_sha256"],
         constraints, 1, "active", "fieldwork:control-plane", now, call["deadline_at"],
     ))
-    eligible, reason = capability_matches(db, intent_id, grant_id, principal_id=RESEARCH_PRINCIPAL)
+    eligible, reason = capability_matches(db, intent_id, grant_id, principal_id=principal)
     if not eligible:
-        raise ValueError(f"research model grant rejected: {reason}")
+        raise ValueError(f"first-party model grant rejected: {reason}")
     db.execute("INSERT INTO model_gateway_bindings_v6 VALUES(?,?,?,?,?,?,?,?)", (
-        call_id, intent_id, grant_id, RESEARCH_PRINCIPAL, RESEARCH_AGENT,
+        call_id, intent_id, grant_id, principal, agent,
         runner_id, route["id"], now,
     ))
 
 
-def authorize_research_start(db: sqlite3.Connection, call: sqlite3.Row,
-                             task: sqlite3.Row) -> tuple[bool, str]:
+def authorize_first_party_start(db: sqlite3.Connection, call: sqlite3.Row,
+                                task: sqlite3.Row) -> tuple[bool, str]:
     """Decide and consume the grant before the call enters `calling`."""
     binding = db.execute("SELECT * FROM model_gateway_bindings_v6 WHERE call_id=?", (call["id"],)).fetchone()
     if not binding:
         return False, "model gateway binding missing"
+    principal, agent, runner_kind, legacy_allowed = _identity_and_guard(db, task, call["runner_id"])
+    runner = db.execute("SELECT kind,metadata_json FROM runner_registry_v5 WHERE id=?", (call["runner_id"],)).fetchone()
     if (binding["runner_id"] != call["runner_id"] or binding["route_decision_id"] != call["decision_id"]
-            or binding["principal_id"] != RESEARCH_PRINCIPAL or binding["agent_id"] != RESEARCH_AGENT):
+            or binding["principal_id"] != principal or binding["agent_id"] != agent
+            or not runner or runner["kind"] != runner_kind
+            or _load_object(runner["metadata_json"]).get("builtin") is not True):
         return False, "model gateway binding mismatch"
-    from v5_orchestration import _continuous_scope_current
-    legacy_allowed = _continuous_scope_current(db, task)
     result = record_policy_decision(
         db, intent_id=binding["intent_id"], grant_id=binding["grant_id"],
-        principal_id=RESEARCH_PRINCIPAL, legacy_guard_allowed=legacy_allowed,
-        legacy_rule_id="v5.research_model_guard", budget_ok=True,
+        principal_id=principal, legacy_guard_allowed=legacy_allowed,
+        legacy_rule_id="v5.research_model_guard" if principal == RESEARCH_PRINCIPAL else "v5.native_model_guard",
+        budget_ok=True,
     )
     if result["decision"] not in {"allow", "allow_with_limit"}:
         return False, result["reasons"][0]

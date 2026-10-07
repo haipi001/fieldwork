@@ -29,7 +29,7 @@ Integration branch: `codex/v6-final-control-plane`.
 
 ## Overall release state
 
-V6 is in development. P0.2 is in progress; P0.3 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
+V6 is in development. P0.2 and P0.3 are in progress; P0.4 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
 
 ## P0.2 passive ActionIntent capture
 
@@ -46,9 +46,23 @@ V6 is in development. P0.2 is in progress; P0.3 through P2.5 and all release gat
 - Add passive capture at the existing execution entry points behind a compatibility flag. Current V5 executions do not automatically create ActionIntent rows.
 - Document the canonical contract's optional Run behavior for historical tasks with null `run_id`; new V6 proposals currently require a Run rather than inventing one.
 
+## P0.3 CapabilityGrant service
+
+- Source is now 0.68.22 / build 100 / schema 30. Additive V6 schema v2 adds immutable grant, revocation and use ledgers without changing V5 task tool grants or Runner capability advertisement.
+- A grant derives principal, capability, operation, task, Run, Scope/Policy hashes and resource from one ActionIntent. The local session can issue a bounded TTL and max-use grant. Exact in-scope HTTP/browser reads may become active; wildcard, out-of-scope and effectful capabilities remain pending. Revocation is a separate immutable row.
+- `capability_matches` requires the caller principal, current task/Run/Scope/Policy, resource and operation constraints, unexpired active grant, no revocation and remaining uses. It returns eligibility only and performs no dispatch. Legacy `tool_grants` and Runner capability labels are not authorization inputs.
+- Isolated 29→30 migration and recovery tests preserve historical rows. Targeted tests cover wrong principal, expiry, revocation, one-shot exhaustion, stale scope, out-of-scope read and read/send separation.
+- Final repository regression for this increment: 851 passed, 4 skipped, 1 existing deprecation warning in 223.75 seconds; focused V6 contract suite: 13 passed. No production database migration or installed App validation occurred.
+
+### Remaining P0.3 work
+
+- Bind grants to authenticated Worker principals once Worker AgentIdentity is authoritative. Current active grants are limited to the local session principal.
+- Consume grant uses atomically with execution gateway dispatch; `capability_uses_v6` is storage ready but no current V5 execution is routed through it.
+- Add the approval workflow for effectful or wildcard grants. `pending_approval` is deliberately unusable until then.
+
 ## Next implementation order
 
 1. Finish P0.2: bind trusted worker identity and capture intents at existing execution entry points. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
-2. P0.3–P0.4: add time-bound CapabilityGrant and deterministic policy decisions. A Runner's advertised capabilities must never authorize an action.
+2. Finish P0.3 and implement P0.4: bind grant consumption to execution and add deterministic policy decisions. A Runner's advertised capabilities must never authorize an action.
 3. P0.5–P0.6: wire the existing model and read-only HTTP execution boundaries to these decisions and emit actual execution transitions. Preserve the current `runtime_calls` budget ledger and existing domain guards.
 4. Continue through evidence, evals, packs, incident handling, and the measured V6.5 scale ladder in the source roadmap. Do not mark V6 complete before its release gates pass.

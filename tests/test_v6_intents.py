@@ -2,7 +2,8 @@ import sqlite3
 
 import final_core
 import lifecycle
-from v6_schema import apply_v6_schema
+from v6_schema import V6_SCHEMA_VERSION, apply_v6_schema
+from version import SCHEMA_VERSION
 from tests.test_final import client, create_ready
 
 
@@ -85,15 +86,15 @@ def test_v6_additive_migration_backup_and_restore(tmp_path):
         db.execute("INSERT INTO preserved VALUES('one','historical-evidence')")
         db.execute("PRAGMA user_version=28")
     result = lifecycle.prepare_database_upgrade(database, tmp_path / "backups", tmp_path)
-    assert result["previous_schema"] == 28 and result["target_schema"] == 29
+    assert result["previous_schema"] == 28 and result["target_schema"] == SCHEMA_VERSION
     backup = result["backup"]
     assert backup and lifecycle.database_integrity(tmp_path / "backups" / backup["database"])
     apply_v6_schema(database)
     lifecycle.finalize_database_version(database)
     with sqlite3.connect(database) as db:
         assert db.execute("SELECT value FROM preserved WHERE id='one'").fetchone()[0] == "historical-evidence"
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
-        assert db.execute("SELECT value FROM v6_schema_meta WHERE key='schema_version'").fetchone()[0] == "1"
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert db.execute("SELECT value FROM v6_schema_meta WHERE key='schema_version'").fetchone()[0] == str(V6_SCHEMA_VERSION)
     recovered = tmp_path / "recovered.db"
     with sqlite3.connect(tmp_path / "backups" / backup["database"]) as source, sqlite3.connect(recovered) as target:
         source.backup(target)

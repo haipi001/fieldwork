@@ -36,6 +36,7 @@ from guided_research import init_guided_db, router as guided_research_router
 from lifecycle import finalize_database_version, prepare_database_upgrade
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 from v5_schema import apply_v5_schema
+from v6_control import router as v6_control_router
 from v5_graph import router as v5_graph_router
 from v5_orchestration import recover_expired_leases, router as v5_orchestration_router, runner_router as v5_runner_router
 from v5_verification import router as v5_verification_router
@@ -246,6 +247,7 @@ app.include_router(v5_orchestration_router)
 app.include_router(v5_runner_router)
 app.include_router(v5_verification_router)
 app.include_router(v5_runtime_router)
+app.include_router(v6_control_router)
 app.include_router(v5_continuous_router)
 app.include_router(v5_intelligence_router)
 app.include_router(v5_workers_router)

@@ -600,7 +600,9 @@ async def execute_toolchain(run_id: str, body: TraditionalToolchainInput, finali
         if agent["ready"]:
             try:
                 result = await asyncio.to_thread(run_native_agent, run_id)
-                record_coverage(run_id, "capability:native-agent", "tested", "read_only_completed", result["observation_ids"])
+                complete = result.get('status') == 'completed'
+                record_coverage(run_id, "capability:native-agent", "tested" if complete else 'not_tested',
+                                "read_only_completed" if complete else 'model_discovery_incomplete', result["observation_ids"])
             except Exception as error:
                 final_core.add_event(run_id, "analysis", "native_agent.failed", f"Native Agent 降级：{redact(str(error))}")
                 record_coverage(run_id, "capability:native-agent", "not_tested", "agent_runtime_failed")

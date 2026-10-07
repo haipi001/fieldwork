@@ -147,6 +147,34 @@ def test_independent_route_never_falls_back_to_non_independent_provider(client):
     assert allowed["route"] == "independent" and allowed["provider_ref"] == verifier["id"]
 
 
+def test_offline_and_local_independent_routes_do_not_select_cloud(client):
+    verifier = provider(client, "offline-cloud-verifier", "cloud", independent=True)
+    healthy(verifier["id"])
+    for mode in ("offline", "local"):
+        current = profile(client, mode, cloud=[verifier["id"]], independent=[verifier["id"]])
+        value = route(client, current["id"], requires_independence=True)
+        assert value["status"] == "blocked" and value["provider_ref"] is None
+
+
+def test_profile_binds_provider_configuration_and_rejects_stale_review(client):
+    local = provider(client, "frozen-local", "local")
+    healthy(local["id"])
+    first = profile(client, "local", local=[local["id"]])
+    assert first["config"]["provider_config_hashes"] == {local["id"]: local["configuration_sha256"]}
+    assert route(client, first["id"])["status"] == "selected"
+    changed = client.patch(f"/api/v1/runtime/providers/{local['id']}", json={"model": "new-model"})
+    assert changed.json()["last_health"] == "unknown"
+    healthy(local["id"])
+    stopped = route(client, first["id"])
+    assert stopped["status"] == "blocked" and "profile_provider_configuration_changed" in stopped["reason"]
+    stale = client.put("/api/v1/runtime/config", json={"name": first["name"], "mode": first["mode"], "config": first["config"]})
+    assert stale.status_code == 409
+    second = profile(client, "local", local=[local["id"]])
+    assert second["id"] != first["id"] and second["immutable_hash"] != first["immutable_hash"]
+    assert route(client, second["id"])["model"] == "new-model"
+    assert client.get(f"/api/v1/runtime/profiles/{first['id']}").json() == first
+
+
 def test_usage_is_idempotent_immutable_and_future_routes_observe_campaign_budget(client):
     cloud = provider(client, "metered-cloud", "cloud", rate=1_000_000)
     healthy(cloud["id"])

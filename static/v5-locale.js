@@ -54,6 +54,16 @@
     }
   };
   const pairs = {
+    "配置可复用模型 Profile，查看路由账本与持续研究策略。":"Configure reusable model profiles and inspect routing decisions and continuous research policies.",
+    "只读发现模型 Profile（可选）":"Read-only discovery model Profile (optional)", "不启用模型发现":"Model discovery disabled", "选择 V5 Profile 后才启用模型驱动的只读发现。页面观察默认私有，强制使用所选 Profile 的本机模型。":"Select a V5 Profile to enable model-driven read-only discovery. Page observations are private and use the selected profile local model.", "每任务词元上限":"Tokens per task", "每任务累计模型时长预算（毫秒）":"Total model time budget per task (milliseconds)",
+    "队伍由持久化的逻辑任务组成；创建后是否实际推理取决于显式启动本机研究 Worker。此操作不会向目标发请求。":"Teams consist of durable tasks. Explicitly start the local research worker to invoke models. This action sends no target request.",
+    "我确认目标描述与固定图谱材料为公开内容，允许发送至所选 Profile 的云模型":"I confirm the objective and frozen graph inputs are public and may be sent to the selected profile cloud models",
+    "固定图谱节点必须已明确标记为 public；未标记或敏感材料始终留在本机。费用按配置费率估算，不是服务商账单。":"Frozen graph nodes must be explicitly marked public. Unclassified or sensitive inputs stay local. Costs use configured rates, not a provider invoice.",
+    "配置研究组":"Configure research team", "研究员":"Researcher", "探索员":"Explorer", "专题员":"Specialist",
+    "最多同时领取":"Concurrent lease limit", "总成本预算（微单位）":"Total cost budget (micro units)", "模型 Profile":"Model profile", "不指定":"Not selected",
+    "预览当前授权与预算":"Preview authority and budget", "创建队伍并排队":"Create team and queue tasks",
+    "我已核对 Run、角色、任务数、并发和预算":"I reviewed the run, roles, task count, concurrency, and budget",
+    "队伍由持久化的逻辑任务组成；创建后是否实际推理取决于独立研究执行节点。此操作不会向目标发请求。":"A team consists of durable logical tasks. Actual reasoning requires an independent research runner. This action sends no target requests.",
     "跳到主要内容":"Skip to main content", "安全研究空间":"Security workspace",
     "主导航":"Main navigation", "收起导航":"Collapse navigation", "关闭导航":"Close navigation", "打开导航":"Open navigation",
     "研究":"RESEARCH", "监控":"MONITOR", "执行":"EXECUTION", "信任层":"TRUST LAYER", "结果":"RESULTS", "系统":"SYSTEM",

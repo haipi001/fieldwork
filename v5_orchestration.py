@@ -7,6 +7,7 @@ runners with explicit capabilities.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import sqlite3
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 router = APIRouter(prefix="/api/v1/orchestration", tags=["V5 Orchestration"])
@@ -76,7 +77,7 @@ def _group_value(row: sqlite3.Row) -> dict[str, Any]:
     return value
 
 
-def _task_value(row: sqlite3.Row, usage: sqlite3.Row | None = None) -> dict[str, Any]:
+def _task_value(row: sqlite3.Row, usage: sqlite3.Row | None = None, model_time=None) -> dict[str, Any]:
     value = dict(row)
     for name in ("context_capsule", "tool_grants", "route_requirement", "budget"):
         value[name] = _load(value.pop(f"{name}_json"), {} if name != "tool_grants" else [])
@@ -88,7 +89,27 @@ def _task_value(row: sqlite3.Row, usage: sqlite3.Row | None = None) -> dict[str,
     if value["usage"]:
         value["usage"].pop("task_id", None)
         value["usage"].pop("updated_at", None)
+    if model_time is not None:
+        value['usage']['runtime_ms'] = max(value['usage']['runtime_ms'], model_time['known_ms'])
+        for field in ('input_tokens', 'output_tokens', 'cost_micros'):
+            value['usage'][field] = max(value['usage'][field], model_time[field])
+        value['model_runtime'] = {**model_time, 'charged_ms': max(
+            value['usage']['runtime_ms'], model_time['known_ms'] + model_time['held_ms'])}
     return value
+
+
+def _model_times(db, task_ids):
+    if not task_ids:
+        return {}
+    return {row['task_id']: {field: row[field] for field in
+            ('known_ms', 'held_ms', 'input_tokens', 'output_tokens', 'cost_micros')} for row in db.execute(
+        "SELECT c.task_id,COALESCE(SUM(t.runtime_ms),0)+COALESCE(MAX(t.legacy_runtime_ms),0) known_ms,"
+        "COALESCE(SUM(CASE WHEN t.call_id IS NULL THEN c.max_runtime_ms ELSE 0 END),0) held_ms,"
+        "COALESCE(SUM(u.input_tokens),0) input_tokens,COALESCE(SUM(u.output_tokens),0) output_tokens,"
+        "COALESCE(SUM(u.cost_micros),0) cost_micros "
+        "FROM runtime_calls c LEFT JOIN runtime_call_timings t ON t.call_id=c.id "
+        "LEFT JOIN runtime_usage u ON u.id=c.usage_id "
+        f"WHERE c.task_id IN ({','.join('?' for _ in task_ids)}) AND c.state!='released' GROUP BY c.task_id", task_ids)}
 
 
 def _runner_value(row: sqlite3.Row) -> dict[str, Any]:
@@ -149,6 +170,165 @@ class GroupCreate(BaseModel):
     strategy: str = Field(default="coordinator", min_length=1, max_length=100)
     runtime_profile_id: str | None = Field(default=None, max_length=200)
     budget: dict[str, int] = Field(default_factory=dict)
+
+
+class TeamRole(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["researcher", "explorer", "specialist"]
+    count: int = Field(ge=1, le=100, strict=True)
+
+
+class TeamPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    campaign_id: str = Field(min_length=1, max_length=200)
+    run_id: str = Field(min_length=1, max_length=200)
+    objective: str = Field(min_length=8, max_length=2000)
+    roles: list[TeamRole] = Field(min_length=1, max_length=3)
+    max_concurrency: int = Field(ge=1, le=32, strict=True)
+    max_cost_micros: int = Field(ge=1, le=1_000_000_000, strict=True)
+    allow_cloud_context: bool = Field(default=False, strict=True)
+    max_tokens_per_task: int = Field(default=8000, strict=True, ge=1, le=100000)
+    max_runtime_ms_per_task: int = Field(default=45000, strict=True, ge=1, le=45000)
+    runtime_profile_id: str | None = Field(default=None, max_length=200)
+
+
+class TeamCommit(TeamPlan):
+    preview_hash: str = Field(min_length=64, max_length=64)
+    idempotency_key: str = Field(min_length=8, max_length=200)
+
+
+def _team_plan(db: sqlite3.Connection, body: TeamPlan) -> dict[str, Any]:
+    campaign = _campaign(db, body.campaign_id)
+    if campaign["status"] != "active":
+        raise HTTPException(409, "research campaign is not active")
+    authority = db.execute(
+        "SELECT e.status,e.current_scope_snapshot_id,e.current_policy_id,s.confirmed_at "
+        "FROM engagements_v2 e JOIN scope_snapshots s ON s.id=e.current_scope_snapshot_id "
+        "WHERE e.id=?", (campaign["engagement_id"],),
+    ).fetchone()
+    if not authority or authority["status"] != "ready" or not authority["confirmed_at"]:
+        raise HTTPException(409, "research project scope is not confirmed")
+    run = db.execute(
+        "SELECT engagement_id,scope_snapshot_id,policy_id,status,synthetic "
+        "FROM analysis_runs WHERE id=?", (body.run_id,),
+    ).fetchone()
+    if (not run or run["engagement_id"] != campaign["engagement_id"]
+            or run["scope_snapshot_id"] != authority["current_scope_snapshot_id"]
+            or run["policy_id"] != authority["current_policy_id"]
+            or run["status"] not in {"queued", "running", "paused", "completed"} or run["synthetic"]):
+        raise HTTPException(409, "run is not usable under the current confirmed scope and policy")
+    if body.runtime_profile_id and not db.execute(
+        "SELECT 1 FROM runtime_profiles WHERE id=?", (body.runtime_profile_id,),
+    ).fetchone():
+        raise HTTPException(404, "runtime profile not found")
+    roles = [item.model_dump() for item in body.roles]
+    if len({item["role"] for item in roles}) != len(roles):
+        raise HTTPException(422, "team roles must be unique")
+    count = sum(item["count"] for item in roles)
+    if count > 100 or body.max_concurrency > count or body.max_cost_micros < count:
+        raise HTTPException(422, "team size, concurrency or cost budget is invalid")
+    from v5_workers import _node_digest
+    input_rows = db.execute("SELECT * FROM research_nodes WHERE campaign_id=? "
+                            "AND node_type IN ('observation','evidence','counterevidence','claim') "
+                            "AND status NOT IN ('archived','retired','invalidated') "
+                            "AND source_type!='team_research' "
+                            "ORDER BY (node_type='counterevidence') DESC,created_at DESC,id LIMIT 20",
+                            (body.campaign_id,)).fetchall()
+    from v5_runtime import _contains_sensitive_key
+    cloud_eligible = all(_load(row['attributes_json'], {}).get('sensitivity') == 'public'
+                         and not _contains_sensitive_key(_load(row['attributes_json'], {})) for row in input_rows)
+    if body.allow_cloud_context and (not body.runtime_profile_id or not cloud_eligible):
+        raise HTTPException(409, "cloud context requires a selected profile and explicitly public graph inputs")
+    plan = {
+        "cloud_context_approved": body.allow_cloud_context,
+        "research_input_hashes": {row["id"]: _node_digest(row) for row in input_rows},
+        "campaign_id": body.campaign_id, "run_id": body.run_id,
+        "engagement_id": campaign["engagement_id"],
+        "scope_snapshot_id": authority["current_scope_snapshot_id"],
+        "policy_id": authority["current_policy_id"],
+        "objective": body.objective.strip(), "roles": roles, "task_count": count,
+        "max_concurrency": body.max_concurrency,
+        "max_cost_micros": body.max_cost_micros,
+        "max_tokens_per_task": body.max_tokens_per_task,
+        "max_runtime_ms_per_task": body.max_runtime_ms_per_task,
+        "runtime_profile_id": body.runtime_profile_id,
+        "execution": "queued_until_explicit_local_research_start",
+    }
+    if len(plan["objective"]) < 8:
+        raise HTTPException(422, "team objective is too short")
+    plan["preview_hash"] = hashlib.sha256(_dump(plan).encode()).hexdigest()
+    return plan
+
+
+@router.post("/groups/team/preview")
+def preview_team(body: TeamPlan):
+    with _core().connect() as db:
+        return _team_plan(db, body)
+
+
+@router.post("/groups/team", status_code=201)
+def create_team(body: TeamCommit):
+    f, now = _core(), _now()
+    with f.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        plan = _team_plan(db, body)
+        if body.preview_hash != plan["preview_hash"]:
+            raise HTTPException(409, "team preview is stale; review the current plan")
+        marker = f"v5-team:{body.idempotency_key}"
+        existing = db.execute("SELECT value FROM app_metadata WHERE key=?", (marker,)).fetchone()
+        if existing:
+            saved = _load(existing["value"], {})
+            if saved.get("preview_hash") != plan["preview_hash"]:
+                raise HTTPException(409, "idempotency key was used for another team plan")
+            group_id = saved["group_id"]
+            group = db.execute("SELECT * FROM research_groups WHERE id=?", (group_id,)).fetchone()
+            tasks = db.execute("SELECT * FROM agent_tasks WHERE group_id=? ORDER BY created_at,id",
+                               (group_id,)).fetchall()
+            return {"group": _group_value(group), "tasks": [_task_value(row) for row in tasks],
+                    "deduplicated": True, "execution": plan["execution"]}
+        group_id = _uid("rgroup")
+        budget = {"max_tasks": plan["task_count"], "max_concurrency": plan["max_concurrency"],
+                  "max_cost_micros": plan["max_cost_micros"]}
+        db.execute(
+            "INSERT INTO research_groups VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (group_id, body.campaign_id, body.run_id, None, "coordinator",
+             plan["objective"], "bounded_research", body.runtime_profile_id,
+             _dump(budget), "active", now, now),
+        )
+        remaining = body.max_cost_micros
+        task_rows = []
+        for role in body.roles:
+            for index in range(role.count):
+                task_id = _uid("atask")
+                remaining_tasks = plan["task_count"] - len(task_rows)
+                task_cost = remaining // remaining_tasks
+                remaining -= task_cost
+                capsule = {"team_plan": True, "scope_snapshot_id": plan["scope_snapshot_id"],
+                           "policy_id": plan["policy_id"], "preview_hash": plan["preview_hash"],
+                           "role_index": index + 1,
+                           "research_input_hashes": plan["research_input_hashes"],
+                           "cloud_context_approved": plan["cloud_context_approved"],
+                           "sensitivity": "public" if plan["cloud_context_approved"] else "secret"}
+                db.execute(
+                    "INSERT INTO agent_tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (task_id, body.campaign_id, body.run_id, group_id, role.role,
+                     f"{plan['objective']} · {role.role} {index + 1}",
+                     _dump(capsule), _dump([]),
+                     _dump({"kind": "research-worker"}), _dump({"max_cost_micros": task_cost, "max_tokens": body.max_tokens_per_task, "max_runtime_ms": body.max_runtime_ms_per_task}),
+                     0, "queued", 0, 2, f"team:{body.idempotency_key}:{role.role}:{index + 1}",
+                     None, None, None, None, None, now, now),
+                )
+                _emit(db, body.campaign_id, task_id, "task.created", {"status": "queued"})
+                task_rows.append(task_id)
+        _emit(db, body.campaign_id, group_id, "team.created",
+              {"task_count": plan["task_count"], "preview_hash": plan["preview_hash"]})
+        db.execute("INSERT INTO app_metadata VALUES(?,?,?)",
+                   (marker, _dump({"preview_hash": plan["preview_hash"], "group_id": group_id}), now))
+        group = db.execute("SELECT * FROM research_groups WHERE id=?", (group_id,)).fetchone()
+        tasks = db.execute("SELECT * FROM agent_tasks WHERE group_id=? ORDER BY created_at,id",
+                           (group_id,)).fetchall()
+    return {"group": _group_value(group), "tasks": [_task_value(row) for row in tasks],
+            "deduplicated": False, "execution": plan["execution"]}
 
 
 class TaskCreate(BaseModel):
@@ -280,9 +460,20 @@ def list_groups(campaign_id: str = Query(min_length=1), limit: int = Query(100, 
     f = _core()
     with f.connect() as db:
         rows = db.execute(
-            "SELECT * FROM research_groups WHERE campaign_id=? ORDER BY created_at LIMIT ?", (campaign_id, limit),
+            "SELECT g.*,COALESCE(u.task_count,0) task_count,COALESCE(u.cost_micros,0) cost_micros "
+            "FROM research_groups g LEFT JOIN ("
+            "SELECT t.group_id,COUNT(t.id) task_count,COALESCE(SUM(v.cost_micros),0) cost_micros "
+            "FROM agent_tasks t LEFT JOIN agent_task_usage v ON v.task_id=t.id "
+            "GROUP BY t.group_id) u ON u.group_id=g.id "
+            "WHERE g.campaign_id=? ORDER BY g.created_at LIMIT ?", (campaign_id, limit),
         ).fetchall()
-    return {"items": [_group_value(row) for row in rows]}
+    items = []
+    for row in rows:
+        value = _group_value(row)
+        value["usage"] = {"task_count": value.pop("task_count"),
+                          "cost_micros": value.pop("cost_micros")}
+        items.append(value)
+    return {"items": items}
 
 
 def _group_transition(group_id: str, target: str) -> dict[str, Any]:
@@ -297,7 +488,9 @@ def _group_transition(group_id: str, target: str) -> dict[str, Any]:
             raise HTTPException(409, f"cannot transition group from {row['status']} to {target}")
         db.execute("UPDATE research_groups SET status=?,updated_at=? WHERE id=?", (target, _now(), group_id))
         if target == "paused":
-            db.execute("UPDATE agent_tasks SET status='paused',updated_at=? WHERE group_id=? AND status='queued'", (_now(), group_id))
+            db.execute("UPDATE agent_tasks SET status='paused',lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,updated_at=? "
+                       "WHERE group_id=? AND status IN ('queued','leased','running')", (_now(), group_id))
+            _sync_runner_jobs(db)
         elif target == "active":
             db.execute("UPDATE agent_tasks SET status='queued',updated_at=? WHERE group_id=? AND status='paused'", (_now(), group_id))
         else:
@@ -381,9 +574,10 @@ def get_task(task_id: str):
     with f.connect() as db:
         row = db.execute("SELECT * FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
         usage = db.execute("SELECT * FROM agent_task_usage WHERE task_id=?", (task_id,)).fetchone() if row else None
+        model_time = _model_times(db, [task_id]).get(task_id)
     if not row:
         raise HTTPException(404, "agent task not found")
-    return _task_value(row, usage)
+    return _task_value(row, usage, model_time)
 
 
 @router.get("/tasks")
@@ -408,6 +602,12 @@ def list_tasks(campaign_id: str = Query(min_length=1), status: str | None = None
         rows = db.execute(
             f"SELECT * FROM agent_tasks WHERE campaign_id=?{clause} ORDER BY priority DESC,created_at,id LIMIT ?", params,
         ).fetchall()
+        visible_ids = [row["id"] for row in rows[:limit]]
+        usage_rows = {row["task_id"]: row for row in db.execute(
+            f"SELECT * FROM agent_task_usage WHERE task_id IN ({','.join('?' for _ in visible_ids)})",
+            visible_ids,
+        ).fetchall()} if visible_ids else {}
+        model_times = _model_times(db, visible_ids)
     has_more = len(rows) > limit
     rows = rows[:limit]
     next_cursor = None
@@ -416,7 +616,7 @@ def list_tasks(campaign_id: str = Query(min_length=1), status: str | None = None
         next_cursor = base64.urlsafe_b64encode(json.dumps(
             [campaign_id, status, last["priority"], last["created_at"], last["id"]],
             separators=(",", ":"), allow_nan=False).encode()).decode()
-    return {"items": [_task_value(row) for row in rows],
+    return {"items": [_task_value(row, usage_rows.get(row["id"]), model_times.get(row['id'])) for row in rows],
             "page": {"has_more": has_more, "next_cursor": next_cursor, "limit": limit}}
 
 
@@ -490,7 +690,7 @@ def retry_task(task_id: str): return _task_transition(task_id, "retry")
 
 @runner_router.put("/{runner_id}")
 def register_runner(runner_id: str, body: RunnerRegistration):
-    if runner_id.startswith(("builtin-verifier-", "builtin-structured-")):
+    if runner_id.startswith(("builtin-verifier-", "builtin-structured-", "builtin-research-")):
         raise HTTPException(409, "built-in runner identities are reserved")
     if (runner_id != body.id or len(set(body.capabilities)) != len(body.capabilities)
             or any(not item or len(item) > 100 for item in body.capabilities)):
@@ -589,13 +789,14 @@ def _group_can_lease(db: sqlite3.Connection, task: sqlite3.Row) -> bool:
 
 def _continuous_scope_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool:
     capsule = _load(task["context_capsule_json"], {})
-    if (not capsule.get("continuous_research") and not capsule.get("structured_worker")
+    if (not capsule.get("continuous_research") and not capsule.get("team_plan")
+            and not capsule.get("structured_worker") and not capsule.get('native_discovery')
             and not capsule.get("cross_pollination")
             and not capsule.get("verification_request_id")):
         return True
     row = db.execute(
         "SELECT c.status AS campaign_status,e.status AS engagement_status,"
-        "e.current_scope_snapshot_id,e.current_policy_id,s.confirmed_at,cr.enabled "
+        "e.current_scope_snapshot_id,e.current_policy_id,s.confirmed_at,cr.enabled,cr.policy_json continuous_policy_json "
         "FROM research_campaigns c JOIN engagements_v2 e ON e.id=c.engagement_id "
         "LEFT JOIN scope_snapshots s ON s.id=e.current_scope_snapshot_id "
         "LEFT JOIN continuous_research_state cr ON cr.campaign_id=c.id WHERE c.id=?",
@@ -605,6 +806,20 @@ def _continuous_scope_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool
                 and row["confirmed_at"] and (not capsule.get("continuous_research") or row["enabled"])
                 and row["current_scope_snapshot_id"] == capsule.get("scope_snapshot_id")
                 and row["current_policy_id"] == capsule.get("policy_id"))
+    if current and (capsule.get("team_plan") or capsule.get('native_discovery')):
+        run = db.execute(
+            "SELECT r.status,r.synthetic,r.scope_snapshot_id,r.policy_id "
+            "FROM analysis_runs r JOIN research_campaigns c ON c.engagement_id=r.engagement_id "
+            "WHERE r.id=? AND c.id=?", (task["run_id"], task["campaign_id"]),
+        ).fetchone()
+        current = bool(row["engagement_status"] == "ready" and run and not run["synthetic"]
+                       and run["status"] in {"queued", "running", "paused", "completed"}
+                       and run["scope_snapshot_id"] == capsule.get("scope_snapshot_id")
+                       and run["policy_id"] == capsule.get("policy_id"))
+        if capsule.get('native_discovery'):
+            current = current and run['status'] == 'running'
+    if current and capsule.get("continuous_policy_hash"):
+        current = hashlib.sha256(_dump(_load(row["continuous_policy_json"], {})).encode()).hexdigest() == capsule["continuous_policy_hash"]
     if current and capsule.get("cross_pollination"):
         from v5_evolution import _inputs_current
         transfer = capsule.get("transfer", {})
@@ -618,7 +833,7 @@ def _continuous_scope_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool
 
 @router.post("/lease")
 def lease_task(body: LeaseRequest):
-    if body.runner_id.startswith(("builtin-verifier-", "builtin-structured-")):
+    if body.runner_id.startswith(("builtin-verifier-", "builtin-structured-", "builtin-research-")):
         raise HTTPException(409, "built-in runners use their dedicated local executor")
     recover_expired_leases()
     f = _core()
@@ -733,6 +948,10 @@ def complete_task(task_id: str, body: CompletionRequest):
             raise HTTPException(409, "verification tasks must finish through the immutable receipt endpoint")
         if context.get("structured_worker") in {"critic", "synthesizer", "evolver"}:
             raise HTTPException(409, "structured worker tasks must use the role-specific result endpoint")
+        if context.get("team_plan"):
+            raise HTTPException(409, "research team results require the dedicated research worker")
+        if context.get('native_discovery'):
+            raise HTTPException(409, 'native discovery results require their dedicated model runner')
         usage = body.usage.model_dump()
         previous = db.execute("SELECT * FROM agent_task_usage WHERE task_id=?", (task_id,)).fetchone()
         if previous:

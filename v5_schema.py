@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-V5_SCHEMA_VERSION = 5
+V5_SCHEMA_VERSION = 8
 
 V5_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS v5_schema_meta(
@@ -63,6 +63,61 @@ V5_SCHEMA_STATEMENTS = (
     """CREATE TRIGGER IF NOT EXISTS runtime_usage_reports_no_delete
          BEFORE DELETE ON runtime_usage_reports BEGIN
          SELECT RAISE(ABORT,'runtime usage report is immutable'); END""",
+    """CREATE TABLE IF NOT EXISTS runtime_calls(
+         id TEXT PRIMARY KEY,decision_id TEXT NOT NULL UNIQUE,task_id TEXT NOT NULL,
+         attempt INTEGER NOT NULL,runner_id TEXT NOT NULL,campaign_id TEXT NOT NULL,
+         group_id TEXT,profile_id TEXT,provider_id TEXT NOT NULL,
+         reserved_tokens INTEGER NOT NULL CHECK(reserved_tokens>0),
+         reserved_cost_micros INTEGER NOT NULL CHECK(reserved_cost_micros>=0),
+         max_runtime_ms INTEGER NOT NULL CHECK(max_runtime_ms>0),deadline_at TEXT NOT NULL,
+         state TEXT NOT NULL CHECK(state IN ('reserved','calling','unknown','settled','released')),
+         usage_id INTEGER,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+         UNIQUE(task_id,attempt))""",
+    "CREATE INDEX IF NOT EXISTS runtime_calls_scope ON runtime_calls(profile_id,campaign_id,state,created_at)",
+    """CREATE TRIGGER IF NOT EXISTS runtime_calls_no_delete BEFORE DELETE ON runtime_calls BEGIN
+         SELECT RAISE(ABORT,'runtime call cannot be deleted'); END""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_calls_identity_immutable BEFORE UPDATE ON runtime_calls
+         WHEN NEW.id IS NOT OLD.id OR NEW.decision_id IS NOT OLD.decision_id
+           OR NEW.task_id IS NOT OLD.task_id OR NEW.attempt IS NOT OLD.attempt
+           OR NEW.runner_id IS NOT OLD.runner_id OR NEW.campaign_id IS NOT OLD.campaign_id
+           OR NEW.group_id IS NOT OLD.group_id OR NEW.profile_id IS NOT OLD.profile_id
+           OR NEW.provider_id IS NOT OLD.provider_id OR NEW.reserved_tokens IS NOT OLD.reserved_tokens
+           OR NEW.reserved_cost_micros IS NOT OLD.reserved_cost_micros
+           OR NEW.max_runtime_ms IS NOT OLD.max_runtime_ms OR NEW.deadline_at IS NOT OLD.deadline_at
+           OR NEW.created_at IS NOT OLD.created_at
+         BEGIN SELECT RAISE(ABORT,'runtime call identity is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_calls_transition_guard BEFORE UPDATE ON runtime_calls
+         WHEN NOT ((OLD.state='reserved' AND NEW.state IN ('calling','released') AND NEW.usage_id IS NULL)
+           OR (OLD.state='calling' AND NEW.state='unknown' AND NEW.usage_id IS NULL)
+           OR (OLD.state IN ('calling','unknown') AND NEW.state='settled' AND NEW.usage_id IS NOT NULL))
+         BEGIN SELECT RAISE(ABORT,'invalid runtime call transition'); END""",
+    """CREATE TABLE IF NOT EXISTS runtime_call_inputs(
+         call_id TEXT PRIMARY KEY REFERENCES runtime_calls(id),
+         strategy TEXT NOT NULL CHECK(strategy IN ('utf8_estimate','llama_cpp_server')),
+         input_tokens INTEGER NOT NULL CHECK(input_tokens>0),output_max_tokens INTEGER NOT NULL CHECK(output_max_tokens>0),
+         request_sha256 TEXT NOT NULL,created_at TEXT NOT NULL)""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_call_inputs_guard BEFORE INSERT ON runtime_call_inputs
+         WHEN NOT EXISTS(SELECT 1 FROM runtime_calls WHERE id=NEW.call_id AND state IN ('reserved','calling')
+           AND NEW.input_tokens+NEW.output_max_tokens<=reserved_tokens)
+         BEGIN SELECT RAISE(ABORT,'invalid model input allowance'); END""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_call_inputs_no_update BEFORE UPDATE ON runtime_call_inputs
+         BEGIN SELECT RAISE(ABORT,'model input allowance is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_call_inputs_no_delete BEFORE DELETE ON runtime_call_inputs
+         BEGIN SELECT RAISE(ABORT,'model input allowance is immutable'); END""",
+    """CREATE TABLE IF NOT EXISTS runtime_call_timings(
+         call_id TEXT PRIMARY KEY REFERENCES runtime_calls(id),
+         runtime_ms INTEGER NOT NULL CHECK(runtime_ms>=0),
+         legacy_runtime_ms INTEGER NOT NULL CHECK(legacy_runtime_ms>=0),created_at TEXT NOT NULL)""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_call_timings_insert_guard
+         BEFORE INSERT ON runtime_call_timings
+         WHEN NOT EXISTS(SELECT 1 FROM runtime_calls WHERE id=NEW.call_id AND state='settled')
+         BEGIN SELECT RAISE(ABORT,'model timing requires settled call'); END""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_call_timings_no_update
+         BEFORE UPDATE ON runtime_call_timings
+         BEGIN SELECT RAISE(ABORT,'model timing is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS runtime_call_timings_no_delete
+         BEFORE DELETE ON runtime_call_timings
+         BEGIN SELECT RAISE(ABORT,'model timing is immutable'); END""",
     """CREATE TABLE IF NOT EXISTS research_nodes(
          id TEXT PRIMARY KEY,campaign_id TEXT NOT NULL,run_id TEXT,node_type TEXT NOT NULL,
          title TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,confidence REAL,

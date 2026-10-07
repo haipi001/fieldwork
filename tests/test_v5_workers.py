@@ -2,6 +2,7 @@ import final_core
 import v5_workers
 import json
 import threading
+import pytest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tests.test_final import client, create_ready
 from tests.test_v5_verification import receipt_body
@@ -232,6 +233,10 @@ def test_local_worker_invalid_output_retries_without_graph_promotion(client, mon
     state = client.get(f"/api/v1/orchestration/tasks/{task['id']}").json()
     assert state["status"] == "queued" and state["attempt"] == 1
     assert state["error"]["error_type"] == "HTTPException"
+    with final_core.connect() as db:
+        usage = db.execute("SELECT * FROM runtime_usage WHERE task_id=?", (task["id"],)).fetchone()
+        assert usage["input_tokens"] == 10 and usage["output_tokens"] == 10
+        assert usage["provider_id"] == "fixture-local-model"
     graph = client.get(f"/api/v1/research/campaigns/{cid}/graph").json()
     assert {n["node_type"] for n in graph["nodes"]} == {"claim"}
 
@@ -276,16 +281,16 @@ def test_local_model_transport_uses_loopback_and_json_contract():
     try:
         provider = {"kind": "llama_cpp", "base_url": f"http://127.0.0.1:{server.server_port}",
                     "model": "fixture-model"}
-        task = {"role": "critic", "objective": "Critique a bounded claim", "budget_json": '{"max_tokens":100}'}
+        task = {"role": "critic", "objective": "Critique a bounded claim", "budget_json": '{"max_tokens":4000}'}
         output, input_tokens, output_tokens, runtime_ms = v5_workers._local_model_output(
             provider, task, [{"id": "claim-fixture", "node_type": "claim", "title": "Fixture claim"}],
         )
         assert output["conclusion"] == "inconclusive"
         assert (input_tokens, output_tokens) == (11, 7) and runtime_ms >= 0
         assert seen[0][0] == "/v1/chat/completions"
-        assert seen[0][1]["max_tokens"] == 100
+        assert 0 < seen[0][1]["max_tokens"] < 4000
         evolver = {"role": "evolver", "objective": "Mutate one selected parent",
-                   "budget_json": '{"max_tokens":100}',
+                   "budget_json": '{"max_tokens":4000}',
                    "context_capsule_json": json.dumps({"evolution_mode": "mutate",
                        "parent_variant_ids": ["variant-1"], "relevant_evidence_ids": ["evidence-1"],
                        "counterevidence_ids": ["counter-1"]})}
@@ -304,3 +309,202 @@ def test_local_model_transport_uses_loopback_and_json_contract():
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_worker_runtime_budget_is_bound_and_checked_before_graph_write(client):
+    _, cid = setup_campaign(client)
+    claim = node(client, cid, "claim", "Bounded runtime review claim")
+    body = {"campaign_id": cid, "role": "critic", "claim_ids": [claim["id"]],
+            "objective": "Review within runtime budget", "idempotency_key": "runtime-limit",
+            "max_runtime_ms": 100}
+    created = client.post('/api/v1/workers/tasks', json=body)
+    assert created.status_code == 201, created.text
+    task = created.json()
+    assert task['budget']['max_runtime_ms'] == 100
+    assert client.post('/api/v1/workers/tasks', json=body).json()['id'] == task['id']
+    assert client.post('/api/v1/workers/tasks', json={**body, 'max_runtime_ms': 101}).status_code == 409
+    assert client.post('/api/v1/workers/tasks', json={**body, 'max_runtime_ms': True}).status_code == 422
+    runner(client, 'runtime-worker', ['structured_critic'])
+    leased = lease(client, 'runtime-worker')
+    before = client.get(f'/api/v1/research/campaigns/{cid}/graph').json()
+    result = client.post(f"/api/v1/workers/tasks/{task['id']}/result", json={
+        'runner_id': 'runtime-worker', 'lease_attempt': leased['attempt'], 'runtime_ms': 101,
+        'output': {'claim_node_id': claim['id'], 'weaknesses': ['Needs further investigation'],
+                   'counterevidence_ids': [], 'conclusion': 'inconclusive'}})
+    assert result.status_code == 409 and 'runtime budget' in result.text
+    assert client.get(f'/api/v1/research/campaigns/{cid}/graph').json() == before
+    with final_core.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM agent_task_usage WHERE task_id=?', (task['id'],)).fetchone()[0] == 0
+
+
+def test_local_model_redirect_does_not_contact_destination():
+    import pytest
+    hits = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            hits.append(self.path)
+            self.send_response(307)
+            self.send_header('Location', f'http://127.0.0.1:{self.server.server_port}/redirected')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+        def log_message(self, *_):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(ValueError, match='redirects are forbidden'):
+            v5_workers._local_model_output(
+                {'kind': 'ollama', 'base_url': f'http://127.0.0.1:{server.server_port}', 'model': 'fixture'},
+                {'role': 'critic', 'objective': 'Bounded review', 'budget_json': '{"max_tokens":4000}'}, [])
+        assert hits == ['/api/chat']
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_ollama_transport_passes_output_limit_and_runtime_timeout(monkeypatch):
+    seen = {}
+    import v5_model_transport
+    def request(url, payload, timeout_ms, check_current):
+        seen.update(payload=payload, timeout=timeout_ms / 1000)
+        check_current()
+        return json.dumps({'message': {'content': '{}'}, 'prompt_eval_count': 3, 'eval_count': 2}).encode()
+    monkeypatch.setattr(v5_model_transport, 'request_model', request)
+    output, prompt, completion, _ = v5_workers._local_model_output(
+        {'kind': 'ollama', 'base_url': 'http://127.0.0.1:11434', 'model': 'fixture'},
+        {'role': 'critic', 'objective': 'Review bounded claim',
+         'budget_json': '{"max_tokens":4000,"max_runtime_ms":250}'}, [])
+    assert 0 < seen['payload']['options']['num_predict'] < 4000
+    assert seen['timeout'] == .25
+    assert (output, prompt, completion) == ({}, 3, 2)
+
+
+def test_profile_bound_worker_uses_actual_http_and_records_route_usage(client):
+    _, cid = setup_campaign(client)
+    claim = node(client, cid, 'claim', 'Profile-specific bounded review')
+    calls = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            raw = json.dumps({'choices': [{'message': {'content': json.dumps({
+                'claim_node_id': claim['id'], 'weaknesses': [],
+                'counterevidence_ids': [], 'conclusion': 'inconclusive'})}}],
+                'usage': {'prompt_tokens': 11, 'completion_tokens': 7}}).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        def log_message(self, *_):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # The first registered healthy provider is intentionally unreachable.
+        for pid, port in [('wrong-first', 1), ('profile-selected', server.server_port)]:
+            with final_core.connect() as db:
+                now = final_core.utcnow()
+                db.execute('INSERT INTO runtime_providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', (
+                    pid, 'llama_cpp', pid, f'http://127.0.0.1:{port}', 'fixture-model', None,
+                    1, '{"location":"local"}', 'healthy', now, now, now))
+        response = client.put('/api/v1/runtime/config', json={
+            'name': 'Bounded worker profile', 'mode': 'offline',
+            'config': {'local_provider_ids': ['profile-selected'], 'max_tokens_per_call': 2000}})
+        assert response.status_code == 201, response.text
+        profile = response.json()['id']
+        task_response = client.post('/api/v1/workers/tasks', json={
+            'campaign_id': cid, 'role': 'critic', 'claim_ids': [claim['id']],
+            'objective': 'Use the selected runtime profile', 'idempotency_key': 'profile-worker',
+            'runtime_profile_id': profile})
+        assert task_response.status_code == 201, task_response.text
+        task = task_response.json()
+        tick = client.post('/api/v1/workers/local/tick?limit=1')
+        assert tick.status_code == 200, tick.text
+        assert tick.json()['completed'][0]['status'] == 'succeeded', tick.text
+        assert len(calls) == 1 and 0 < calls[0]['max_tokens'] < 2000
+        with final_core.connect() as db:
+            decision = db.execute('SELECT * FROM runtime_route_decisions WHERE task_id=?', (task['id'],)).fetchone()
+            usage = db.execute('SELECT * FROM runtime_usage WHERE task_id=?', (task['id'],)).fetchone()
+            assert decision['profile_id'] == profile and decision['provider_id'] == 'profile-selected'
+            assert json.loads(decision['request_json'])['provider_configuration_sha256']
+            assert usage['input_tokens'] == 11 and usage['output_tokens'] == 7
+        override = client.post('/api/v1/runtime/routes', json={
+            'task_type': 'critic', 'task_id': task['id'], 'profile_id': 'different-profile'})
+        assert override.status_code == 409
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('change', ['cancel', 'disabled', 'model', 'credential'])
+def test_cancel_api_interrupts_active_model_transport_without_result(client, monkeypatch, tmp_path, change):
+    import time
+    _, cid = setup_campaign(client)
+    claim = node(client, cid, 'claim', 'Cancelable bounded model review')
+    task = worker_task(client, cid, 'critic', [claim['id']], key='cancel-model-transport')
+    requested = threading.Event()
+    disconnected = threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(200)
+            self.send_header('Content-Length', '10000')
+            self.end_headers()
+            requested.set()
+            try:
+                for _ in range(200):
+                    self.wfile.write(b' ')
+                    self.wfile.flush()
+                    time.sleep(.025)
+            except (BrokenPipeError, ConnectionResetError):
+                disconnected.set()
+        def log_message(self, *_):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    results = []
+    ticking = threading.Thread(target=lambda: results.append(client.post('/api/v1/workers/local/tick?limit=1')),
+                               daemon=True)
+    try:
+        with final_core.connect() as db:
+            now = final_core.utcnow()
+            db.execute('INSERT INTO runtime_providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', (
+                'cancel-model', 'llama_cpp', 'Cancel fixture', f'http://127.0.0.1:{server.server_port}',
+                'fixture-model', None, 1, '{"location":"local"}', 'healthy', now, now, now))
+        ticking.start()
+        assert requested.wait(3)
+        start = time.monotonic()
+        if change == 'cancel':
+            changed = client.post(f"/api/v1/orchestration/tasks/{task['id']}/cancel")
+        else:
+            import runtime_secrets
+            monkeypatch.setattr(runtime_secrets, 'secret_root', lambda: tmp_path / 'secrets')
+            fields = {'disabled': {'enabled': False}, 'model': {'model': 'changed-model'},
+                      'credential': {'api_key': 'fixture-rotated-credential'}}
+            changed = client.patch('/api/v1/runtime/providers/cancel-model', json=fields[change])
+        assert changed.status_code == 200, changed.text
+        ticking.join(timeout=2)
+        assert not ticking.is_alive() and time.monotonic() - start < 2
+        assert results[0].status_code == 200
+        assert disconnected.wait(1)
+        state = client.get(f"/api/v1/orchestration/tasks/{task['id']}").json()
+        assert state['status'] == ('cancelled' if change == 'cancel' else 'paused') and state['result'] is None
+        with final_core.connect() as db:
+            assert db.execute('SELECT COUNT(*) FROM runtime_usage WHERE task_id=?', (task['id'],)).fetchone()[0] == 0
+            assert db.execute('SELECT COUNT(*) FROM agent_task_usage WHERE task_id=?', (task['id'],)).fetchone()[0] == 0
+            assert db.execute('SELECT state FROM runtime_calls WHERE task_id=?', (task['id'],)).fetchone()[0] == 'unknown'
+            assert db.execute('SELECT COUNT(*) FROM research_nodes WHERE campaign_id=?', (cid,)).fetchone()[0] == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        serving.join(timeout=2)
+        ticking.join(timeout=2)

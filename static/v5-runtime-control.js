@@ -1,0 +1,211 @@
+(() => {
+  "use strict";
+  window.createFieldworkRuntimeControl = ({state, esc, list, request, onConfig=()=>{}}) => {
+    const $ = selector => document.querySelector(selector);
+    const t = (zh, en) => document.documentElement.lang.startsWith("en") ? en : zh;
+    const copy = (zh, en) => `<span data-runtime-zh="${esc(zh)}" data-runtime-en="${esc(en)}">${esc(t(zh,en))}</span>`;
+    const label = (zh, en, field) => `<label>${copy(zh,en)}${field}</label>`;
+    const input = (id, type="text", attrs="") => `<input id="${id}" type="${type}" ${attrs}>`;
+    const number = (id, value, min, max, step=1) => input(id,"number",`required value="${value}" min="${min}" max="${max}" step="${step}"`);
+    const check = (id, zh, en, checked=false) => `<label class="check-line">${input(id,"checkbox",checked ? "checked" : "")}${copy(zh,en)}</label>`;
+    const button = (id, zh, en, type="button") => `<button id="${id}" type="${type}">${copy(zh,en)}</button>`;
+    const bindings = window.FieldworkLocale.bindings();
+    let calls=[], providers=[], profiles=[], campaigns=[], campaignId="", engagementId="", policy=null;
+    let generation=0, busy=false, offset=0, routes=[], routePage={}, failure="";
+    const panel = document.createElement("article");
+    panel.id="runtimeControl"; panel.className="panel runtime-control";
+    panel.innerHTML=`<header><h2>${copy("V5 模型配置与研究策略","V5 model configuration and research policy")}</h2>${button("rcRefresh","刷新配置","Refresh configuration")}</header>
+      <p>${copy("Profile 是不可变配置版本。研究组引用指定版本；创建或浏览配置不会调用模型。","Profiles are immutable configuration versions referenced by research teams. Creating or viewing configuration does not invoke a model.")}</p>
+      <p id="rcMessage" role="status"></p>
+      <details><summary>${copy("新增 V5 Provider","Add V5 provider")}</summary><form id="rcProviderForm" class="form-stack">
+        <div class="form-pair">${label("名称","Name",input("rcProviderName","text","required maxlength=120 autocomplete=off"))}
+          ${label("位置","Location",`<select id="rcLocation"><option value="local">Local</option><option value="cloud">Cloud</option></select>`)}</div>
+        <div class="form-pair">${label("接口类型","API kind",`<select id="rcKind"><option value="openai_compatible">OpenAI compatible</option><option value="ollama">Ollama</option><option value="llama_cpp">llama.cpp</option></select>`)}
+          ${label("模型 ID","Model ID",input("rcModel","text","required maxlength=200 autocomplete=off"))}</div>
+        ${label("API Base URL","API Base URL",input("rcBase","url","required autocomplete=off placeholder=http://127.0.0.1:11434"))}
+        ${label("API Key（可选）","API key (optional)",input("rcKey","password","minlength=8 maxlength=16384 autocomplete=new-password spellcheck=false"))}
+        <div class="form-pair">${label("每百万词元费用（µ）","Cost per million tokens (µ)",number("rcRate",0,0,10000000000))}
+          ${label("最大上下文词元","Maximum context tokens",number("rcContext",32768,1,10000000))}</div>
+        ${label("输入词元计数","Input token counting",`<select id="rcInputCounting"><option value="utf8_estimate" data-runtime-zh="保守字节预估" data-runtime-en="Conservative byte estimate">${t("保守字节预估","Conservative byte estimate")}</option><option value="llama_cpp_server" data-runtime-zh="本机 llama.cpp 服务端计数" data-runtime-en="Local llama.cpp server count">${t("本机 llama.cpp 服务端计数","Local llama.cpp server count")}</option></select>`)}
+        <p>${copy("输入先计入总额度，输出只使用剩余额度。字节预估不是精确计数；服务端计数需本机 llama.cpp 支持计数接口。","Input uses the total allowance first; generation uses the remainder. Byte estimates are not exact. Server counting requires the local llama.cpp counting endpoint.")}</p>
+        ${check("rcIndependent","声明支持独立模型路线；独立验证仍需隔离执行与证据","Declare independent model routing support; verification still requires isolation and evidence")}
+        ${check("rcProviderAccepted","确认将配置保存至本机后端","Confirm saving configuration to the local backend")}
+        ${button("rcProviderSave","保存 Provider","Save provider","submit")}</form></details>
+      <div id="rcProviderActions"></div>
+      <details><summary>${copy("创建新的 Profile 版本","Create a new profile version")}</summary><form id="rcProfileForm" class="form-stack">
+        <div class="form-pair">${label("Profile 名称","Profile name",input("rcProfileName","text","required maxlength=120 autocomplete=off"))}
+          ${label("模式","Mode",`<select id="rcMode"><option value="local">Local</option><option value="cloud">Cloud</option><option value="hybrid">Hybrid</option><option value="offline">Offline</option></select>`)}</div>
+        <p>${copy("Offline 可使用本机模型；所有敏感上下文强制本地。独立路线的本机限制同样适用。","Offline may use local models. Sensitive context always stays local, including independent routes.")}</p>
+        <fieldset><legend>${copy("本机 Provider","Local providers")}</legend><div id="rcLocalProviders"></div></fieldset>
+        <fieldset><legend>${copy("云端 Provider","Cloud providers")}</legend><div id="rcCloudProviders"></div></fieldset>
+        <fieldset><legend>${copy("独立模型路线","Independent model route")}</legend><div id="rcIndependentProviders"></div></fieldset>
+        <div class="form-pair">${label("单次词元上限","Tokens per call",number("rcMaxTokens",32768,1,2000000))}
+          ${label("累计费用上限（µ；0 表示未设置）","Cumulative cost cap (µ; 0 means unset)",number("rcMaxCost",1000000,0,1000000000))}</div>
+        <div class="form-pair">${label("模型调用并发上限（同一 Profile）","Concurrent model calls per profile",number("rcCallConcurrency",1,1,32))}
+          ${label("每小时词元上限（同一 Profile）","Hourly tokens per profile",number("rcHourlyTokens",1000000,1,100000000))}</div>
+        ${label("单次调用时限（毫秒，包含进程启动）","Call deadline in milliseconds, including process startup",number("rcCallRuntime",45000,1,45000))}
+        ${label("云升级复杂度阈值","Cloud escalation complexity threshold",number("rcThreshold",0.65,0,1,0.01))}
+        ${check("rcFallback","允许健康与预算约束下的回退","Allow fallback within health and budget limits",true)}
+        ${check("rcProfileAccepted","确认创建新版本，现有队伍继续引用原版本","Confirm a new version; existing teams keep their original version")}
+        ${button("rcProfileSave","创建 Profile 版本","Create profile version","submit")}</form></details>
+      <details><summary>${copy("检查模型路线","Inspect model routing")}</summary><form id="rcRouteForm" class="form-stack">
+        ${label("Profile","Profile",`<select id="rcRouteProfile" required></select>`)}
+        <div class="form-pair">${label("任务类型","Task type",input("rcTaskType","text","required value=hypothesis_exploration maxlength=120"))}
+          ${label("上下文敏感度","Context sensitivity",`<select id="rcSensitivity"><option value="internal">Internal</option><option value="public">Public</option><option value="private">Private</option><option value="secret">Secret</option></select>`)}</div>
+        <div class="form-pair">${label("复杂度","Complexity",number("rcComplexity",0.5,0,1,0.01))}${label("估算词元","Estimated tokens",number("rcEstimate",4000,1,2000000))}</div>
+        ${label("本次剩余费用预算（µ）","Remaining cost budget for this decision (µ)",number("rcRouteBudget",1000000,0,1000000000))}
+        ${check("rcRouteIndependent","要求独立模型路线","Require an independent model route")}
+        <p>${copy("检查只保存路由决策，不发送模型提示词，也不增加调用次数。","Inspection records a routing decision, sends no model prompt, and does not count as a call.")}</p>
+        ${button("rcRouteCheck","检查并记录路由决策","Inspect and record route decision","submit")}<pre id="rcRouteResult"></pre></form></details>
+      <h3>${copy("路由决策账本","Route decision ledger")}</h3><div id="rcRoutes"></div>
+      <h3>${copy("模型调用与预算预留","Model calls and budget reservations")}</h3>
+      <p>${copy("未知用量保留额度并阻止同一任务自动重发；关闭连接不代表模型服务已停止推理。这里只显示最近 50 条。","Unknown usage retains budget and blocks automatic task redispatch. Disconnecting does not prove server inference stopped. Showing the latest 50 calls.")}</p>
+      <div id="rcCalls"></div>${button("rcMoreRoutes","加载更多路由","Load more routes")}
+      <details><summary>${copy("持续研究策略","Continuous research policy")}</summary>
+        <div class="form-pair">${label("授权项目","Authorized project",`<select id="rcEngagement"></select>`)}${label("Research Campaign","Research campaign",`<select id="rcCampaign"></select>`)}</div>
+        <p id="rcPolicyState" role="status"></p><form id="rcPolicyForm" class="form-stack">
+          ${check("rcEnabled","启用定期增量研究入队","Enable scheduled incremental research queueing")}
+          ${check("rcIdle","仅在队列空闲时触发","Trigger only while the queue is idle",true)}
+          <div class="form-pair">${label("最小间隔（分钟）","Minimum interval (minutes)",number("rcInterval",60,1,10080))}
+            ${label("每日费用上限（µ；0 表示未设置）","Daily cost cap (µ; 0 means unset)",number("rcDaily",1000000,0,1000000000))}</div>
+          ${label("每次最多新增任务","Maximum new tasks per tick",number("rcTickTasks",4,1,50))}
+          <p>${copy("当前持续研究任务强制本地。云升级尚未接通；定期入队需要 App 后端在线，任务执行需要兼容 Worker。","Continuous research tasks currently stay local. Cloud escalation is not connected. Scheduled queueing requires the app backend online, and execution requires a compatible worker.")}</p>
+          ${check("rcPolicyAccepted","确认当前授权与策略变更；旧配置任务将取消","Confirm current authority and policy change; old configuration tasks will be cancelled")}
+          ${button("rcPolicySave","保存策略版本","Save policy version","submit")}
+        </form>${button("rcTick","执行一次增量入队检查","Run one incremental queue check")}<pre id="rcTickResult"></pre><div id="rcHistory"></div></details>`;
+    $("#runtime .page-heading").after(panel);
+    const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
+    function localize() {
+      panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
+      bindings.apply(); renderProviders(); renderRoutes(); renderCalls();
+    }
+    async function send(url, body, method="POST") {
+      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
+      try {
+        const result=await fetch(url,{method,headers:{Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify(body),signal:controller.signal});
+        const data=await result.json();
+        if(!result.ok) throw new Error(typeof data.detail==="string"?data.detail:`${result.status} ${result.statusText}`);
+        return data;
+      } catch(error) {
+        if(error.name==="AbortError")throw window.FieldworkLocale.error("请求超时，请刷新核对保存状态后重试。","Request timed out. Refresh to check saved state before retrying.");
+        throw error;
+      } finally {clearTimeout(timer)}
+    }
+    async function mutate(action, control) {
+      if(busy)return;
+      busy=true; control.disabled=true; showMessage("正在处理…","Working…");
+      try{await action()}catch(error){bindings.text($("#rcMessage"),()=>error.message)}
+      finally{busy=false;control.disabled=false}
+    }
+    const option=(id,name)=>`<option value="${esc(id)}">${esc(name)}</option>`;
+    function providerChecks(selector, values) {
+      const prior=new Set([...$(selector).querySelectorAll("input:checked")].map(node=>node.value));
+      $(selector).innerHTML=values.map(item=>`<label class="check-line"><input type="checkbox" value="${esc(item.id)}" ${prior.has(item.id)?"checked":""}>${esc(item.name)} · ${esc(item.model)} · ${esc(item.last_health)}</label>`).join("") || `<p>${t("尚无对应 Provider","No matching providers")}</p>`;
+    }
+    function renderProviders() {
+      $("#rcProviderActions").innerHTML=providers.map(item=>`<div class="runtime-provider-action"><span><b>${esc(item.name)}</b> · ${esc(item.model)} · ${esc(item.location)} · ${esc(item.last_health)}<small class="cell-subline">${esc(item.base_url)} · ${esc(item.last_health_at||"–")}</small></span><button type="button" data-rc-health="${esc(item.id)}">${t("检查连接","Check connection")}</button><button type="button" data-rc-toggle="${esc(item.id)}">${item.enabled?t("禁用","Disable"):t("启用","Enable")}</button></div>`).join("");
+      panel.querySelectorAll("[data-rc-health]").forEach(node=>node.onclick=()=>{
+        const provider=providers.find(item=>item.id===node.dataset.rcHealth);
+        if(!provider||!window.confirm(t(`连接 ${provider.base_url} 检查健康？不会调用模型。`,`Check health at ${provider.base_url}? No model prompt is sent.`)))return;
+        mutate(async()=>{const value=await send("/api/v1/runtime/providers/test",{provider_id:provider.id});await refresh();showMessage(`${provider.name}: ${value.status}`)},node);
+      });
+      panel.querySelectorAll("[data-rc-toggle]").forEach(node=>node.onclick=()=>{
+        const provider=providers.find(item=>item.id===node.dataset.rcToggle);
+        if(!provider)return;
+        mutate(async()=>{await send(`/api/v1/runtime/providers/${encodeURIComponent(provider.id)}`,{enabled:!provider.enabled},"PATCH");await refresh();showMessage("Provider 状态已更新。","Provider state updated.")},node);
+      });
+      providerChecks("#rcLocalProviders",providers.filter(item=>item.location==="local"));
+      providerChecks("#rcCloudProviders",providers.filter(item=>item.location==="cloud"));
+      providerChecks("#rcIndependentProviders",providers.filter(item=>item.metadata?.supports_independence));
+      const selected=$("#rcRouteProfile").value;
+      $("#rcRouteProfile").innerHTML=option("",t("选择 Profile","Select profile"))+profiles.map(item=>option(item.id,`${item.name} · ${item.mode} · ${item.id}${item.provider_configuration_bound===false?t(" · 旧版：未绑定 Provider 快照"," · Legacy: provider snapshot unbound"):""}`)).join("");
+      if(profiles.some(item=>item.id===selected))$("#rcRouteProfile").value=selected;
+    }
+    function renderRoutes() {
+      $("#rcRoutes").innerHTML=routes.length?`<div class="table-wrap"><table><thead><tr><th>Profile / Task</th><th>${t("路线 / 状态","Route / status")}</th><th>Provider / Model</th><th>${t("原因","Reason")}</th></tr></thead><tbody>${routes.map(item=>`<tr><td>${esc(item.profile_id||"–")}<small class="cell-subline">${esc(item.task_id||t("配置检查","Configuration inspection"))}</small></td><td>${esc(item.route)} / ${esc(item.status)}</td><td>${esc(item.provider_id||"–")}<small class="cell-subline">${esc(item.model||"–")}</small></td><td>${esc(list(item.reason).join(" · "))}<small class="cell-subline">${esc(item.created_at)}</small></td></tr>`).join("")}</tbody></table></div>`:`<p>${esc(failure||t("尚无路由决策。","No route decisions yet."))}</p>`;
+      $("#rcMoreRoutes").hidden=!routePage.has_more;
+    }
+    async function loadRoutes(append=false) {
+      const token=generation;
+      const value=await request(`/api/v1/runtime/routes?limit=50&offset=${append?offset:0}`);
+      if(token!==generation)return;
+      routes=append?[...routes,...list(value)]:list(value);offset=routes.length;routePage=value.page||{};renderRoutes();
+    }
+    async function loadCalls(token=generation) {
+      const value=await request("/api/v1/runtime/calls?limit=50");
+      if(token!==generation)return;
+      calls=list(value);renderCalls();
+    }
+    function renderCalls() {
+      const states={reserved:t("已预留","Reserved"),calling:t("调用中","Calling"),unknown:t("用量未知","Usage unknown"),settled:t("已结算","Settled"),released:t("发送前释放","Released before dispatch")};
+      $("#rcCalls").innerHTML=calls.length?`<div class="table-wrap"><table><thead><tr><th>Task / Profile</th><th>${t("状态","State")}</th><th>${t("预留词元 / 费用 µ","Reserved tokens / cost µ")}</th><th>${t("调用截止时间 / 用量记录","Deadline / usage record")}</th></tr></thead><tbody>${calls.map(item=>`<tr><td>${esc(item.task_id)}<small class="cell-subline">${esc(item.profile_id||"–")}</small></td><td>${esc(states[item.state]||item.state)}</td><td>${esc(item.reserved_tokens)} / ${esc(item.reserved_cost_micros)}<small class="cell-subline">${item.input_counting ? `${esc(item.input_counting === "llama_cpp_server" ? t("服务端报告计数","Server-reported count") : t("字节预估（非精确）","Byte estimate (not exact)"))}: ${esc(item.preflight_input_tokens)} · ${t("生成上限","Generation limit")} ${esc(item.output_max_tokens)}` : esc(t("无输入预检记录","No input preflight record"))}</small></td><td>${esc(item.deadline_at)}<small class="cell-subline">${esc(item.usage_id||"–")}</small></td></tr>`).join("")}</tbody></table></div>`:`<p>${esc(t("尚无模型调用预留。","No model call reservations yet."))}</p>`;
+    }
+    async function refresh() {
+      const token=++generation;failure="";
+      try {
+        const [config,ledger]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0")]);
+        if(token!==generation)return;
+        providers=list(config.providers);profiles=list(config.profiles);state.remote.runtimeConfig={ok:true,data:config};
+        onConfig();
+        routes=list(ledger);offset=routes.length;routePage=ledger.page||{};renderProviders();renderRoutes();await loadCalls(token);
+        await loadCampaigns(token);
+      } catch(error){if(token===generation){failure=error.message;showMessage(error.message);renderRoutes();$("#rcCalls").textContent=error.message}}
+    }
+    async function loadCampaigns(token=++generation) {
+      const projects=list(state.engagements);if(!projects.some(item=>item.id===engagementId))engagementId=projects[0]?.id||"";
+      $("#rcEngagement").innerHTML=option("",t("选择项目","Select project"))+projects.map(item=>option(item.id,item.name||item.id)).join("");$("#rcEngagement").value=engagementId;
+      const result=engagementId?list(await request(`/api/v1/engagements/${encodeURIComponent(engagementId)}/campaigns`)):[];
+      if(token!==generation)return;
+      campaigns=result;
+      if(!campaigns.some(item=>item.id===campaignId))campaignId=campaigns[0]?.id||"";
+      $("#rcCampaign").innerHTML=option("",t("选择 Campaign","Select campaign"))+campaigns.map(item=>option(item.id,item.name||item.id)).join("");$("#rcCampaign").value=campaignId;
+      await loadPolicy(token);
+    }
+    async function loadPolicy(token=++generation) {
+      policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true;
+      if(!campaignId){$("#rcTickResult").textContent="";bindings.forget($("#rcHistory"));$("#rcHistory").textContent="";bindings.text($("#rcPolicyState"),()=>t("选择已授权项目与 Campaign 后配置。","Select an authorized project and campaign to configure."));return}
+      try{
+        const [value,history]=await Promise.all([request(`/api/v1/continuous-research/campaigns/${encodeURIComponent(campaignId)}`),request(`/api/v1/continuous-research/campaigns/${encodeURIComponent(campaignId)}/history`)]);
+        if(token!==generation)return;
+        policy=value.policy;$("#rcEnabled").checked=!!policy.enabled;$("#rcIdle").checked=!!policy.idle_only;
+        $("#rcInterval").value=policy.min_interval_minutes;$("#rcDaily").value=policy.daily_budget_micros;$("#rcTickTasks").value=policy.max_tasks_per_tick;$("#rcPolicyAccepted").checked=false;
+        $("#rcPolicySave").disabled=false;$("#rcTick").disabled=!policy.enabled;
+        bindings.text($("#rcPolicyState"),()=>`${t("配置版本","Configuration revision")}: ${value.configuration_revision} · ${value.configuration_sha256||t("未配置","Not configured")} · ${t("下次检查","Next tick")}: ${value.next_tick_at||"–"}`);
+        bindings.html($("#rcHistory"),()=>list(history).map(item=>`<p>${t("版本","Revision")} ${esc(item.revision)} · ${esc(item.created_at)}<small class="cell-subline">Scope ${esc(item.scope_snapshot_id)} · Policy ${esc(item.policy_id)}</small><small class="cell-subline mono">${esc(item.sha256)}</small></p>`).join(""));
+      }catch(error){if(token===generation)bindings.text($("#rcPolicyState"),()=>error.message)}
+    }
+    $("#rcProviderForm").onsubmit=event=>{
+      event.preventDefault();if(!$("#rcProviderAccepted").checked)return;
+      const body={name:$("#rcProviderName").value.trim(),location:$("#rcLocation").value,kind:$("#rcKind").value,base_url:$("#rcBase").value.trim(),model:$("#rcModel").value.trim(),api_key:$("#rcKey").value||null,
+        metadata:{supports_independence:$("#rcIndependent").checked,cost_micros_per_million_tokens:Number($("#rcRate").value),max_context_tokens:Number($("#rcContext").value),input_token_counting:$("#rcInputCounting").value}};
+      mutate(async()=>{try{await send("/api/v1/runtime/providers",body);event.target.reset();await refresh();showMessage("Provider 已保存；请显式检查连接。","Provider saved. Explicitly check its connection.")}finally{$("#rcKey").value="";body.api_key=null}},$("#rcProviderSave"));
+    };
+    $("#rcProfileForm").onsubmit=event=>{
+      event.preventDefault();if(!$("#rcProfileAccepted").checked)return;
+      const ids=selector=>[...$(selector).querySelectorAll("input:checked")].map(node=>node.value);
+      const body={name:$("#rcProfileName").value.trim(),mode:$("#rcMode").value,config:{local_provider_ids:ids("#rcLocalProviders"),cloud_provider_ids:ids("#rcCloudProviders"),independent_provider_ids:ids("#rcIndependentProviders"),allow_fallback:$("#rcFallback").checked,cloud_complexity_threshold:Number($("#rcThreshold").value),max_tokens_per_call:Number($("#rcMaxTokens").value),max_cost_micros:Number($("#rcMaxCost").value),max_concurrent_calls:Number($("#rcCallConcurrency").value),max_tokens_per_hour:Number($("#rcHourlyTokens").value),max_runtime_ms_per_call:Number($("#rcCallRuntime").value)}};
+      const selectedIds=new Set([...body.config.local_provider_ids,...body.config.cloud_provider_ids,...body.config.independent_provider_ids]);
+      body.config.provider_config_hashes=Object.fromEntries(providers.filter(item=>selectedIds.has(item.id)).map(item=>[item.id,item.configuration_sha256]));
+      mutate(async()=>{const value=await send("/api/v1/runtime/config",body,"PUT");await refresh();$("#rcRouteProfile").value=value.id;$("#rcProfileAccepted").checked=false;showMessage(`Profile ${value.id} ${t("已保存。","saved.")}`)},$("#rcProfileSave"));
+    };
+    $("#rcRouteForm").onsubmit=event=>{
+      event.preventDefault();mutate(async()=>{const value=await send("/api/v1/runtime/routes",{profile_id:$("#rcRouteProfile").value,task_type:$("#rcTaskType").value,sensitivity:$("#rcSensitivity").value,complexity:Number($("#rcComplexity").value),estimated_tokens:Number($("#rcEstimate").value),budget_remaining_micros:Number($("#rcRouteBudget").value),requires_independence:$("#rcRouteIndependent").checked});$("#rcRouteResult").textContent=JSON.stringify(value,null,2);await loadRoutes();showMessage("路由决策已记录；模型调用次数未增加。","Route decision recorded; model call count did not increase.")},$("#rcRouteCheck"));
+    };
+    $("#rcPolicyForm").onsubmit=event=>{
+      event.preventDefault();if(!campaignId||!policy||!$("#rcPolicyAccepted").checked)return;
+      const body={...policy,enabled:$("#rcEnabled").checked,idle_only:$("#rcIdle").checked,min_interval_minutes:Number($("#rcInterval").value),daily_budget_micros:Number($("#rcDaily").value),max_tasks_per_tick:Number($("#rcTickTasks").value),local_first:true,sensitive_local_only:true,cloud_escalation:false,max_cloud_tasks_per_tick:0};
+      mutate(async()=>{await send(`/api/v1/continuous-research/campaigns/${encodeURIComponent(campaignId)}`,body,"PUT");await loadPolicy();showMessage("策略版本已保存。","Policy version saved.")},$("#rcPolicySave"));
+    };
+    $("#rcTick").onclick=()=>{if(!campaignId||!window.confirm(t("检查当前图谱变化并按预算新增持久任务？","Check graph changes and queue tasks within the budget?")))return;mutate(async()=>{const value=await send(`/api/v1/continuous-research/campaigns/${encodeURIComponent(campaignId)}/tick`,{});$("#rcTickResult").textContent=JSON.stringify(value,null,2);await loadPolicy()},$("#rcTick"))};
+    $("#rcEngagement").onchange=event=>{engagementId=event.target.value;campaignId="";loadCampaigns().catch(error=>showMessage(error.message))};
+    $("#rcCampaign").onchange=event=>{campaignId=event.target.value;loadPolicy()};
+    $("#rcRefresh").onclick=refresh;$("#rcMoreRoutes").onclick=()=>loadRoutes(true).catch(error=>showMessage(error.message));
+    for(const [formId,acceptedId] of [["rcProviderForm","rcProviderAccepted"],["rcProfileForm","rcProfileAccepted"],["rcPolicyForm","rcPolicyAccepted"]]){
+      $(`#${acceptedId}`).required=true;
+      $(`#${formId}`).addEventListener("input",event=>{if(event.target.id!==acceptedId)$(`#${acceptedId}`).checked=false});
+    }
+    document.addEventListener("fieldwork:languagechange",localize);
+    localize();
+    return {refresh,reset(){generation++;engagementId=campaignId="";policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true}};
+  };
+})();

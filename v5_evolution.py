@@ -630,8 +630,15 @@ def submit_evolver_result(task_id: str, body: EvolverResult):
         result = {"claim_node_id": claim_id, "parent_variant_ids": output.parent_variant_ids,
                   "mode": output.mode, "status": "draft"}
         now = _now()
-        db.execute("INSERT INTO agent_task_usage VALUES(?,?,?,?,?,?)", (
-            task_id, body.input_tokens, body.output_tokens, 0, body.runtime_ms, now))
+        from v5_runtime_calls import spent_runtime_ms
+        cumulative_runtime = max(body.runtime_ms, spent_runtime_ms(db, task_id))
+        budget = _load(task['budget_json'])
+        if cumulative_runtime > budget.get('max_runtime_ms', 45_000):
+            raise HTTPException(409, 'evolver cumulative runtime budget exceeded')
+        db.execute("INSERT INTO agent_task_usage VALUES(?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
+                   "input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,"
+                   "cost_micros=excluded.cost_micros,runtime_ms=excluded.runtime_ms,updated_at=excluded.updated_at", (
+            task_id, body.input_tokens, body.output_tokens, 0, cumulative_runtime, now))
         db.execute("UPDATE agent_tasks SET status='succeeded',result_json=?,lease_owner=NULL,"
                    "lease_expires_at=NULL,heartbeat_at=NULL,updated_at=? WHERE id=?",
                    (_dump(result), now, task_id))

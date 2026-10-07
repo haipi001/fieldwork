@@ -1,4 +1,33 @@
 /* Shared native-app finish: quieter surfaces, clearer actions and readable density. */
+.team-toolbar,.team-role-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end}
+.team-toolbar{grid-template-columns:minmax(150px,1.4fr) minmax(150px,1.4fr) minmax(150px,1.4fr) auto auto;margin:12px 0}
+.team-toolbar label,.team-role-grid label{display:grid;gap:6px;color:var(--muted);font-size:12px}
+.team-toolbar select,.team-role-grid select,.team-role-grid input{width:100%;min-width:0}
+.team-summary{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}
+.team-summary span{padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+.team-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:14px 0}
+.team-group{min-width:0}.team-group.selected{border-color:var(--accent)}
+.team-group header{display:flex;justify-content:space-between;gap:12px;align-items:start}
+.team-group h3{font-size:16px;margin:4px 0 0;overflow-wrap:anywhere}
+.team-group p{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.team-group-actions{display:flex;flex-wrap:wrap;gap:8px}.team-error{color:var(--danger,#b34141)}
+#agentsContent button,#teamDialog button{padding:8px 11px;border:1px solid var(--line-2);border-radius:6px;background:var(--surface-2);color:var(--text);cursor:pointer}
+#agentsContent button.primary-button,#teamDialog button.primary-button{background:var(--blue);color:var(--surface);border-color:var(--blue)}
+#agentsContent button:disabled,#teamDialog button:disabled{opacity:.5;cursor:not-allowed}
+.team-toolbar select{padding:8px;border:1px solid var(--line-2);border-radius:6px;background:var(--surface-2);color:var(--text)}
+#teamDialog .team-role-grid{margin:8px 0}#teamPreviewResult{margin:10px 0}
+.runtime-control{margin:16px 0}.runtime-control details{margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:8px}
+.runtime-control summary{cursor:pointer;font-weight:600}.runtime-control form{margin-top:14px}
+.runtime-control input,.runtime-control select{min-width:0;max-width:100%;background:var(--surface-2);color:var(--text);border:1px solid var(--line-2);border-radius:6px;padding:8px}
+.runtime-control button{appearance:none;background:var(--surface-2);color:var(--text);border:1px solid var(--line-2);border-radius:6px;padding:8px 11px;cursor:pointer}
+.runtime-control button:disabled{opacity:.5;cursor:not-allowed}.runtime-control fieldset{border:1px solid var(--line);border-radius:6px;min-width:0}
+.runtime-control .form-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.runtime-control pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:280px;overflow:auto}.runtime-control p{overflow-wrap:anywhere}
+.runtime-provider-action{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}
+.runtime-provider-action>span{flex:1;min-width:180px;overflow-wrap:anywhere}
+@media(max-width:720px){.runtime-control .form-pair{grid-template-columns:1fr}}
+@media(max-width:1100px){.team-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:720px){.team-toolbar,.team-role-grid,.team-groups{grid-template-columns:1fr}}
 :root{--panel-gap:16px;--radius-md:12px;--page-padding:28px;--surface-1:var(--surface)}
 .app-shell,.main{min-height:100dvh}
 .view{padding-top:28px}

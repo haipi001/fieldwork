@@ -43,6 +43,7 @@ from v5_runtime import router as v5_runtime_router
 from v5_continuous import router as v5_continuous_router, run_due as run_due_continuous_research
 from v5_intelligence import router as v5_intelligence_router
 from v5_workers import router as v5_workers_router
+from v5_research_worker import router as v5_research_worker_router
 from v5_evolution import router as v5_evolution_router
 
 ROOT = Path(__file__).resolve().parent
@@ -225,6 +226,8 @@ async def lifespan(_: FastAPI):
             except asyncio.CancelledError:
                 pass
             mark_campaign_scheduler(running=False)
+        from v5_research_worker import stop_workers
+        await asyncio.to_thread(stop_workers)
         shutdown_labs()
 
 
@@ -246,6 +249,7 @@ app.include_router(v5_runtime_router)
 app.include_router(v5_continuous_router)
 app.include_router(v5_intelligence_router)
 app.include_router(v5_workers_router)
+app.include_router(v5_research_worker_router)
 app.include_router(v5_evolution_router)
 app.add_middleware(SessionAuthMiddleware, allow_test_bypass=True)
 app.add_middleware(LocalBoundaryMiddleware, port=int(os.getenv("FIELDWORK_PORT", "8000")))

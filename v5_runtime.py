@@ -53,6 +53,10 @@ def _sha(value: Any) -> str:
     return hashlib.sha256(_dump(value).encode()).hexdigest()
 
 
+def _provider_config_hash(row: sqlite3.Row) -> str:
+    return _sha({key: row[key] for key in ("id", "kind", "base_url", "model", "metadata_json")})
+
+
 def _emit(db: sqlite3.Connection, entity_id: str, event_type: str,
           payload: dict[str, Any], campaign_id: str | None = None) -> None:
     db.execute(
@@ -82,12 +86,13 @@ def _location(row: sqlite3.Row) -> str:
 def _provider_view(row: sqlite3.Row) -> dict[str, Any]:
     metadata = _load(row["metadata_json"], {})
     safe_metadata = {key: metadata[key] for key in (
-        "priority", "tier", "supports_independence", "cost_micros_per_million_tokens", "max_context_tokens"
+        "priority", "tier", "supports_independence", "cost_micros_per_million_tokens", "max_context_tokens", "input_token_counting"
     ) if key in metadata}
     return {
         "id": row["id"], "kind": row["kind"], "name": row["name"],
         "location": _location(row), "base_url": row["base_url"], "model": row["model"],
         "enabled": bool(row["enabled"]), "metadata": safe_metadata,
+        "configuration_sha256": _provider_config_hash(row),
         "secret_configured": bool(row["secret_ref"]), "last_health": row["last_health"] or "unknown",
         "last_health_at": row["last_health_at"], "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
@@ -105,6 +110,7 @@ def _profile_view(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"], "name": row["name"], "mode": row["mode"],
         "config": config, "immutable_hash": row["immutable_hash"],
+        "provider_configuration_bound": "provider_config_hashes" in raw,
         "created_at": row["created_at"],
     }
 
@@ -143,6 +149,7 @@ class ProviderMetadata(BaseModel):
     supports_independence: bool = False
     cost_micros_per_million_tokens: int = Field(default=0, ge=0, le=10_000_000_000)
     max_context_tokens: int = Field(default=32768, ge=1, le=10_000_000)
+    input_token_counting: Literal['utf8_estimate', 'llama_cpp_server'] = 'utf8_estimate'
 
 
 class ProviderCreate(BaseModel):
@@ -173,6 +180,10 @@ class ProfileConfig(BaseModel):
     cloud_complexity_threshold: float = Field(default=.65, ge=0, le=1)
     max_tokens_per_call: int = Field(default=32768, ge=1, le=2_000_000)
     max_cost_micros: int = Field(default=0, ge=0)
+    max_concurrent_calls: int = Field(default=1, strict=True, ge=1, le=32)
+    max_tokens_per_hour: int = Field(default=1_000_000, strict=True, ge=1, le=100_000_000)
+    max_runtime_ms_per_call: int = Field(default=45_000, strict=True, ge=1, le=45_000)
+    provider_config_hashes: dict[str, str] = Field(default_factory=dict, max_length=300)
 
 
 class ProfileCreate(BaseModel):
@@ -196,14 +207,18 @@ class RouteRequest(BaseModel):
 
 class UsageReport(BaseModel):
     decision_id: str = Field(min_length=1, max_length=200)
+    call_id: str | None = Field(default=None, min_length=1, max_length=200)
     idempotency_key: str = Field(min_length=1, max_length=200)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cost_micros: int = Field(default=0, ge=0)
+    runtime_ms: int | None = Field(default=None, strict=True, ge=0)
 
 
 @router.post("/providers", status_code=201)
 def create_provider(body: ProviderCreate):
+    if body.metadata.input_token_counting == 'llama_cpp_server' and (body.location != 'local' or body.kind != 'llama_cpp'):
+        raise HTTPException(422, 'server input counting requires local llama.cpp')
     base_url = _validated_base_url(body.base_url, body.location)
     metadata = body.metadata.model_dump(mode="json")
     metadata["location"] = body.location
@@ -276,6 +291,8 @@ def update_provider(provider_id: str, body: ProviderUpdate):
     if body.api_key or body.clear_secret:
         assignments.append("secret_ref=?")
         values.append(None if body.clear_secret else secret_ref)
+    if (body.model is not None and body.model != row["model"]) or body.api_key or body.clear_secret:
+        assignments.extend(["last_health='unknown'", "last_health_at=NULL"])
     values.append(provider_id)
     try:
         with f.connect() as db:
@@ -325,13 +342,22 @@ def _validate_profile_providers(db: sqlite3.Connection, config: ProfileConfig) -
 @router.put("/config", status_code=201)
 def create_profile(body: ProfileCreate):
     config = body.config.model_dump(mode="json")
-    canonical = {"name": body.name, "mode": body.mode, "config": config}
-    digest, now = _sha(canonical), _now()
-    profile_id = f"profile-{digest[:24]}"
+    now = _now()
     f = _core()
     with f.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         _validate_profile_providers(db, body.config)
+        provider_ids = set(body.config.local_provider_ids + body.config.cloud_provider_ids
+                           + body.config.independent_provider_ids)
+        snapshots = {row["id"]: _provider_config_hash(row) for row in db.execute(
+            f"SELECT * FROM runtime_providers WHERE id IN ({','.join('?' for _ in provider_ids)})",
+            list(provider_ids),
+        ).fetchall()} if provider_ids else {}
+        if body.config.provider_config_hashes and body.config.provider_config_hashes != snapshots:
+            raise HTTPException(409, "provider configuration changed; review a new profile")
+        config["provider_config_hashes"] = snapshots
+        digest = _sha({"name": body.name, "mode": body.mode, "config": config})
+        profile_id = f"profile-{digest[:24]}"
         existing = db.execute("SELECT * FROM runtime_profiles WHERE immutable_hash=?", (digest,)).fetchone()
         if existing:
             return _profile_view(existing)
@@ -445,6 +471,14 @@ def _task_constraints(db: sqlite3.Connection, request: RouteRequest) -> tuple[st
         if request.campaign_id and task["campaign_id"] != request.campaign_id:
             raise HTTPException(409, "task does not belong to the requested campaign")
         context = _load(task["context_capsule_json"], {})
+        if context.get('native_discovery'):
+            sensitivity = 'secret'
+        if context.get("team_plan"):
+            if context.get("cloud_context_approved") is not True:
+                sensitivity = "secret"
+            from v5_orchestration import _continuous_scope_current
+            if not _continuous_scope_current(db, task):
+                raise HTTPException(409, "team scope, policy or run changed")
         if context.get("continuous_research") or context.get("structured_worker"):
             from v5_orchestration import _continuous_scope_current
             if not _continuous_scope_current(db, task):
@@ -474,9 +508,10 @@ def _ordered(rows: list[sqlite3.Row], complexity: float) -> list[sqlite3.Row]:
     ))
 
 
-def _provider_pool(rows: list[sqlite3.Row], location: str, configured: list[str]) -> list[sqlite3.Row]:
+def _provider_pool(rows: list[sqlite3.Row], location: str, configured: list[str], allow_unconfigured: bool = True) -> list[sqlite3.Row]:
     allowed = set(configured)
-    return [row for row in rows if _location(row) == location and (not allowed or row["id"] in allowed)]
+    return [row for row in rows if _location(row) == location
+            and (row["id"] in allowed or (not allowed and allow_unconfigured))]
 
 
 def _estimated_cost(row: sqlite3.Row, tokens: int) -> int:
@@ -503,7 +538,12 @@ def route_task(request: RouteRequest):
             group_profile_id = group["runtime_profile_id"] if group else None
         if request.profile_id and group_profile_id and request.profile_id != group_profile_id:
             raise HTTPException(409, "task group runtime profile cannot be overridden")
-        effective_profile_id = group_profile_id or request.profile_id
+        capsule_profile_id = _load(task["context_capsule_json"], {}).get("runtime_profile_id") if task else None
+        if capsule_profile_id and request.profile_id and capsule_profile_id != request.profile_id:
+            raise HTTPException(409, "task runtime profile cannot be overridden")
+        if capsule_profile_id and group_profile_id and capsule_profile_id != group_profile_id:
+            raise HTTPException(409, "task and group runtime profiles conflict")
+        effective_profile_id = group_profile_id or capsule_profile_id or request.profile_id
         profile = db.execute("SELECT * FROM runtime_profiles WHERE id=?", (effective_profile_id,)).fetchone() if effective_profile_id else None
         if effective_profile_id and not profile:
             raise HTTPException(404, "runtime profile not found")
@@ -525,18 +565,25 @@ def route_task(request: RouteRequest):
                 budget_caps.append(int(task_budget["max_cost_micros"]))
         available_budget = min(budget_caps) if budget_caps else 0
         healthy = _healthy_providers(db)
-        local = _ordered(_provider_pool(healthy, "local", config.local_provider_ids), request.complexity)
-        cloud = _ordered(_provider_pool(healthy, "cloud", config.cloud_provider_ids), request.complexity)
+        changed_provider_ids = [row["id"] for row in healthy
+                                if row["id"] in config.provider_config_hashes
+                                and _provider_config_hash(row) != config.provider_config_hashes[row["id"]]]
+        healthy = [row for row in healthy if row["id"] not in changed_provider_ids]
+        bound_profile = bool(profile and "provider_config_hashes" in _load(profile["config_json"], {}))
+        local = _ordered(_provider_pool(healthy, "local", config.local_provider_ids, not bound_profile), request.complexity)
+        cloud = _ordered(_provider_pool(healthy, "cloud", config.cloud_provider_ids, not bound_profile), request.complexity)
         independent_ids = set(config.independent_provider_ids)
         independent = _ordered([
             row for row in healthy if _load(row["metadata_json"], {}).get("supports_independence")
-            and (not independent_ids or row["id"] in independent_ids)
+            and (row["id"] in independent_ids or (not independent_ids and not bound_profile))
         ], request.complexity)
         reasons: list[str] = []
         provider: sqlite3.Row | None = None
         route = "blocked"
         if request.requires_independence:
-            candidates = [row for row in independent if sensitivity not in {"private", "secret"} or _location(row) == "local"]
+            candidates = [row for row in independent
+                          if (sensitivity not in {"private", "secret"} and mode not in {"local", "offline"})
+                          or _location(row) == "local"]
             provider = candidates[0] if candidates else None
             route, reasons = ("independent", ["independence_required"]) if provider else ("blocked", ["no_healthy_independent_provider"])
         elif sensitivity in {"private", "secret"}:
@@ -567,6 +614,8 @@ def route_task(request: RouteRequest):
                 reasons = ["preferred_provider_unavailable_fallback"]
             else:
                 reasons = ["no_healthy_provider_for_hybrid_route"]
+        if changed_provider_ids:
+            reasons.append("profile_provider_configuration_changed")
         if provider:
             max_tokens = min(max_tokens, int(_load(provider["metadata_json"], {}).get("max_context_tokens", max_tokens)))
         estimated_cost = _estimated_cost(provider, max_tokens) if provider and _location(provider) == "cloud" else 0
@@ -583,7 +632,8 @@ def route_task(request: RouteRequest):
                 reasons.append("cloud_budget_preflight_blocked")
         status = "selected" if provider else "blocked"
         max_cost = min(available_budget, estimated_cost) if provider and route in {"cloud", "independent"} and _location(provider) == "cloud" else 0
-        safe_request = request.model_dump(mode="json") | {"effective_sensitivity": sensitivity}
+        safe_request = request.model_dump(mode="json") | {"effective_sensitivity": sensitivity,
+            "provider_configuration_sha256": _provider_config_hash(provider) if provider else None}
         db.execute(
             "INSERT INTO runtime_route_decisions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (decision_id, campaign_id, request.task_id, effective_profile_id, _dump(safe_request), route,
@@ -595,7 +645,8 @@ def route_task(request: RouteRequest):
     return {"id": decision_id, "status": status, "mode": mode, "profile_id": effective_profile_id, "route": route,
             "provider_ref": provider["id"] if provider else None, "model": provider["model"] if provider else None,
             "reason": reasons, "max_tokens": max_tokens, "max_cost_micros": max_cost,
-            "estimated_cost_micros": estimated_cost, "effective_sensitivity": sensitivity}
+            "estimated_cost_micros": estimated_cost, "effective_sensitivity": sensitivity,
+            "provider_configuration_sha256": _provider_config_hash(provider) if provider else None}
 
 
 @router.get("/routes")
@@ -620,6 +671,10 @@ def list_routes(campaign_id: str | None = None, limit: int = Query(100, ge=1, le
 @router.post("/usage", status_code=201)
 def record_usage(body: UsageReport):
     payload = body.model_dump(mode="json")
+    if body.call_id is None:
+        payload.pop("call_id", None)
+    if body.runtime_ms is None:
+        payload.pop("runtime_ms", None)
     digest, f, now = _sha(payload), _core(), _now()
     with f.connect() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -633,6 +688,13 @@ def record_usage(body: UsageReport):
         decision = db.execute("SELECT * FROM runtime_route_decisions WHERE id=?", (body.decision_id,)).fetchone()
         if not decision or decision["status"] != "selected" or not decision["provider_id"]:
             raise HTTPException(409, "usage requires a selected runtime route decision")
+        call = db.execute("SELECT * FROM runtime_calls WHERE decision_id=?", (body.decision_id,)).fetchone()
+        if call and (body.call_id != call["id"] or call["state"] not in {"calling", "unknown"}):
+            raise HTTPException(409, "usage must settle the reserved model call")
+        if body.call_id and not call:
+            raise HTTPException(409, "model call reservation not found")
+        if body.runtime_ms is not None and not call:
+            raise HTTPException(409, "model timing requires a call reservation")
         selected_provider = db.execute("SELECT * FROM runtime_providers WHERE id=?", (decision["provider_id"],)).fetchone()
         if selected_provider and _location(selected_provider) == "local" and body.cost_micros:
             raise HTTPException(422, "local route usage cannot report cloud cost")
@@ -643,6 +705,18 @@ def record_usage(body: UsageReport):
              body.input_tokens, body.output_tokens, body.cost_micros, now),
         )
         usage_id = cursor.lastrowid
+        if call:
+            db.execute("UPDATE runtime_calls SET state='settled',usage_id=?,updated_at=? WHERE id=?",
+                       (usage_id, now, call["id"]))
+            if body.runtime_ms is not None:
+                prior = db.execute("SELECT COALESCE(SUM(COALESCE(t.runtime_ms,c.max_runtime_ms)),0),"
+                                   "COALESCE(MAX(t.legacy_runtime_ms),0) FROM runtime_calls c "
+                                   "LEFT JOIN runtime_call_timings t ON t.call_id=c.id "
+                                   "WHERE c.task_id=? AND c.id!=? AND c.state!='released'",
+                                   (call['task_id'], call['id'])).fetchone()
+                legacy = db.execute('SELECT runtime_ms FROM agent_task_usage WHERE task_id=?', (call['task_id'],)).fetchone()
+                baseline = max(prior[1], (legacy[0] if legacy else 0) - prior[0])
+                db.execute("INSERT INTO runtime_call_timings VALUES(?,?,?,?)", (call["id"], body.runtime_ms, baseline, now))
         db.execute("INSERT INTO runtime_usage_reports VALUES(?,?,?,?,?)",
                    (body.idempotency_key, body.decision_id, usage_id, digest, now))
         _emit(db, str(usage_id), "usage.recorded",
@@ -660,6 +734,27 @@ def _usage_value(row: sqlite3.Row, db: sqlite3.Connection) -> dict[str, Any]:
     value["decision_id"] = report["decision_id"]
     value["over_budget"] = value["cost_micros"] > decision["max_cost_micros"]
     return value
+
+
+@router.get("/calls")
+def list_model_calls(campaign_id: str | None = None, limit: int = Query(50, ge=1, le=500),
+                     offset: int = Query(0, ge=0)):
+    from v5_runtime_calls import recover_calls
+    where, params = (" WHERE campaign_id=?", [campaign_id]) if campaign_id else ("", [])
+    with _core().connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        recover_calls(db)
+        total = db.execute("SELECT COUNT(*) FROM runtime_calls" + where, params).fetchone()[0]
+        rows = db.execute("SELECT c.*,p.strategy input_counting,p.input_tokens preflight_input_tokens,"
+                          "p.output_max_tokens FROM runtime_calls c LEFT JOIN runtime_call_inputs p ON p.call_id=c.id"
+                          + where + " ORDER BY c.created_at DESC,c.id LIMIT ? OFFSET ?",
+                          [*params, limit, offset]).fetchall()
+        states = db.execute("SELECT state,COUNT(*) count,SUM(reserved_tokens) tokens,SUM(reserved_cost_micros) cost "
+                            "FROM runtime_calls" + where + " GROUP BY state", params).fetchall()
+    return {"items": [dict(row) for row in rows], "page": {"total": total, "limit": limit,
+            "offset": offset, "has_more": offset + len(rows) < total},
+            "states": {row["state"]: {"count": row["count"], "reserved_tokens": row["tokens"],
+                                      "reserved_cost_micros": row["cost"]} for row in states}}
 
 
 @router.get("/usage")

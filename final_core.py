@@ -698,6 +698,7 @@ class StartAnalysisInput(BaseModel):
     include_strix: bool = False
     include_shannon: bool = False
     include_native_agent: bool = True
+    native_runtime_profile_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class ResearchCampaignInput(BaseModel):
@@ -903,6 +904,12 @@ def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -
     for capability in _planned_capabilities(engagement, body):
         item = native if capability == "native-agent" else inventory.get(capability, {})
         ready = bool(item.get("ready", item.get("available") and item.get("configured", True)))
+        if capability == 'native-agent':
+            from v5_native_discovery import validate_profile
+            try:
+                validate_profile(body.native_runtime_profile_id)
+            except HTTPException:
+                ready = False
         reason = "已就绪" if ready else ("需要模型 API 或系统 Chrome" if capability == "native-agent" else "未安装、未配置或运行时不可用")
         tools.append({"id": capability, "ready": ready, "version": item.get("version") or item.get("browser") or "未探测", "reason": reason, "optional": capability in {"native-agent", "strix", "shannon", "aderyn", "echidna", "medusa", "halmos"}})
         if not ready:

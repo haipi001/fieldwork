@@ -27,6 +27,30 @@ def configure(client, campaign_id, **values):
     return response.json()
 
 
+def test_policy_versions_are_bound_and_old_tasks_cancel_on_change(client):
+    _, campaign_id = setup_campaign(client)
+    add_node(client, campaign_id, "observation", "Policy revision signal")
+    first = configure(client, campaign_id)
+    assert first["configuration_revision"] == 1
+    ticked = client.post(f"/api/v1/continuous-research/campaigns/{campaign_id}/tick", json={}).json()
+    assert len(ticked["tasks_enqueued"]) == 1
+    same = configure(client, campaign_id)
+    assert same["configuration_revision"] == 1
+    with final_core.connect() as db:
+        assert db.execute("SELECT status FROM agent_tasks WHERE campaign_id=?", (campaign_id,)).fetchone()[0] == "queued"
+    second = configure(client, campaign_id, max_tasks_per_tick=3)
+    assert second["configuration_revision"] == 2
+    assert second["configuration_sha256"] != first["configuration_sha256"]
+    with final_core.connect() as db:
+        assert db.execute("SELECT status FROM agent_tasks WHERE campaign_id=?", (campaign_id,)).fetchone()[0] == "cancelled"
+        db.execute("UPDATE continuous_research_state SET next_tick_at='2000-01-01T00:00:00+00:00' WHERE campaign_id=?", (campaign_id,))
+    renewed = client.post(f"/api/v1/continuous-research/campaigns/{campaign_id}/tick", json={}).json()
+    assert len(renewed["tasks_enqueued"]) == 1
+    history = client.get(f"/api/v1/continuous-research/campaigns/{campaign_id}/history").json()["items"]
+    assert [item["revision"] for item in history] == [2, 1]
+    assert history[1]["sha256"] == first["configuration_sha256"]
+
+
 def test_bounded_tick_checkpoint_delta_local_routing_and_idempotency(client):
     engagement, campaign_id = setup_campaign(client)
     observation = add_node(client, campaign_id, "observation", "Signal requiring triage")
@@ -103,6 +127,8 @@ def test_budget_idle_and_scope_change_block_continuous_leases(client):
         "task_id": old_task_id, "campaign_id": campaign_id, "task_type": "hypothesis_exploration",
         "sensitivity": "public", "mode": "cloud", "budget_remaining_micros": 1_000_000,
     }).status_code == 409
+    assert client.post(f"/api/v1/continuous-research/campaigns/{campaign_id}/tick", json={}).status_code == 409
+    configure(client, campaign_id, daily_budget_micros=200)
     renewed = client.post(f"/api/v1/continuous-research/campaigns/{campaign_id}/tick", json={}).json()
     assert renewed["status"] == "checkpointed" and len(renewed["tasks_enqueued"]) == 1
     with final_core.connect() as db:

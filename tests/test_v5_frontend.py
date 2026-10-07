@@ -250,12 +250,13 @@ def test_v5_overview_distinguishes_unavailable_from_empty_data():
 def test_v5_orchestration_views_keep_agent_and_runner_roles_distinct():
     client = TestClient(application.app, base_url="http://127.0.0.1:8000")
     script = client.get("/static/v5.js").text
+    team_script = client.get("/static/v5-team.js").text
     css = client.get("/static/v5-workflows.css").text
 
-    assert 'const agents=list(result.data?.agents),runners=list(result.data?.runners)' in script
-    assert 'table(["AgentTask","Role / Group","Campaign","Lease Owner","Usage","Attempts","Status"],agentRows)' in script
+    assert 'window.createFieldworkTeam' in team_script
     assert 'table(["Runner","Kind / Labels","Capabilities","Status / Heartbeat","Active / Limit","Updated"],runnerRows)' in script
-    assert "逻辑 AgentTask，不把物理 Runner 或模型会话伪装成 Agent 实例" in script
+    assert "逻辑 AgentTask" in team_script
+    assert "这里不使用 Run 或 Runner 数量填充 Agent 清单" in team_script
     assert "在线状态和 Heartbeat 仅按后端持久化字段展示" in script
     assert ".cell-subline" in css
 

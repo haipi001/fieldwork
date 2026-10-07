@@ -86,7 +86,18 @@ def get_state(campaign_id: str):
     with _core().connect() as db:
         _campaign_scope(db, campaign_id)
         row = db.execute("SELECT * FROM continuous_research_state WHERE campaign_id=?", (campaign_id,)).fetchone()
-    return {"campaign_id": campaign_id, **_state(row)}
+        version = db.execute("SELECT COUNT(*) FROM v5_events WHERE campaign_id=? AND event_type='policy.configured' AND topic='continuous_research'", (campaign_id,)).fetchone()[0]
+    value = _state(row)
+    return {"campaign_id": campaign_id, **value, "configuration_revision": version,
+            "configuration_sha256": hashlib.sha256(_dump(value["policy"]).encode()).hexdigest() if row else None}
+
+
+@router.get("/campaigns/{campaign_id}/history")
+def policy_history(campaign_id: str):
+    with _core().connect() as db:
+        _campaign_scope(db, campaign_id)
+        rows = db.execute("SELECT payload_json,created_at FROM v5_events WHERE campaign_id=? AND topic='continuous_research' AND event_type='policy.configured' ORDER BY id DESC LIMIT 100", (campaign_id,)).fetchall()
+    return {"items": [{**_load(row["payload_json"], {}), "created_at": row["created_at"]} for row in rows]}
 
 
 @router.put("/campaigns/{campaign_id}")
@@ -104,7 +115,13 @@ def configure(campaign_id: str, policy: CampaignPolicy):
         if policy.enabled and (campaign["status"] != "active" or campaign["engagement_status"] == "archived"
                                or not campaign["confirmed_at"] or not campaign["current_policy_id"]):
             raise HTTPException(409, "active campaign and confirmed current scope/policy required")
-        prior = db.execute("SELECT enabled,last_checkpoint_id,last_tick_at,next_tick_at,last_result_json FROM continuous_research_state WHERE campaign_id=?", (campaign_id,)).fetchone()
+        prior = db.execute("SELECT * FROM continuous_research_state WHERE campaign_id=?", (campaign_id,)).fetchone()
+        encoded_policy = _dump(policy.model_dump())
+        last_version = db.execute("SELECT payload_json FROM v5_events WHERE campaign_id=? AND topic='continuous_research' AND event_type='policy.configured' ORDER BY id DESC LIMIT 1", (campaign_id,)).fetchone()
+        binding = _load(last_version["payload_json"], {}) if last_version else {}
+        changed = (not prior or prior["policy_json"] != encoded_policy
+                   or binding.get("scope_snapshot_id") != campaign["current_scope_snapshot_id"]
+                   or binding.get("policy_id") != campaign["current_policy_id"])
         next_at = (prior["next_tick_at"] if prior and prior["enabled"] and prior["next_tick_at"]
                    else now.isoformat()) if policy.enabled else None
         db.execute(
@@ -115,7 +132,15 @@ def configure(campaign_id: str, policy: CampaignPolicy):
              prior["last_checkpoint_id"] if prior else None, prior["last_tick_at"] if prior else None,
              next_at, prior["last_result_json"] if prior else "null"),
         )
-        if not policy.enabled:
+        if changed:
+            revision = db.execute("SELECT COUNT(*) FROM v5_events WHERE campaign_id=? AND topic='continuous_research' AND event_type='policy.configured'", (campaign_id,)).fetchone()[0] + 1
+            db.execute("INSERT INTO v5_events(topic,campaign_id,entity_id,event_type,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+                       ("continuous_research", campaign_id, campaign_id, "policy.configured", _dump({
+                           "revision": revision, "policy": policy.model_dump(),
+                           "sha256": hashlib.sha256(encoded_policy.encode()).hexdigest(),
+                           "scope_snapshot_id": campaign["current_scope_snapshot_id"], "policy_id": campaign["current_policy_id"],
+                       }), now.isoformat()))
+        if not policy.enabled or changed:
             for task in db.execute(
                 "SELECT id,context_capsule_json FROM agent_tasks WHERE campaign_id=? "
                 "AND status IN ('queued','paused','leased','running')", (campaign_id,),
@@ -125,6 +150,8 @@ def configure(campaign_id: str, policy: CampaignPolicy):
                         "UPDATE agent_tasks SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,"
                         "updated_at=? WHERE id=?", (now.isoformat(), task["id"]),
                     )
+            from v5_orchestration import _sync_runner_jobs
+            _sync_runner_jobs(db)
     return get_state(campaign_id)
 
 
@@ -145,8 +172,9 @@ def _graph_snapshot(db: sqlite3.Connection, campaign_id: str) -> tuple[str, dict
 
 
 def _enqueue(db: sqlite3.Connection, campaign_id: str, kind: str, ref: str, scope_id: str,
-             policy_id: str, now: str, fingerprint: str | None = None) -> bool:
-    key = hashlib.sha256(f"continuous\0{campaign_id}\0{scope_id}\0{policy_id}\0{kind}\0{fingerprint or ref}".encode()).hexdigest()
+             policy_id: str, now: str, fingerprint: str | None = None,
+             configuration_sha256: str | None = None) -> bool:
+    key = hashlib.sha256(f"continuous\0{campaign_id}\0{scope_id}\0{policy_id}\0{kind}\0{fingerprint or ref}\0{configuration_sha256 or ''}".encode()).hexdigest()
     if db.execute("SELECT 1 FROM agent_tasks WHERE idempotency_key=?", (key,)).fetchone():
         return False
     task_id = _uid("atask")
@@ -157,6 +185,7 @@ def _enqueue(db: sqlite3.Connection, campaign_id: str, kind: str, ref: str, scop
         "INSERT INTO agent_tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (task_id, campaign_id, None, None, kind, objective,
          _dump({"source_node_id": ref, "scope_snapshot_id": scope_id, "policy_id": policy_id,
+                "continuous_policy_hash": configuration_sha256,
                 "continuous_research": True, "external_target_actions_authorized": False}),
          "[]", _dump({"labels": {"location": "local"}}),
          _dump({"max_tokens": 8000, "max_cost_micros": 0}), 0, "queued", 0, 2, key,
@@ -179,6 +208,11 @@ def tick(campaign_id: str, trigger: str = "manual") -> dict:
         if not state or not state["enabled"]:
             raise HTTPException(409, "continuous research is not enabled")
         policy = CampaignPolicy.model_validate(_load(state["policy_json"], {}))
+        version = db.execute("SELECT payload_json FROM v5_events WHERE campaign_id=? AND topic='continuous_research' AND event_type='policy.configured' ORDER BY id DESC LIMIT 1", (campaign_id,)).fetchone()
+        binding = _load(version["payload_json"], {}) if version else {}
+        if (binding.get("scope_snapshot_id") != campaign["current_scope_snapshot_id"]
+                or binding.get("policy_id") != campaign["current_policy_id"]):
+            raise HTTPException(409, "continuous configuration requires review under current scope and policy")
         if campaign["status"] != "active" or campaign["engagement_status"] == "archived" or not campaign["confirmed_at"]:
             raise HTTPException(409, "campaign or confirmed scope is no longer active")
         if not db.execute("SELECT 1 FROM execution_policies WHERE id=? AND engagement_id=?",
@@ -253,7 +287,8 @@ def tick(campaign_id: str, trigger: str = "manual") -> dict:
             if len(tasks) >= policy.max_tasks_per_tick:
                 break
             if _enqueue(db, campaign_id, kind, ref, campaign["current_scope_snapshot_id"],
-                        campaign["current_policy_id"], now, fingerprint):
+                        campaign["current_policy_id"], now, fingerprint,
+                        hashlib.sha256(_dump(policy.model_dump()).encode()).hexdigest()):
                 tasks.append({"kind": kind, "source_node_id": ref})
         counts = snapshot["counts"]
         observation_ids = {row["id"] for row in nodes if row["node_type"] == "observation"}

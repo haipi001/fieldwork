@@ -54,7 +54,7 @@ def _resource_matches(pattern: str, resource: str) -> bool:
 
 def _intent_current(db: sqlite3.Connection, intent: sqlite3.Row) -> bool:
     row = db.execute("""
-        SELECT t.status task_status,t.run_id,c.status campaign_status,
+        SELECT t.status task_status,t.run_id,t.context_capsule_json,c.status campaign_status,
                e.status engagement_status,e.current_scope_snapshot_id,e.current_policy_id,
                r.status run_status,r.scope_snapshot_id run_scope_id,r.policy_id run_policy_id,
                s.confirmed_at,s.rules,p.policy
@@ -66,10 +66,15 @@ def _intent_current(db: sqlite3.Connection, intent: sqlite3.Row) -> bool:
         JOIN execution_policies p ON p.id=e.current_policy_id AND p.engagement_id=e.id
         WHERE t.id=? AND t.campaign_id=?
     """, (intent["task_id"], intent["campaign_id"])).fetchone()
+    try:
+        team_plan = bool(row and json.loads(row["context_capsule_json"]).get("team_plan"))
+    except (TypeError, ValueError, AttributeError):
+        team_plan = False
     return bool(row and row["run_id"] == intent["run_id"]
                 and row["task_status"] in {"queued", "leased", "running"}
                 and row["campaign_status"] == "active" and row["engagement_status"] == "ready"
-                and row["run_status"] in {"queued", "running"} and row["confirmed_at"]
+                and row["run_status"] in ({"queued", "running", "paused", "completed"} if team_plan else {"queued", "running"})
+                and row["confirmed_at"]
                 and row["current_scope_snapshot_id"] == row["run_scope_id"] == intent["scope_snapshot_id"]
                 and row["current_policy_id"] == row["run_policy_id"] == intent["policy_id"]
                 and _sha256(row["rules"]) == intent["scope_sha256"]
@@ -108,6 +113,22 @@ def _scope_allows_safe_read(db: sqlite3.Connection, intent: sqlite3.Row) -> bool
     return allowed and not denied
 
 
+def _model_route_current(db: sqlite3.Connection, intent: sqlite3.Row) -> bool:
+    if (intent["capability"] != "model.call" or intent["operation"] != "call"
+            or intent["side_effect"] or not intent["resource"].startswith("route:")):
+        return False
+    decision_id = intent["resource"][len("route:"):]
+    route = db.execute("SELECT * FROM runtime_route_decisions WHERE id=? AND task_id=? AND campaign_id=?",
+                       (decision_id, intent["task_id"], intent["campaign_id"])).fetchone()
+    return bool(route and route["status"] == "selected" and route["provider_id"])
+
+
+def _domain_guard_eligible(db: sqlite3.Connection, intent: sqlite3.Row) -> bool:
+    if intent["capability"] == "model.call":
+        return _model_route_current(db, intent)
+    return _scope_allows_safe_read(db, intent)
+
+
 def _view(row: sqlite3.Row) -> dict:
     value = dict(row)
     value["constraints"] = json.loads(value.pop("constraints_json"))
@@ -126,7 +147,7 @@ def issue_grant(db: sqlite3.Connection, intent_id: str, request: GrantRequest) -
                   and intent["principal_id"] == LOCAL_SESSION_PRINCIPAL
                   and intent["capability"] in SAFE_READ_CAPABILITIES
                   and intent["operation"] in SAFE_READ_OPERATIONS
-                  and _scope_allows_safe_read(db, intent))
+                  and _domain_guard_eligible(db, intent))
     now = datetime.now(timezone.utc)
     grant_id = f"grant-{uuid.uuid4().hex}"
     constraints = {"operation": intent["operation"], "side_effect": bool(intent["side_effect"])}
@@ -153,7 +174,7 @@ def capability_matches(db: sqlite3.Connection, intent_id: str, grant_id: str,
         return False, "wrong_principal"
     if not _intent_current(db, intent):
         return False, "stale_context"
-    if not _scope_allows_safe_read(db, intent):
+    if not _domain_guard_eligible(db, intent):
         return False, "scope_or_domain_guard"
     if grant["approval_state"] != "active":
         return False, "approval_required"

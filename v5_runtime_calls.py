@@ -129,6 +129,9 @@ def reserve_call(decision_id: str, task_id: str, runner_id: str, attempt: int) -
         db.execute('INSERT INTO runtime_calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
             call_id, decision_id, task_id, attempt, runner_id, task['campaign_id'], task['group_id'],
             decision['profile_id'], provider['id'], tokens, cost, runtime_ms, deadline, 'reserved', None, now, now))
+        if capsule.get('team_plan'):
+            from v6_model_gateway import bind_research_call
+            bind_research_call(db, call_id=call_id, task=task, route=decision, runner_id=runner_id)
         r._emit(db, call_id, 'call.reserved', {'task_id': task_id, 'reserved_tokens': tokens}, task['campaign_id'])
         return dict(db.execute('SELECT * FROM runtime_calls WHERE id=?', (call_id,)).fetchone())
 
@@ -136,6 +139,7 @@ def reserve_call(decision_id: str, task_id: str, runner_id: str, attempt: int) -
 def start_call(call_id: str) -> None:
     r = _runtime()
     from v5_orchestration import _owned_running, _check_lease_attempt
+    denial = None
     with r._core().connect() as db:
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT * FROM runtime_calls WHERE id=?', (call_id,)).fetchone()
@@ -147,7 +151,19 @@ def start_call(call_id: str) -> None:
         provider = db.execute("SELECT * FROM runtime_providers WHERE id=? AND enabled=1 AND last_health='healthy'", (row['provider_id'],)).fetchone()
         if not provider or r._provider_config_hash(provider) != r._load(decision['request_json'], {}).get('provider_configuration_sha256'):
             raise HTTPException(409, 'model provider changed before dispatch')
-        db.execute("UPDATE runtime_calls SET state='calling',updated_at=? WHERE id=?", (r._now(), call_id))
+        capsule = r._load(task['context_capsule_json'], {})
+        if capsule.get('team_plan'):
+            from v6_model_gateway import authorize_research_start
+            allowed, reason = authorize_research_start(db, row, task)
+            if not allowed:
+                denial = reason
+                db.execute("UPDATE runtime_calls SET state='released',updated_at=? WHERE id=?", (r._now(), call_id))
+                r._emit(db, call_id, 'call.released', {'task_id': row['task_id'], 'reason': reason}, row['campaign_id'])
+        if denial is None:
+            db.execute("UPDATE runtime_calls SET state='calling',updated_at=? WHERE id=?", (r._now(), call_id))
+            r._emit(db, call_id, 'call.calling', {'task_id': row['task_id']}, row['campaign_id'])
+    if denial is not None:
+        raise HTTPException(409, f'model gateway denied dispatch: {denial}')
 
 
 def fail_call(call_id: str) -> None:

@@ -40,6 +40,7 @@ def test_event_bridge_correlates_task_route_and_redacts_legacy_payload(db):
     assert events[0]["task_id"] == events[1]["task_id"] == "task-1"
     assert events[0]["group_id"] == events[1]["group_id"] == "group-1"
     assert events[0]["runner_id"] == "local-1"
+    assert events[1]["event_type"] == "model.route.decision"
     assert events[0]["principal_id"] is None and events[0]["signature_ref"] is None
     assert "never-expose" not in str(events)
     assert [event["event_id"] for event in list_events(db, after_id=1)] == ["v5:2"]
@@ -90,6 +91,7 @@ def test_call_snapshot_and_agent_identity_do_not_invent_provenance(db):
     assert call["state"] == "unknown" and call["runner_id"] == "runner-1"
     assert call["agent_id"] is None and call["principal_id"] is None
     assert event["task_id"] == "task-1" and event["runner_id"] == "runner-1"
+    assert event["event_type"] == "model.call.reserved"
     assert "hidden" not in str(event)
     assert identity["agent_id"] == "agent-observed" and identity["attestation"] is None
     db.execute("UPDATE runtime_calls SET campaign_id='other' WHERE id='call-1'")

@@ -29,7 +29,7 @@ Integration branch: `codex/v6-final-control-plane`.
 
 ## Overall release state
 
-V6 is in development. P0.2–P0.4 are in progress; P0.5 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
+V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
 
 ## P0.2 passive ActionIntent capture
 
@@ -57,7 +57,7 @@ V6 is in development. P0.2–P0.4 are in progress; P0.5 through P2.5 and all rel
 ### Remaining P0.3 work
 
 - Bind grants to authenticated Worker principals once Worker AgentIdentity is authoritative. Current active grants are limited to the local session principal.
-- Consume grant uses atomically with execution gateway dispatch; `capability_uses_v6` is storage ready but no current V5 execution is routed through it.
+- Extend atomic grant use beyond the built-in research model gateway. That path now consumes a one-use grant at the `calling` transition; other execution paths remain on their legacy gates.
 - Add the approval workflow for effectful or wildcard grants. `pending_approval` is deliberately unusable until then.
 
 ## P0.4 deterministic PolicyDecision overlay
@@ -70,12 +70,25 @@ V6 is in development. P0.2–P0.4 are in progress; P0.5 through P2.5 and all rel
 
 ### Remaining P0.4 work
 
-- Wire real domain guard and budget facts from each execution boundary. A stored decision is not currently consumed by model, HTTP, browser or other first-party execution.
+- Extend real guard and budget inputs beyond the built-in research model gateway. That path now records a decision and consumes its grant before `calling`; other model, HTTP, browser and tool paths remain ungated by V6.
 - Establish approvals for decisions that require them; the current result is review-only and cannot be treated as permission.
+
+## P0.5 research model execution gateway
+
+- Source is now 0.68.24 / build 102 / schema 32. Additive V6 schema v4 adds immutable model gateway binding and start ledgers. It preserves the existing `runtime_calls` budget ledger and V5 events.
+- The built-in research Worker receives a server-assigned research principal and Agent ID. During call reservation, the gateway binds a metadata-only `model.call` ActionIntent, a one-use active Grant, the selected route and the existing task/Run/Runner. At the `calling` transition, the existing research guard is checked, a deterministic V6 PolicyDecision is recorded, and the Grant is consumed in the same transaction as the start record.
+- Denied starts release the reserved call without outbound model execution. The bridge maps existing `call.*` events into model-call transitions while retaining their original event IDs and task correlation.
+- The local HTTP research fixture executes eight tasks and verifies eight corresponding bindings, starts, Grant uses and allow decisions, with no findings or receipts. Targeted tests also cover revocation before start, changed Scope, one-use replay denial and isolated 31→32 migration/recovery. The focused suite passed 34 tests; repository-wide regression passed 859 tests, skipped 4, with one existing deprecation warning in 227.90 seconds.
+- This is a source-level slice. The main database, installed app and running service have not been upgraded or validated for schema 32.
+
+### Remaining P0.5 work
+
+- Gate structured and native model-call paths, plus any other first-party model execution route, using the same authoritative identity and decision contract.
+- Cover cancellation, provider failure and unknown usage recovery at the gateway, and expose complete immutable model-call lineage in the UI.
+- Keep historical tasks without a Run on the legacy path until an explicit migration rule exists.
 
 ## Next implementation order
 
-1. Finish P0.2: bind trusted worker identity and capture intents at existing execution entry points. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
-2. Finish P0.3–P0.4 at a real execution boundary: bind trusted Worker identity, domain guard results, Grant consumption and approval semantics to the deterministic decision.
-3. P0.5–P0.6: wire the existing model and read-only HTTP execution boundaries to these decisions and emit actual execution transitions. Preserve the current `runtime_calls` budget ledger and existing domain guards.
+1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
+2. P0.6: wire the existing read-only HTTP execution boundaries to these decisions. Preserve the current runtime budget ledger and domain guards.
 4. Continue through evidence, evals, packs, incident handling, and the measured V6.5 scale ladder in the source roadmap. Do not mark V6 complete before its release gates pass.

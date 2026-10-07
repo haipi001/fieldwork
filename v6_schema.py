@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-V6_SCHEMA_VERSION = 3
+V6_SCHEMA_VERSION = 4
 V6_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS v6_schema_meta(
          key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)""",
@@ -48,12 +48,19 @@ V6_SCHEMA_STATEMENTS = (
          scope_sha256 TEXT NOT NULL,policy_sha256 TEXT NOT NULL,
          created_at TEXT NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS policy_decisions_v6_intent ON policy_decisions_v6(intent_id,created_at,id)",
+    """CREATE TABLE IF NOT EXISTS model_gateway_bindings_v6(
+         call_id TEXT PRIMARY KEY,intent_id TEXT NOT NULL UNIQUE,grant_id TEXT NOT NULL UNIQUE,
+         principal_id TEXT NOT NULL,agent_id TEXT NOT NULL,runner_id TEXT NOT NULL,
+         route_decision_id TEXT NOT NULL,created_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS model_gateway_starts_v6(
+         call_id TEXT PRIMARY KEY,policy_decision_id TEXT NOT NULL UNIQUE,
+         grant_use_id TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL)""",
     *(
         f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation}
              BEFORE {operation.upper()} ON {table}
              BEGIN SELECT RAISE(ABORT,'V6 capability audit row is immutable'); END"""
         for table in ("capability_grants_v6", "capability_revocations_v6", "capability_uses_v6",
-                      "policy_decisions_v6")
+                      "policy_decisions_v6", "model_gateway_bindings_v6", "model_gateway_starts_v6")
         for operation in ("update", "delete")
     ),
 )

@@ -90,6 +90,10 @@ def test_eight_team_tasks_use_actual_model_http_and_preserve_draft_boundary(clie
         assert all(t['usage']['input_tokens'] == 40 and t['usage']['output_tokens'] == 30 for t in tasks)
         with final_core.connect() as db:
             assert db.execute("SELECT COUNT(*) FROM runtime_calls WHERE state='settled'").fetchone()[0] == 8
+            assert db.execute("SELECT COUNT(*) FROM model_gateway_bindings_v6").fetchone()[0] == 8
+            assert db.execute("SELECT COUNT(*) FROM model_gateway_starts_v6").fetchone()[0] == 8
+            assert db.execute("SELECT COUNT(*) FROM capability_uses_v6").fetchone()[0] == 8
+            assert db.execute("SELECT COUNT(*) FROM policy_decisions_v6 WHERE decision='allow_with_limit'").fetchone()[0] == 8
             assert db.execute("SELECT COUNT(*) FROM research_nodes WHERE campaign_id=? AND source_type='team_research' AND node_type='claim'", (campaign['id'],)).fetchone()[0] == 8
             assert db.execute('SELECT COUNT(*) FROM verification_receipts_v5').fetchone()[0] == 0
             assert db.execute("SELECT COUNT(*) FROM research_nodes WHERE node_type='canonical_result'").fetchone()[0] == 0

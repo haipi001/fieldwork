@@ -79,7 +79,9 @@ def normalize_event(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str, Any
     return {
         "schema": "fieldwork.runtime-event/v6",
         "event_id": f"v5:{event['id']}",
-        "event_type": f"agent.{kind}" if kind.startswith("task.") else kind,
+        "event_type": (f"agent.{kind}" if kind.startswith("task.") else
+                       f"model.{kind}" if kind.startswith("call.") else
+                       "model.route.decision" if kind == "route.decided" else kind),
         "timestamp": event["created_at"],
         "source": "v5_events",
         "topic": event["topic"],

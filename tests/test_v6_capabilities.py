@@ -6,7 +6,8 @@ import lifecycle
 from tests.test_final import client
 from tests.test_v6_intents import _body, _setup
 from v6_capabilities import capability_matches
-from v6_schema import apply_v6_schema
+from v6_schema import V6_SCHEMA_VERSION, apply_v6_schema
+from version import SCHEMA_VERSION
 
 
 def _intent(client, task_id, **changes):
@@ -123,8 +124,8 @@ def test_v6_grant_migration_preserves_schema_29_and_recovery(tmp_path):
     lifecycle.finalize_database_version(database)
     with sqlite3.connect(database) as db:
         assert db.execute("SELECT value FROM preserved").fetchone()[0] == "old-row"
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
-        assert db.execute("SELECT value FROM v6_schema_meta WHERE key='schema_version'").fetchone()[0] == "2"
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert db.execute("SELECT value FROM v6_schema_meta WHERE key='schema_version'").fetchone()[0] == str(V6_SCHEMA_VERSION)
     with sqlite3.connect(tmp_path / "backups" / backup["database"]) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 29
         assert db.execute("SELECT value FROM preserved").fetchone()[0] == "old-row"

@@ -29,7 +29,7 @@ Integration branch: `codex/v6-final-control-plane`.
 
 ## Overall release state
 
-V6 is in development. P0.2 and P0.3 are in progress; P0.4 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
+V6 is in development. P0.2–P0.4 are in progress; P0.5 through P2.5 and all release gates beyond baseline remain open. This file records source progress only; it is not evidence that the installed app or a running service has been upgraded.
 
 ## P0.2 passive ActionIntent capture
 
@@ -60,9 +60,22 @@ V6 is in development. P0.2 and P0.3 are in progress; P0.4 through P2.5 and all r
 - Consume grant uses atomically with execution gateway dispatch; `capability_uses_v6` is storage ready but no current V5 execution is routed through it.
 - Add the approval workflow for effectful or wildcard grants. `pending_approval` is deliberately unusable until then.
 
+## P0.4 deterministic PolicyDecision overlay
+
+- Source is now 0.68.23 / build 101 / schema 31. Additive V6 schema v3 adds immutable `policy_decisions_v6`; the existing `v5_events` stream receives a metadata-only `policy.decided` audit event correlated back to the original task.
+- Pure `evaluate_policy` has no Runner or tool dependency. Identity, current Scope, existing domain guard, explicit deny rules, Grant eligibility and budget have ordered fail-closed precedence. Agent/classifier risk hints can only raise the decision from bounded allow to approval/quarantine; they cannot cancel a deterministic deny.
+- `record_policy_decision` requires a caller-owned transaction and trusted legacy guard/budget facts. There is no public decision-writing endpoint accepting caller claims. The read-only endpoint lists recorded decisions.
+- Focused tests prove deny precedence, unknown guard/budget rejection, wrong principal, missing Grant, immutability, audited task correlation, no model dispatch, and isolated 30→31 backup/recovery.
+- Final repository regression for this increment: 855 passed, 4 skipped, 1 existing deprecation warning in 228.70 seconds; focused V6 contract suite: 17 passed. No main database migration or installed App validation occurred.
+
+### Remaining P0.4 work
+
+- Wire real domain guard and budget facts from each execution boundary. A stored decision is not currently consumed by model, HTTP, browser or other first-party execution.
+- Establish approvals for decisions that require them; the current result is review-only and cannot be treated as permission.
+
 ## Next implementation order
 
 1. Finish P0.2: bind trusted worker identity and capture intents at existing execution entry points. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
-2. Finish P0.3 and implement P0.4: bind grant consumption to execution and add deterministic policy decisions. A Runner's advertised capabilities must never authorize an action.
+2. Finish P0.3–P0.4 at a real execution boundary: bind trusted Worker identity, domain guard results, Grant consumption and approval semantics to the deterministic decision.
 3. P0.5–P0.6: wire the existing model and read-only HTTP execution boundaries to these decisions and emit actual execution transitions. Preserve the current `runtime_calls` budget ledger and existing domain guards.
 4. Continue through evidence, evals, packs, incident handling, and the measured V6.5 scale ladder in the source roadmap. Do not mark V6 complete before its release gates pass.

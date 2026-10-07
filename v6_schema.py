@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-V6_SCHEMA_VERSION = 2
+V6_SCHEMA_VERSION = 3
 V6_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS v6_schema_meta(
          key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)""",
@@ -40,11 +40,20 @@ V6_SCHEMA_STATEMENTS = (
          id TEXT PRIMARY KEY,grant_id TEXT NOT NULL,intent_id TEXT NOT NULL,
          action_id TEXT NOT NULL UNIQUE,recorded_at TEXT NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS capability_uses_v6_grant ON capability_uses_v6(grant_id)",
+    """CREATE TABLE IF NOT EXISTS policy_decisions_v6(
+         id TEXT PRIMARY KEY,intent_id TEXT NOT NULL,grant_id TEXT,
+         principal_id TEXT NOT NULL,decision TEXT NOT NULL
+         CHECK(decision IN ('allow','allow_with_limit','require_approval','deny','quarantine')),
+         reasons_json TEXT NOT NULL,legacy_guard_json TEXT NOT NULL,
+         scope_sha256 TEXT NOT NULL,policy_sha256 TEXT NOT NULL,
+         created_at TEXT NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS policy_decisions_v6_intent ON policy_decisions_v6(intent_id,created_at,id)",
     *(
         f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation}
              BEFORE {operation.upper()} ON {table}
              BEGIN SELECT RAISE(ABORT,'V6 capability audit row is immutable'); END"""
-        for table in ("capability_grants_v6", "capability_revocations_v6", "capability_uses_v6")
+        for table in ("capability_grants_v6", "capability_revocations_v6", "capability_uses_v6",
+                      "policy_decisions_v6")
         for operation in ("update", "delete")
     ),
 )

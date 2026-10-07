@@ -52,6 +52,15 @@ def normalize_event(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str, Any
             "SELECT task_id,campaign_id,group_id,runner_id FROM runtime_calls WHERE id=?", (entity_id,)
         ).fetchone()
         task = _task(db, call["task_id"]) if call else None
+    if kind == "policy.decided" and entity_id:
+        policy = db.execute(
+            "SELECT a.task_id,a.campaign_id FROM policy_decisions_v6 d "
+            "JOIN action_intents_v6 a ON a.id=d.intent_id WHERE d.id=?", (entity_id,)
+        ).fetchone()
+        if policy:
+            task = _task(db, policy["task_id"])
+            if event["campaign_id"] != policy["campaign_id"]:
+                raise ValueError("policy event campaign conflicts with intent")
     campaign_id = event["campaign_id"]
     if task and campaign_id and campaign_id != task["campaign_id"]:
         raise ValueError("event campaign conflicts with task")
@@ -110,7 +119,7 @@ def list_events(db: sqlite3.Connection, *, after_id: int = 0, limit: int = 100,
 
 def normalize_runner(row: sqlite3.Row) -> dict[str, Any]:
     legacy_kind = row["kind"]
-    if legacy_kind == "worker" or legacy_kind == "local" or legacy_kind.startswith("local-"):
+    if legacy_kind in {"worker", "local", "research-worker", "native-discovery", "isolated-verifier"} or legacy_kind.startswith("local-"):
         kind = "local"
     elif legacy_kind in {"container", "remote", "cloud"}:
         kind = legacy_kind

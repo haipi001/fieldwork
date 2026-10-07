@@ -40,6 +40,7 @@ from v6_schema import apply_v6_schema
 from v6_control import router as v6_control_router
 from v6_intents import router as v6_intents_router
 from v6_capabilities import router as v6_capabilities_router
+from v6_policy import router as v6_policy_router
 from v5_graph import router as v5_graph_router
 from v5_orchestration import recover_expired_leases, router as v5_orchestration_router, runner_router as v5_runner_router
 from v5_verification import router as v5_verification_router
@@ -254,6 +255,7 @@ app.include_router(v5_runtime_router)
 app.include_router(v6_control_router)
 app.include_router(v6_intents_router)
 app.include_router(v6_capabilities_router)
+app.include_router(v6_policy_router)
 app.include_router(v5_continuous_router)
 app.include_router(v5_intelligence_router)
 app.include_router(v5_workers_router)

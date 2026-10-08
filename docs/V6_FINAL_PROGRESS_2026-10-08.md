@@ -300,3 +300,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.60/build138/schema40 adds paged read audit with current material, ownership, usage/timing and usage-report consistency checks, retaining actual booked usage when integrity fails. No local URI/raw material is exposed.
 - Regression covers intact/changed/restored/missing review material, pagination bounds/empty offset, recorded token/runtime and retaining settled state after tamper. Reconciliation and runtime-summary targeted tests pass; full repository acceptance/UI remain open.
+
+### Reconciliation explicit confirmation and Run existence
+
+- Source 0.68.61/build139/schema40 rejects integer/string/null substitutes for explicit JSON boolean confirmation and requires the Task Run to actually exist before reconciliation. Cross-Run material remains rejected.
+- Reconciliation regression adds real API rejection checks for cross-Run evidence, nonexistent Run, non-boolean confirmation, boolean/string/negative/fractional token counts, alongside the existing atomic/idempotency/integrity checks. Full UI and release acceptance remain open.

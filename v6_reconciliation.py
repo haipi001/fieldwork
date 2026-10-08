@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 import final_core as core
 import v5_runtime as runtime
@@ -15,6 +15,13 @@ class ReviewInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     artifact_id: str = Field(min_length=1, max_length=200)
     confirmed: Literal[True]
+
+    @field_validator('confirmed', mode='before')
+    @classmethod
+    def explicit_confirmation(cls, value):
+        if value is not True:
+            raise ValueError('confirmation must be the JSON boolean true')
+        return value
 
 
 class ReviewMaterial(BaseModel):
@@ -36,7 +43,8 @@ def reconcile(call_id: str, body: ReviewInput):
                           'WHERE c.id=?', (call_id,)).fetchone()
         if not call:
             raise HTTPException(404, 'Model call not found')
-        if not call['run_id']:
+        if not call['run_id'] or not db.execute('SELECT 1 FROM analysis_runs WHERE id=?',
+                                               (call['run_id'],)).fetchone():
             raise HTTPException(409, 'Reconciliation requires a recorded Run')
         artifact = db.execute("SELECT * FROM artifacts WHERE id=? AND run_id=? AND kind='runtime.usage_review'",
                               (body.artifact_id, call['run_id'])).fetchone()

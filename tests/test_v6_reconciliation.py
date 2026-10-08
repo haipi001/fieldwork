@@ -36,6 +36,21 @@ def test_unknown_reconciliation_is_evidence_bound_atomic_and_does_not_resume(cli
     route = f"/api/v1/v6/model-calls/{call['id']}/reconcile"
     body = dict(artifact_id='review-artifact', confirmed=True)
     assert client.post(route, json={**body, 'confirmed':False}).status_code == 422
+    for ambiguous in (1, 'true', None):
+        assert client.post(route, json={**body, 'confirmed':ambiguous}).status_code == 422
+    with core.connect() as db:
+        db.execute("UPDATE artifacts SET run_id='other-run' WHERE id='review-artifact'")
+    assert client.post(route, json=body).status_code == 409
+    store(material)
+    with core.connect() as db:
+        db.execute("UPDATE agent_tasks SET run_id='nonexistent-run' WHERE id=?", (task['id'],))
+    assert client.post(route, json=body).status_code == 409
+    with core.connect() as db:
+        db.execute("UPDATE agent_tasks SET run_id='review-run' WHERE id=?", (task['id'],))
+    for invalid in (True, '10', -1, 1.5):
+        store({**material, 'input_tokens':invalid})
+        assert client.post(route, json=body).status_code == 409
+    store(material)
     store({**material, 'provider_id':'another-provider'})
     assert client.post(route, json=body).status_code == 409
     store(material); path.write_text('{}')

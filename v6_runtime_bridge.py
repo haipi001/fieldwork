@@ -85,6 +85,11 @@ def normalize_event(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str, Any
         runner_id = call["runner_id"]
     if tool:
         runner_id = tool["runner_id"]
+    artifact_ids = []
+    if tool and kind == "tool.execution.completed":
+        artifact_ids = [row["artifact_id"] for row in db.execute(
+            "SELECT artifact_id FROM runtime_artifact_links_v6 WHERE action_id=? ORDER BY artifact_id",
+            (entity_id,))]
     return {
         "schema": "fieldwork.runtime-event/v6",
         "event_id": f"v5:{event['id']}",
@@ -105,7 +110,7 @@ def normalize_event(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str, Any
         "operation": kind,
         "resource": tool["resource"] if tool else None,
         "policy_decision": None,
-        "artifact_ids": [],
+        "artifact_ids": artifact_ids,
         "node_id": None,
         "sequence": None,
         "causal_parent_event_id": None,
@@ -130,7 +135,8 @@ def list_events(db: sqlite3.Connection, *, after_id: int = 0, limit: int = 100,
 
 def normalize_runner(row: sqlite3.Row) -> dict[str, Any]:
     legacy_kind = row["kind"]
-    if legacy_kind in {"worker", "local", "research-worker", "native-discovery", "isolated-verifier"} or legacy_kind.startswith("local-"):
+    if legacy_kind in {"worker", "local", "research-worker", "native-discovery", "isolated-verifier",
+                       "native-browser", "http-replay", "run-http"} or legacy_kind.startswith("local-"):
         kind = "local"
     elif legacy_kind in {"container", "remote", "cloud"}:
         kind = legacy_kind

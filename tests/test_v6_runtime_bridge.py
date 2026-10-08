@@ -68,7 +68,8 @@ def test_runner_view_does_not_treat_advertisement_as_authorization(db):
         "worker-1", "worker", '[]', '{}', 1, "online", None,
     ))
     assert {item["kind"] for item in list_runners(db)} == {"local"}
-    for kind in ("research-worker", "native-discovery", "isolated-verifier"):
+    for kind in ("research-worker", "native-discovery", "isolated-verifier",
+                 "native-browser", "http-replay", "run-http"):
         db.execute("UPDATE runner_registry_v5 SET kind=? WHERE id='worker-1'", (kind,))
         assert {item["kind"] for item in list_runners(db)} == {"local"}
     db.execute("UPDATE runner_registry_v5 SET kind='unsupported' WHERE id='worker-1'")

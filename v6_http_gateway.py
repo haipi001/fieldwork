@@ -245,3 +245,22 @@ def finish_http_read(action_id: str, *, response: dict | None = None,
         _sync_runner_jobs(db, execution["runner_id"])
         _emit(db, execution["campaign_id"], action_id, f"tool.execution.{status}",
               {"task_id": execution["task_id"], "http_status": http_status})
+
+
+def link_completed_reads_to_artifact(db: sqlite3.Connection, *, action_ids: list[str],
+                                     artifact_id: str, run_id: str) -> None:
+    """Bind completed gateway reads to an existing same-Run artifact in the caller's transaction."""
+    if not action_ids or len(set(action_ids)) != len(action_ids):
+        raise ValueError("read artifact lineage requires distinct actions")
+    artifact = db.execute("SELECT run_id FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+    if not artifact or artifact["run_id"] != run_id:
+        raise ValueError("read artifact does not belong to this Run")
+    for action_id in action_ids:
+        execution = db.execute("""SELECT t.run_id,r.status FROM http_gateway_executions_v6 x
+            JOIN agent_tasks t ON t.id=x.task_id
+            JOIN http_gateway_receipts_v6 r ON r.action_id=x.action_id
+            WHERE x.action_id=?""", (action_id,)).fetchone()
+        if not execution or execution["run_id"] != run_id or execution["status"] != "completed":
+            raise ValueError("read action is not a completed request from this Run")
+        db.execute("INSERT INTO runtime_artifact_links_v6 VALUES(?,?,?)",
+                   (action_id, artifact_id, datetime.now(timezone.utc).isoformat()))

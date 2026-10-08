@@ -162,6 +162,14 @@ def test_reviewed_live_replay_requires_authorization_and_preserves_unconfirmed_r
         assert len({row['arguments_hash'] for row in intents if json.loads(row['context_capsule_json'])['replay_round'] == 0}) == 5
         assert all('X-Role' not in str(dict(row)) and '?' not in row['resource'] for row in intents)
         artifact = db.execute("SELECT uri FROM artifacts WHERE kind='http.replay'").fetchone()
+        linked = db.execute("SELECT action_id,artifact_id FROM runtime_artifact_links_v6").fetchall()
+        assert len(linked) == 10 and len({row['artifact_id'] for row in linked}) == 1
+        from v6_runtime_bridge import list_events
+        completed = [event for event in list_events(db, limit=500)
+                     if event['event_type'] == 'tool.execution.completed'
+                     and event['artifact_ids']]
+        assert len(completed) == 10
+        assert all(event['artifact_ids'] == [linked[0]['artifact_id']] for event in completed)
         from pathlib import Path
         replay = json.loads(Path(artifact['uri']).read_text())
         responses = [response for group in replay['rounds'] for response in group.values()]

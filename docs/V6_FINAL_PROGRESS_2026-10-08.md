@@ -124,6 +124,13 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 - Campaign scheduling, workflow, iteration and recovery regression paths continue to pass with normalized Campaign source classes. Repository-wide regression: 869 passed, 4 skipped, 1 existing deprecation warning in 282.16 seconds.
 - Other read-only methods, effectful HTTP methods, full Playwright browser journey, Artifact/Observation/Evidence linkage and unknown-outcome recovery remain open. The main database, installed app and running service have not been upgraded or validated for this source version.
 
+### P0.7 first HTTP replay artifact lineage
+
+- Source is now 0.68.30 / build 108 / schema 34. Completed, Run-bound HTTP replay GET actions are linked immutably to the existing replay Artifact. The link writer checks that each action has a completed receipt and that the action and Artifact belong to the same Run; it runs in the Artifact insertion transaction. The RuntimeEvent bridge exposes the linked Artifact ID on the corresponding completed execution event. Existing Artifact → Observation → Evidence rows remain the source of truth.
+- The real ten-request replay fixture verifies all ten event-to-Artifact links and the established replay artifact contents. Cross-Run links and deletion of stored links are rejected. Built-in read Runner kinds now normalize to local placement in the V6 runner view.
+- An isolated schema 33 → 34 backup/upgrade retains historical Intent rows and adds an empty lineage table. Repository-wide regression: 870 passed, 4 skipped, 1 existing deprecation warning in 287.93 seconds; the revised migration case passed separately after the full run.
+- This is partial P0.7 coverage. Workbench and browser reads do not yet produce an Artifact chain; proof polarity and VerificationReceipt binding remain separate work. The main database, installed app and running service have not been upgraded to schema 34.
+
 ## Next implementation order
 
 1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.

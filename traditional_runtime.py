@@ -664,6 +664,7 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
     rate = max(.001, float(engagement["policy"].get("max_requests_per_second", 1)))
     interval = 1 / rate
     rounds = []
+    read_action_ids = []
     completed_requests = 0
     checkpoint_result = None
     ledger_request = None
@@ -722,6 +723,7 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
                     if action_id:
                         from v6_http_gateway import finish_http_read
                         finish_http_read(action_id, response=results[name])
+                        read_action_ids.append(action_id)
                 except Exception as error:
                     if action_id:
                         from v6_http_gateway import finish_http_read
@@ -780,6 +782,10 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
             db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
                 artifact_id, run_id, "http.replay", str(artifact_path), hashlib.sha256(artifact_path.read_bytes()).hexdigest(), "application/json", 1, final_core.utcnow(),
             ))
+            if read_action_ids:
+                from v6_http_gateway import link_completed_reads_to_artifact
+                link_completed_reads_to_artifact(db, action_ids=read_action_ids,
+                                                 artifact_id=artifact_id, run_id=run_id)
             observation_id = final_core.uid("obs")
             db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
                 observation_id, run_id, run["engagement_id"], "traditional", "http.replay_result",

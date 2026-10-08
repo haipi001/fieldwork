@@ -229,3 +229,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.47 / build 125 / schema 39 provides a read-transaction snapshot of real Group/Task/Runner/model-call states, task roles, current leased Runner load, HTTP receipts/unsettled executions, effective containment, event counts and Grant issuance/revocation/use counts. It reads existing ledgers and adds no parallel runtime store.
 - Focused summary/runtime-view/Pack suite: 7 passed. The lifecycle fixture verifies running→completed counts, Runner load, unsettled→completed receipts and containment/revocation. UI integration and broader P1.7 acceptance remain open. No installed-service or main-data validation was performed.
+
+### P1.7 runtime snapshot UI
+
+- Source 0.68.48 / build 126 / schema 39 adds real runtime summary counts to the existing model/routing page, including Group/Task/Runner/model-call/HTTP-receipt state breakdowns, unsettled reads, containment, events and Grant counts. Refresh uses the existing UI lifecycle and preserves model configuration; API failure removes the count table and shows the read error. States localize with Chinese/English switching.
+- Real Chrome UI acceptance using isolated APIs/DB passed count equality, updated task counts, injected summary failure, language switching and dark/light 1440/680-width layout checks; no page errors or model calls. Initial fixture failures were corrected by adding the V6 API route and current schema initialization. JS syntax validation passed. Full Groups/Agents aggregation and P1.8 controls remain open; the installed app was not upgraded.

@@ -48,24 +48,26 @@ def run():
             stack.enter_context(patch.object(runtime_secrets,"secret_root",lambda:root/"secrets"))
             stack.enter_context(patch.dict(os.environ,{"FIELDWORK_SESSION_TOKEN":secrets.token_urlsafe(48)}))
             app.prepare_database_upgrade(app.DB,root/"backups",ROOT)
-            app.init_db();final_core.init_final_db();app.apply_v5_schema(app.DB);app.finalize_database_version(app.DB)
+            app.init_db();final_core.init_final_db();app.apply_v5_schema(app.DB);app.apply_v6_schema(app.DB);app.finalize_database_version(app.DB)
             client=TestClient(app.app,base_url="http://127.0.0.1:8000",headers={"X-Fieldwork-Session":os.environ["FIELDWORK_SESSION_TOKEN"]})
             project=create_ready(client,target="https://runtime-ui.example.test")
             campaign=client.post(f"/api/v1/engagements/{project['id']}/campaigns",json={"name":"Runtime UI fixture","objective":"Inspect configuration and scheduling"}).json()
             assert client.post("/api/v1/research/nodes",json={"campaign_id":campaign["id"],"node_type":"observation","title":"Explicit scheduling fixture"}).status_code==201
             writes,errors=[],[]
-            flags={"fail_config":False}
+            flags={"fail_config":False,"fail_summary":False}
             def route_request(route):
                 request=route.request;parsed=urlparse(request.url);path=parsed.path
                 assert parsed.hostname=="127.0.0.1"
                 if path=="/v5":route.fulfill(path=str(ROOT/"templates/v5.html"),content_type="text/html")
                 elif path.startswith("/static/"):route.fulfill(path=str(ROOT/path.lstrip("/")))
-                elif (path=="/api/v1/engagements" or path.startswith("/api/v1/orchestration/")
+                elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary"} or path.startswith("/api/v1/orchestration/")
                       or path==f"/api/v1/engagements/{project['id']}/campaigns"
                       or path.startswith("/api/v1/continuous-research/")
                       or path.startswith("/api/v1/runtime/") and path!="/api/v1/runtime/readiness"):
                     if flags["fail_config"] and path=="/api/v1/runtime/config":
                         route.fulfill(status=503,json={"detail":"injected configuration read failure"});return
+                    if flags["fail_summary"] and path=="/api/v1/v6/runtime-summary":
+                        route.fulfill(status=503,json={"detail":"injected summary failure"});return
                     if request.method!="GET":writes.append(path)
                     response=client.request(request.method,path+("?"+parsed.query if parsed.query else ""),content=request.post_data,headers={"Content-Type":"application/json"})
                     route.fulfill(status=response.status_code,body=response.content,content_type="application/json")
@@ -81,8 +83,15 @@ def run():
                 page.on("dialog",lambda dialog:dialog.accept())
                 page.route("**/*",route_request)
                 page.goto("http://127.0.0.1:8000/v5#runtime")
+                page.wait_for_selector('[data-summary-total="tasks"]')
+                assert page.locator('[data-summary-total="tasks"]').inner_text() == str(client.get('/api/v1/v6/runtime-summary').json()['tasks']['total'])
                 page.wait_for_function("document.querySelector('#rcCampaign').value !== ''")
                 assert not writes and counts=={"health":0,"model":0}
+                flags['fail_summary']=True;page.locator('#rcRefresh').click()
+                page.wait_for_function("document.querySelector('#rcSummary').textContent.includes('503')")
+                assert page.locator('[data-summary-total]').count()==0
+                flags['fail_summary']=False;page.locator('#rcRefresh').click()
+                page.wait_for_selector('[data-summary-total="tasks"]')
                 page.locator("#rcProviderForm").locator("..").locator("summary").click()
                 page.locator("#rcProviderName").fill("Local UI fixture")
                 page.locator("#rcModel").fill("ui-fixture-model")
@@ -136,6 +145,8 @@ def run():
                 page.locator("#rcPolicySave").click()
                 page.wait_for_function("document.querySelector('#rcPolicyState').textContent.includes('配置版本: 2')")
                 assert client.get(f"/api/v1/orchestration/tasks?campaign_id={campaign['id']}").json()["items"][0]["status"]=="cancelled"
+                page.locator('#rcRefresh').click()
+                page.wait_for_function("document.querySelector('[data-summary-total=tasks]').textContent==='1'")
                 page.locator("#rcProviderName").fill("Unsaved input stays intact")
                 page.locator("#languageToggle").click()
                 assert page.locator("#rcProviderName").input_value()=="Unsaved input stays intact"

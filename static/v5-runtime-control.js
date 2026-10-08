@@ -12,11 +12,13 @@
     const bindings = window.FieldworkLocale.bindings();
     let calls=[], providers=[], profiles=[], campaigns=[], campaignId="", engagementId="", policy=null;
     let generation=0, busy=false, offset=0, routes=[], routePage={}, failure="";
+    let summary=null, summaryError="";
     const panel = document.createElement("article");
     panel.id="runtimeControl"; panel.className="panel runtime-control";
     panel.innerHTML=`<header><h2>${copy("V5 模型配置与研究策略","V5 model configuration and research policy")}</h2>${button("rcRefresh","刷新配置","Refresh configuration")}</header>
       <p>${copy("Profile 是不可变配置版本。研究组引用指定版本；创建或浏览配置不会调用模型。","Profiles are immutable configuration versions referenced by research teams. Creating or viewing configuration does not invoke a model.")}</p>
       <p id="rcMessage" role="status"></p>
+      <section aria-labelledby="rcSummaryTitle"><h3 id="rcSummaryTitle">${copy("运行状态快照","Runtime state snapshot")}</h3><div id="rcSummary" aria-live="polite"></div></section>
       <details><summary>${copy("新增 V5 Provider","Add V5 provider")}</summary><form id="rcProviderForm" class="form-stack">
         <div class="form-pair">${label("名称","Name",input("rcProviderName","text","required maxlength=120 autocomplete=off"))}
           ${label("位置","Location",`<select id="rcLocation"><option value="local">Local</option><option value="cloud">Cloud</option></select>`)}</div>
@@ -77,7 +79,7 @@
     const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
     function localize() {
       panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
-      bindings.apply(); renderProviders(); renderRoutes(); renderCalls();
+      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();
     }
     async function send(url, body, method="POST") {
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
@@ -136,6 +138,16 @@
       if(token!==generation)return;
       calls=list(value);renderCalls();
     }
+    function renderSummary() {
+      const host=$("#rcSummary");
+      if(!summary){host.textContent=summaryError||t("等待状态快照。","Awaiting state snapshot.");return}
+      const sections=[["groups",t("研究组","Groups")],["tasks",t("任务","Tasks")],["runners",t("执行节点","Runners")],["model_calls",t("模型调用","Model calls")],["http_receipts",t("HTTP 回执","HTTP receipts")]];
+      const names={running:t("运行中","Running"),pending:t("待执行","Pending"),queued:t("排队中","Queued"),succeeded:t("已完成","Succeeded"),completed:t("已完成","Completed"),failed:t("失败","Failed"),paused:t("已暂停","Paused"),cancelled:t("已取消","Cancelled"),online:t("在线","Online"),offline:t("离线","Offline"),reserved:t("已预留","Reserved"),calling:t("调用中","Calling"),unknown:t("用量未知","Usage unknown"),settled:t("已结算","Settled"),released:t("已释放","Released")};
+      host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>${t("账本","Ledger")}</th><th>${t("总数","Total")}</th><th>${t("当前状态计数","Current state counts")}</th></tr></thead><tbody>${sections.map(([key,label])=>`<tr><td>${esc(label)}</td><td data-summary-total="${key}">${esc(summary[key]?.total??"—")}</td><td>${Object.entries(summary[key]?.states||{}).map(([state,count])=>`${esc(names[state]||state)}: ${esc(count)}`).join(" · ")||t("无记录","No records")}</td></tr>`).join("")}</tbody></table></div>
+        <p>${t("未结读取","Unsettled reads")}: ${esc(summary.http_unsettled??"—")} · ${t("隔离 Run","Contained runs")}: ${esc(summary.contained_runs??"—")} · ${t("事件","Events")}: ${esc(summary.event_count??"—")}</p>
+        <p>Grant ${t("签发 / 撤销 / 使用","issued / revoked / used")}: ${esc(summary.grants?.issued??"—")} / ${esc(summary.grants?.revoked??"—")} / ${esc(summary.grants?.uses??"—")}</p>
+        <small>${t("快照时间","Snapshot time")}: ${esc(summary.snapshot_at||"—")}</small>`;
+    }
     function renderCalls() {
       const states={reserved:t("已预留","Reserved"),calling:t("调用中","Calling"),unknown:t("用量未知","Usage unknown"),settled:t("已结算","Settled"),released:t("发送前释放","Released before dispatch")};
       $("#rcCalls").innerHTML=calls.length?`<div class="table-wrap"><table><thead><tr><th>Task / Profile</th><th>${t("状态","State")}</th><th>${t("预留词元 / 费用 µ","Reserved tokens / cost µ")}</th><th>${t("调用截止时间 / 用量记录","Deadline / usage record")}</th></tr></thead><tbody>${calls.map(item=>`<tr><td>${esc(item.task_id)}<small class="cell-subline">${esc(item.profile_id||"–")}</small></td><td>${esc(states[item.state]||item.state)}</td><td>${esc(item.reserved_tokens)} / ${esc(item.reserved_cost_micros)}<small class="cell-subline">${item.input_counting ? `${esc(item.input_counting === "llama_cpp_server" ? t("服务端报告计数","Server-reported count") : t("字节预估（非精确）","Byte estimate (not exact)"))}: ${esc(item.preflight_input_tokens)} · ${t("生成上限","Generation limit")} ${esc(item.output_max_tokens)}` : esc(t("无输入预检记录","No input preflight record"))}</small></td><td>${esc(item.deadline_at)}<small class="cell-subline">${esc(item.usage_id||"–")}</small></td></tr>`).join("")}</tbody></table></div>`:`<p>${esc(t("尚无模型调用预留。","No model call reservations yet."))}</p>`;
@@ -143,8 +155,9 @@
     async function refresh() {
       const token=++generation;failure="";
       try {
-        const [config,ledger]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0")]);
+        const [config,ledger,snapshot]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0"),request("/api/v1/v6/runtime-summary").then(data=>({data}),error=>({error:error.message}))]);
         if(token!==generation)return;
+        summary=snapshot.data||null;summaryError=snapshot.error||"";renderSummary();
         providers=list(config.providers);profiles=list(config.profiles);state.remote.runtimeConfig={ok:true,data:config};
         onConfig();
         routes=list(ledger);offset=routes.length;routePage=ledger.page||{};renderProviders();renderRoutes();await loadCalls(token);

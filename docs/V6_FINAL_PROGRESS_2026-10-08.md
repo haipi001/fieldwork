@@ -279,3 +279,9 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.57/build135/schema39 checks all response events for incidents attached to the Run inside the release transaction, including recorded Run ownership and current Artifact/file integrity. RECOVERED/CLOSED status with damaged historical evidence cannot authorize release using a distinct intact review.
 - Targeted regression: 2 passed (11 deselected), using actual analyzed Agent Audit response history and current confirmed test authority; missing historical file keeps containment active, restoration permits release, and existing revoked-grant/read-denial behavior passes. No full repository regression or installed-state validation; complete release gates remain open.
+
+### Post-Incident/evidence compatibility regression
+
+- Authoritative tested source: cfbeed9 / 0.68.57/build135/schema39. `PYTHONPATH=. python3 -m pytest -q tests/test_v6_*.py`: 48 passed, 1 existing warning (6.35s). Full `PYTHONPATH=. python3 -m pytest -q`: 893 passed, 3 skipped, 1 existing Starlette/httpx deprecation warning (266.81s). No code changed during these runs.
+- This verifies current automated compatibility/regression coverage after Incident history/release and paged evidence UI changes. Skipped checks and unimplemented plan items remain outside this evidence. Installed app, live service, domain Eval metric completeness, fault-injected 10/32/100/256/500/1000 ladder and three clean 1000-task runs are not established by this result.
+- Roadmap next priority: P2.2 explicit human/provider-backed reconciliation for unknown model consumption; current v5_runtime_calls.py retains unknown consumption and v5_workers.py pauses affected tasks, but no explicit reconciliation path is present. Full goal remains active.

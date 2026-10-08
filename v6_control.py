@@ -13,6 +13,12 @@ from v6_runtime_bridge import list_events, list_model_call_snapshots, list_runne
 router = APIRouter(prefix="/api/v1/v6", tags=["V6 Control Plane"])
 
 
+@router.get('/packs')
+def packs():
+    from v6_packs import list_packs
+    return {'packs': list_packs()}
+
+
 @router.get("/campaigns/{campaign_id}/runtime-events")
 def campaign_runtime_events(campaign_id: str, after_id: int = Query(0, ge=0),
                             limit: int = Query(100, ge=1, le=500)):

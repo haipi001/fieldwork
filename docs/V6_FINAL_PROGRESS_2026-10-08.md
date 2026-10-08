@@ -192,3 +192,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 ### Eval read integrity
 
 - Source 0.68.40 / build 118 / schema 36 verifies current Artifact bytes/hash and scenario manifest digest when exposing EvalRun records. Missing or changed materials produce status `invalid`; the original measured result stays available for audit. Focused Eval storage/seed/runtime-view tests: 7 passed, including Artifact tamper changing the query status. No release or main-data validation is claimed.
+
+### P1 first-party Pack manifests
+
+- Source 0.68.41 / build 119 / schema 36 adds three versioned, hashed manifests referencing existing SRC, Web3 and Agent Audit adapters/verifiers and actual Artifact kinds. A read-only Pack endpoint exposes capabilities, roles, report/Eval mapping and explicit unsupported paths. All manifests state partial integration; empty domain Eval suites stay empty until real seeds exist. These declarations grant no execution authority.
+- Adapter existence and read-only/mutation-isolation checks with runtime-view regression: 6 passed. Domain convergence, complete capability boundaries, independent verification and Pack quality gates remain unfinished.

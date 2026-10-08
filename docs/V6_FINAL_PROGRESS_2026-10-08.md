@@ -305,3 +305,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.61/build139/schema40 rejects integer/string/null substitutes for explicit JSON boolean confirmation and requires the Task Run to actually exist before reconciliation. Cross-Run material remains rejected.
 - Reconciliation regression adds real API rejection checks for cross-Run evidence, nonexistent Run, non-boolean confirmation, boolean/string/negative/fractional token counts, alongside the existing atomic/idempotency/integrity checks. Full UI and release acceptance remain open.
+
+### Runtime reconciliation audit UI
+
+- Source 0.68.62/build140/schema40 reads the latest 50 reconciliation records in Runtime and renders call/Run, actual tokens/cost/runtime, operator-declared source, Artifact and current integrity. Missing usage is explicitly identified; empty/loading/error states remain distinct. Language changes rerender labels.
+- Browser acceptance covers actual empty API response, injected 503 read failure clearing rows and recovery, alongside existing runtime/evidence/Incident/layout checks. Populated reconciliation UI data has not yet been browser-verified; evidence import/action controls and pagination remain open. No model or production-data actions.

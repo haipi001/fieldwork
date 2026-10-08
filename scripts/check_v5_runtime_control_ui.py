@@ -88,18 +88,20 @@ def run():
             campaign=client.post(f"/api/v1/engagements/{project['id']}/campaigns",json={"name":"Runtime UI fixture","objective":"Inspect configuration and scheduling"}).json()
             assert client.post("/api/v1/research/nodes",json={"campaign_id":campaign["id"],"node_type":"observation","title":"Explicit scheduling fixture"}).status_code==201
             writes,errors=[],[]
-            flags={"fail_config":False,"fail_summary":False}
+            flags={"fail_config":False,"fail_summary":False,"fail_reviews":False}
             def route_request(route):
                 request=route.request;parsed=urlparse(request.url);path=parsed.path
                 assert parsed.hostname=="127.0.0.1"
                 if path=="/v5":route.fulfill(path=str(ROOT/"templates/v5.html"),content_type="text/html")
                 elif path.startswith("/static/"):route.fulfill(path=str(ROOT/path.lstrip("/")))
-                elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs", "/api/v1/v6/policy-decisions"} or path.startswith("/api/v1/orchestration/")
+                elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs", "/api/v1/v6/policy-decisions", "/api/v1/v6/model-usage-reconciliations"} or path.startswith("/api/v1/orchestration/")
                       or path.startswith('/api/v1/v6/runs/') and path.endswith('/evidence-lineage')
                       or path.startswith('/api/v1/v6/incidents/') and path.endswith('/response')
                       or path==f"/api/v1/engagements/{project['id']}/campaigns"
                       or path.startswith("/api/v1/continuous-research/")
                       or path.startswith("/api/v1/runtime/") and path!="/api/v1/runtime/readiness"):
+                    if flags["fail_reviews"] and path=="/api/v1/v6/model-usage-reconciliations":
+                        route.fulfill(status=503,json={"detail":"injected review read failure"});return
                     if flags["fail_config"] and path=="/api/v1/runtime/config":
                         route.fulfill(status=503,json={"detail":"injected configuration read failure"});return
                     if flags["fail_summary"] and path=="/api/v1/v6/runtime-summary":
@@ -172,6 +174,13 @@ def run():
                 page.locator('#rcIncidentId').fill(incident['candidate_id'])
                 page.locator('#rcIncidentRead').click()
                 page.wait_for_selector('[data-incident-integrity="missing_or_changed"]')
+                page.locator('#rcReconciliations').locator('..').locator('summary').first.click()
+                assert '没有已记录' in page.locator('#rcReconciliations').inner_text()
+                flags['fail_reviews']=True;page.locator('#rcRefresh').click()
+                page.wait_for_function("document.querySelector('#rcReconciliations').textContent.includes('503')")
+                assert page.locator('[data-reconciliation-integrity]').count()==0
+                flags['fail_reviews']=False;page.locator('#rcRefresh').click()
+                page.wait_for_function("document.querySelector('#rcReconciliations').textContent.includes('没有已记录')")
                 flags['fail_summary']=True;page.locator('#rcRefresh').click()
                 page.wait_for_function("document.querySelector('#rcSummary').textContent.includes('503')")
                 assert page.locator('[data-summary-total]').count()==0

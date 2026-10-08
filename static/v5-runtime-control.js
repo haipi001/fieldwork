@@ -13,6 +13,7 @@
     let calls=[], providers=[], profiles=[], campaigns=[], campaignId="", engagementId="", policy=null;
     let generation=0, busy=false, offset=0, routes=[], routePage={}, failure="";
     let summary=null, summaryError="";
+    let reconciliations=null,reconciliationError="";
     let evalRuns=null, evalError="";
     let policyDecisions=null, policyError="";
     let incidentResponse=null, incidentError="", incidentGeneration=0;
@@ -23,6 +24,7 @@
       <p>${copy("Profile 是不可变配置版本。研究组引用指定版本；创建或浏览配置不会调用模型。","Profiles are immutable configuration versions referenced by research teams. Creating or viewing configuration does not invoke a model.")}</p>
       <p id="rcMessage" role="status"></p>
       <section aria-labelledby="rcSummaryTitle"><h3 id="rcSummaryTitle">${copy("运行状态快照","Runtime state snapshot")}</h3><div id="rcSummary" aria-live="polite"></div></section>
+      <details><summary>${copy("模型用量核销审计","Model usage reconciliation audit")}</summary><p>${copy("审核来源由操作员声明，当前未验证 Provider 签名。核销不会自动恢复或重放任务。","Review source is declared by the operator; provider signatures are not verified. Reconciliation does not resume or replay tasks.")}</p><div id="rcReconciliations" aria-live="polite"></div></details>
       <details><summary>${copy("回归评估记录","Regression Eval records")}</summary><p>${copy("状态仅适用于记录的场景。材料完整性由后端在读取时核对。","Status applies to the recorded scenario. The backend checks material integrity on read.")}</p><div id="rcEvals" aria-live="polite"></div></details>
       <details><summary>${copy("策略判定记录","Policy decision records")}</summary><p>${copy("判定记录不代表操作已执行。","A decision record does not establish execution.")}</p><div id="rcDecisions" aria-live="polite"></div></details>
       <details><summary>${copy("证据血缘","Evidence lineage")}</summary><form id="rcEvidenceForm" class="form-stack">${label("Run ID","Run ID",input("rcEvidenceRun","text","required maxlength=200 autocomplete=off"))}${button("rcEvidenceRead","读取血缘","Read lineage","submit")}</form><p>${copy("读取时核对材料哈希。确认发现需独立复验。","Material hashes are checked on read. Confirmed findings require independent verification.")}</p><div id="rcEvidence" aria-live="polite"></div><div class="form-pair">${button("rcEvidencePrevious","上一页","Previous page")}${button("rcEvidenceNext","下一页","Next page")}</div></details>
@@ -87,7 +89,7 @@
     const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
     function localize() {
       panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
-      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();renderEvidence();renderIncident();
+      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();renderEvidence();renderIncident();renderReconciliations();
     }
     async function send(url, body, method="POST") {
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
@@ -188,6 +190,13 @@
       const labels={allow:t("允许","Allow"),allow_with_limit:t("受限允许","Allow with limits"),deny:t("拒绝","Deny"),require_approval:t("待批准","Approval required"),quarantine:t("隔离","Quarantine")};
       host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>${t("任务 / Run","Task / run")}</th><th>${t("动作 / 资源","Action / resource")}</th><th>${t("判定 / 理由","Decision / reasons")}</th></tr></thead><tbody>${policyDecisions.map(row=>`<tr data-policy-decision="${esc(row.decision)}"><td>${esc(row.task_id)}<small class="cell-subline">${esc(row.run_id)}</small></td><td>${esc(row.capability)} / ${esc(row.operation)}<small class="cell-subline">${esc(row.resource)}</small></td><td>${esc(labels[row.decision]||row.decision)}<small class="cell-subline">${(row.reasons||[]).map(esc).join(" · ")}</small></td></tr>`).join("")}</tbody></table></div>`;
     }
+    function renderReconciliations() {
+      const host=$("#rcReconciliations");
+      if(reconciliationError){host.textContent=reconciliationError;return}
+      if(reconciliations===null){host.textContent=t("等待读取核销记录。","Awaiting reconciliation records.");return}
+      if(!reconciliations.length){host.textContent=t("没有已记录的用量核销。","No recorded usage reconciliations.");return}
+      host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>${t("调用 / Run","Call / run")}</th><th>${t("实际用量","Recorded usage")}</th><th>${t("审核 / 完整性","Review / integrity")}</th></tr></thead><tbody>${reconciliations.map(row=>`<tr data-reconciliation-integrity="${esc(row.integrity)}"><td>${esc(row.call_id)}<small class="cell-subline">${esc(row.run_id)}</small></td><td>${row.usage?`${esc(row.usage.input_tokens)} / ${esc(row.usage.output_tokens)} tokens · ${esc(row.usage.cost_micros)} µ`:t("用量记录缺失","Usage missing")}<small class="cell-subline">${esc(row.runtime_ms??"—")} ms</small></td><td>${row.review_kind==="provider_record"?t("Provider 记录声明","Provider record statement"):t("操作员审核","Operator review")} · ${row.integrity==="intact"?t("完整","Intact"):t("缺失或已变化","Missing or changed")}<small class="cell-subline">Artifact: ${esc(row.artifact_id)}</small><small class="cell-subline">${esc(row.created_at)}</small></td></tr>`).join("")}</tbody></table></div><p>${t("当前显示最近 50 条核销记录。","Showing the latest 50 reconciliation records.")}</p>`;
+    }
     function renderEvals() {
       const host=$("#rcEvals");
       if(evalError){host.textContent=evalError;return}
@@ -213,9 +222,10 @@
     async function refresh() {
       const token=++generation;failure="";
       try {
-        const [config,ledger,snapshot,evals,decisions]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0"),request("/api/v1/v6/runtime-summary").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/eval-runs?limit=50").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/policy-decisions?limit=50").then(data=>({data}),error=>({error:error.message}))]);
+        const [config,ledger,snapshot,evals,decisions,reviews]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0"),request("/api/v1/v6/runtime-summary").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/eval-runs?limit=50").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/policy-decisions?limit=50").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/model-usage-reconciliations?limit=50").then(data=>({data}),error=>({error:error.message}))]);
         if(token!==generation)return;
         summary=snapshot.data||null;summaryError=snapshot.error||"";renderSummary();
+        reconciliations=reviews.data?.items||[];reconciliationError=reviews.error||"";renderReconciliations();
         evalRuns=evals.data?.runs||[];evalError=evals.error||"";renderEvals();
         policyDecisions=decisions.data?.decisions||[];policyError=decisions.error||"";renderDecisions();
         providers=list(config.providers);profiles=list(config.profiles);state.remote.runtimeConfig={ok:true,data:config};

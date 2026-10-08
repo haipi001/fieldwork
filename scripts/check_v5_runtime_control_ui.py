@@ -6,7 +6,6 @@ No cloud calls, background workers, or production data are used.
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import hashlib
 import os
 from pathlib import Path
 import secrets
@@ -98,6 +97,7 @@ def run():
                 elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs", "/api/v1/v6/policy-decisions", "/api/v1/v6/model-usage-reconciliations"} or path.startswith("/api/v1/orchestration/")
                       or path.startswith('/api/v1/v6/runs/') and path.endswith('/evidence-lineage')
                       or path.startswith('/api/v1/v6/incidents/') and path.endswith('/response')
+                      or path.startswith('/api/v1/v6/model-calls/') and path.rsplit('/',1)[-1] in {'usage-review','reconcile'}
                       or path==f"/api/v1/engagements/{project['id']}/campaigns"
                       or path.startswith("/api/v1/continuous-research/")
                       or path.startswith("/api/v1/runtime/") and path!="/api/v1/runtime/readiness"):
@@ -257,18 +257,32 @@ def run():
                 review_task,review_route=task_route(client,campaign['id'],saved['profiles'][0]['id'],'ui-review')
                 review_call=reserve_call(review_route['id'],review_task['id'],'call-runner',review_task['attempt'])
                 start_call(review_call['id']);fail_call(review_call['id'])
-                review_path=root/'usage-review.json'
-                review_path.write_text(json.dumps(dict(call_id=review_call['id'],decision_id=review_route['id'],
-                    provider_id=review_call['provider_id'],review_kind='operator_review',input_tokens=10,
-                    output_tokens=5,cost_micros=0,runtime_ms=50)))
                 with final_core.connect() as db:
                     db.execute("UPDATE agent_tasks SET run_id='ui-eval-run',status='paused' WHERE id=?",(review_task['id'],))
-                    db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)',('ui-usage-review','ui-eval-run',
-                        'runtime.usage_review',str(review_path),hashlib.sha256(review_path.read_bytes()).hexdigest(),
-                        'application/json',1,final_core.utcnow()))
-                reviewed=client.post(f"/api/v1/v6/model-calls/{review_call['id']}/reconcile",
-                    json=dict(artifact_id='ui-usage-review',confirmed=True))
-                assert reviewed.status_code==200,reviewed.text
+                page.locator('#rcReviewCall').fill(review_call['id'])
+                page.locator('#rcReviewDecision').fill(review_route['id'])
+                page.locator('#rcReviewProvider').fill(review_call['provider_id'])
+                page.locator('#rcReviewInput').fill('10')
+                page.locator('#rcReviewOutput').fill('5')
+                page.locator('#rcReviewRuntime').fill('50')
+                page.locator('#rcReviewImport').click()
+                page.wait_for_function("!document.querySelector('#rcReviewSettle').disabled")
+                page.locator('#rcReviewRuntime').fill('51')
+                assert page.locator('#rcReviewSettle').is_disabled()
+                assert not page.locator('#rcReviewConfirmed').is_checked()
+                page.locator('#rcReviewRuntime').fill('50')
+                page.locator('#rcReviewImport').click()
+                page.wait_for_function("!document.querySelector('#rcReviewSettle').disabled")
+                page.locator('#rcReviewSettle').click()
+                page.wait_for_function("document.querySelector('#rcReviewStatus').textContent.includes('Explicitly confirm')")
+                assert client.get('/api/v1/v6/model-usage-reconciliations').json()['items']==[]
+                page.locator('#rcReviewConfirmed').check()
+                page.locator('#rcReviewSettle').click()
+                page.wait_for_selector('[data-reconciliation-integrity="intact"]')
+                with final_core.connect() as db:
+                    review_path=Path(db.execute('SELECT a.uri FROM model_usage_reconciliations_v6 r '
+                        'JOIN artifacts a ON a.id=r.artifact_id WHERE r.call_id=?',(review_call['id'],)).fetchone()[0])
+                    assert db.execute('SELECT status FROM agent_tasks WHERE id=?',(review_task['id'],)).fetchone()[0]=='paused'
                 page.reload()
                 page.wait_for_function("document.querySelectorAll('[data-rc-health]').length===1")
                 assert page.locator("#rcKey").input_value()==""

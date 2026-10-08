@@ -325,3 +325,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Tested source 37ed05b / 0.68.63/build141/schema40. Fault injection independently rejects Artifact insertion and runtime audit-event insertion after review file creation. Both failures leave no new file, no Artifact/event rows, and preserve the full unknown reservation. Successful import/reconciliation/read checks continue to pass.
 - Current V6 test suite: 49 passed, 1 existing warning in6.66s. This supplies explicit exception-path evidence; process-kill/fsync recovery is not covered by these injections. Full UI and release gates remain open.
+
+### Operator usage review/import/reconcile UI
+
+- Source 0.68.64/build142/schema40 adds Runtime form fields for call/decision/provider/source and actual tokens/cost/duration, imports a structured review, then requires a separate explicit checkbox before reconciliation. Editing the form invalidates the imported selection/confirmation; reset invalidates pending results. Successful reconciliation refreshes audit and retains task state. No model dispatch is performed.
+- Real Chrome/API acceptance completes import and confirmed reconciliation, verifies no unchecked reconciliation occurs, editing disables stale confirmation, actual10/5 tokens/50ms and paused task retention. Existing audit tamper/error/language/theme/narrow-layout checks remain. Full repository regression and full release gates are not established by this browser check.

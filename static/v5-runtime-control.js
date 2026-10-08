@@ -13,6 +13,7 @@
     let calls=[], providers=[], profiles=[], campaigns=[], campaignId="", engagementId="", policy=null;
     let generation=0, busy=false, offset=0, routes=[], routePage={}, failure="";
     let summary=null, summaryError="";
+    let importedReview=null,reviewGeneration=0;
     let reconciliations=null,reconciliationError="";
     let evalRuns=null, evalError="";
     let policyDecisions=null, policyError="";
@@ -24,7 +25,7 @@
       <p>${copy("Profile 是不可变配置版本。研究组引用指定版本；创建或浏览配置不会调用模型。","Profiles are immutable configuration versions referenced by research teams. Creating or viewing configuration does not invoke a model.")}</p>
       <p id="rcMessage" role="status"></p>
       <section aria-labelledby="rcSummaryTitle"><h3 id="rcSummaryTitle">${copy("运行状态快照","Runtime state snapshot")}</h3><div id="rcSummary" aria-live="polite"></div></section>
-      <details><summary>${copy("模型用量核销审计","Model usage reconciliation audit")}</summary><p>${copy("审核来源由操作员声明，当前未验证 Provider 签名。核销不会自动恢复或重放任务。","Review source is declared by the operator; provider signatures are not verified. Reconciliation does not resume or replay tasks.")}</p><div id="rcReconciliations" aria-live="polite"></div></details>
+      <details><summary>${copy("模型用量核销审计","Model usage reconciliation audit")}</summary><p>${copy("审核来源由操作员声明，当前未验证 Provider 签名。核销不会自动恢复或重放任务。","Review source is declared by the operator; provider signatures are not verified. Reconciliation does not resume or replay tasks.")}</p><form id="rcReviewForm" class="form-stack">${label("调用 ID","Call ID",input("rcReviewCall","text","required maxlength=200"))}${label("路由判定 ID","Route decision ID",input("rcReviewDecision","text","required maxlength=200"))}${label("Provider ID","Provider ID",input("rcReviewProvider","text","required maxlength=200"))}${label("审核来源声明","Review source statement",`<select id="rcReviewKind"><option value="operator_review">Operator review</option><option value="provider_record">Provider record statement</option></select>`)}<div class="form-pair">${label("输入词元","Input tokens",number("rcReviewInput",0,0,1000000000))}${label("输出词元","Output tokens",number("rcReviewOutput",0,0,1000000000))}</div><div class="form-pair">${label("实际费用（µ）","Actual cost (µ)",number("rcReviewCost",0,0,1000000000000))}${label("实际耗时（ms）","Actual duration (ms)",number("rcReviewRuntime",0,0,1000000000000))}</div>${button("rcReviewImport","保存审核材料","Save review material","submit")}</form><p id="rcReviewStatus" role="status"></p>${check("rcReviewConfirmed","确认上述材料与实际用量，执行核销","Confirm the material and actual usage to reconcile")}${button("rcReviewSettle","确认核销","Confirm reconciliation")}<div id="rcReconciliations" aria-live="polite"></div></details>
       <details><summary>${copy("回归评估记录","Regression Eval records")}</summary><p>${copy("状态仅适用于记录的场景。材料完整性由后端在读取时核对。","Status applies to the recorded scenario. The backend checks material integrity on read.")}</p><div id="rcEvals" aria-live="polite"></div></details>
       <details><summary>${copy("策略判定记录","Policy decision records")}</summary><p>${copy("判定记录不代表操作已执行。","A decision record does not establish execution.")}</p><div id="rcDecisions" aria-live="polite"></div></details>
       <details><summary>${copy("证据血缘","Evidence lineage")}</summary><form id="rcEvidenceForm" class="form-stack">${label("Run ID","Run ID",input("rcEvidenceRun","text","required maxlength=200 autocomplete=off"))}${button("rcEvidenceRead","读取血缘","Read lineage","submit")}</form><p>${copy("读取时核对材料哈希。确认发现需独立复验。","Material hashes are checked on read. Confirmed findings require independent verification.")}</p><div id="rcEvidence" aria-live="polite"></div><div class="form-pair">${button("rcEvidencePrevious","上一页","Previous page")}${button("rcEvidenceNext","下一页","Next page")}</div></details>
@@ -190,6 +191,23 @@
       const labels={allow:t("允许","Allow"),allow_with_limit:t("受限允许","Allow with limits"),deny:t("拒绝","Deny"),require_approval:t("待批准","Approval required"),quarantine:t("隔离","Quarantine")};
       host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>${t("任务 / Run","Task / run")}</th><th>${t("动作 / 资源","Action / resource")}</th><th>${t("判定 / 理由","Decision / reasons")}</th></tr></thead><tbody>${policyDecisions.map(row=>`<tr data-policy-decision="${esc(row.decision)}"><td>${esc(row.task_id)}<small class="cell-subline">${esc(row.run_id)}</small></td><td>${esc(row.capability)} / ${esc(row.operation)}<small class="cell-subline">${esc(row.resource)}</small></td><td>${esc(labels[row.decision]||row.decision)}<small class="cell-subline">${(row.reasons||[]).map(esc).join(" · ")}</small></td></tr>`).join("")}</tbody></table></div>`;
     }
+    function invalidateReview() {reviewGeneration++;importedReview=null;$("#rcReviewConfirmed").checked=false;$("#rcReviewSettle").disabled=true;$("#rcReviewStatus").textContent=""}
+    $("#rcReviewSettle").disabled=true;
+    $("#rcReviewForm").oninput=invalidateReview;
+    $("#rcReviewForm").onsubmit=async event=>{
+      event.preventDefault();invalidateReview();const token=reviewGeneration;
+      $("#rcReviewImport").disabled=true;
+      const material={call_id:$("#rcReviewCall").value.trim(),decision_id:$("#rcReviewDecision").value.trim(),provider_id:$("#rcReviewProvider").value.trim(),review_kind:$("#rcReviewKind").value,input_tokens:Number($("#rcReviewInput").value),output_tokens:Number($("#rcReviewOutput").value),cost_micros:Number($("#rcReviewCost").value),runtime_ms:Number($("#rcReviewRuntime").value)};
+      try{const result=await send(`/api/v1/v6/model-calls/${encodeURIComponent(material.call_id)}/usage-review`,material);if(token!==reviewGeneration)return;importedReview=result;$("#rcReviewStatus").textContent=`Artifact: ${result.artifact_id} · SHA256: ${result.sha256}`;$("#rcReviewSettle").disabled=false}
+      catch(error){if(token===reviewGeneration)$("#rcReviewStatus").textContent=error.message}
+      finally{$("#rcReviewImport").disabled=false}
+    };
+    $("#rcReviewSettle").onclick=async()=>{
+      if(!importedReview||!$("#rcReviewConfirmed").checked){$("#rcReviewStatus").textContent=t("请明确确认审核材料和实际用量。","Explicitly confirm the material and actual usage.");return}
+      const review=importedReview,token=reviewGeneration;$("#rcReviewSettle").disabled=true;
+      try{await send(`/api/v1/v6/model-calls/${encodeURIComponent(review.call_id)}/reconcile`,{artifact_id:review.artifact_id,confirmed:true});if(token!==reviewGeneration)return;invalidateReview();$("#rcReviewStatus").textContent=t("核销已记录，任务状态保持不变。","Reconciliation recorded; task state is unchanged.");await refresh()}
+      catch(error){if(token===reviewGeneration){$("#rcReviewStatus").textContent=error.message;$("#rcReviewSettle").disabled=false}}
+    };
     function renderReconciliations() {
       const host=$("#rcReconciliations");
       if(reconciliationError){host.textContent=reconciliationError;return}
@@ -289,6 +307,6 @@
     }
     document.addEventListener("fieldwork:languagechange",localize);
     localize();
-    return {refresh,reset(){generation++;incidentGeneration++;incidentResponse=null;incidentError="";$("#rcIncidentId").value="";$("#rcIncidentRead").disabled=false;renderIncident();evidenceGeneration++;evidencePage=null;evidenceError="";$("#rcEvidenceRun").value="";$("#rcEvidenceRead").disabled=false;renderEvidence();engagementId=campaignId="";policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true}};
+    return {refresh,reset(){generation++;invalidateReview();incidentGeneration++;incidentResponse=null;incidentError="";$("#rcIncidentId").value="";$("#rcIncidentRead").disabled=false;renderIncident();evidenceGeneration++;evidencePage=null;evidenceError="";$("#rcEvidenceRun").value="";$("#rcEvidenceRead").disabled=false;renderEvidence();engagementId=campaignId="";policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true}};
   };
 })();

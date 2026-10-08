@@ -337,3 +337,7 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 - Targeted reconciliation tests: 2 passed. A125-token review against60-token reservation is recorded intact, flags token/runtime excess, releases pending reservation, and exhausts the100-token profile budget so the next reservation is denied. Full snapshot regression follows for Git synchronization.
 
 - Git synchronization acceptance for0.68.65/build143/schema40: full `PYTHONPATH=. python3 -m pytest -q` =896 passed,3 skipped,1 existing warning in278.75s. Tested source unchanged during regression; only this result note was appended afterward. Development snapshot requested by user; complete V6 goal remains active.
+
+### Local desktop installation 0.68.65/build143
+
+- User-requested installation of pushed revision 959071c succeeded at `/Applications/Fieldwork.app`. Prior App and database are preserved under ignored `build/macos/install-backup-06815-to06865-lkh9fkcs/`. Native window loaded V5, health200, business API without session401, code signature verified, DB schema40/integrity ok and six evidence/finding collections unchanged by row digest. See `docs/acceptance/2026-10-08-native-install-06865.md`. The app remains source linked; this does not close V6 release gates.

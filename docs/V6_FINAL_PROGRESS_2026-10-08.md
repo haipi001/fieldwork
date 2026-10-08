@@ -177,3 +177,9 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.37 / build 115 / schema 35 adds a pure comparison core for measured Eval metrics: false Verified, policy bypass, candidate precision, replay success, cost and evidence gain. Missing, negative, non-finite and invalid-rate measurements fail closed. False Verified and bypass always fail; baseline precision loss and cost growth without evidence gain are explicit gates, including zero-cost baselines.
 - Focused comparator tests: 8 passed. This does not execute fixtures or establish a release gate result. EvalScenario/EvalRun persistence, subject/version metadata, real result ingestion, API and seed regression scenarios remain required P0.9/P0.10 work. P0.8 other oracle identities also remain open.
+
+### P0.9 immutable EvalScenario/EvalRun records and read views
+
+- Source 0.68.38 / build 116 / schema 36 adds immutable versioned scenario manifests and measured EvalRun records in the existing database. Trusted writers bind a registered scenario, Run, existing Artifact/hash, explicit model/profile/prompt/policy/pack/scheduler metadata and measured metrics; metrics/subject must match the captured Artifact. Baseline comparison requires the same scenario version and intact baseline Artifact. No execution queue or result-write HTTP endpoint is added.
+- Read-only V6 scenario/run endpoints expose persisted records. Focused storage/comparison/receipt-schema suite: 10 passed, including scenario version conflict, record immutability, capture mismatch, Artifact tamper and API write rejection. These are storage fixtures, not real security Eval outcomes. First-party measured scenario runners and seed regressions remain required.
+- Repository regression: 886 passed, 3 skipped, one existing warning in 258.81 seconds. Isolated 35 → 36 backup/upgrade preserves historical receipt bindings and creates empty Eval tables.

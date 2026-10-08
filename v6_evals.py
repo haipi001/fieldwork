@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -57,3 +62,69 @@ def compare_regression(current: Mapping[str, float], baseline: Mapping[str, floa
             failures.append('cost_without_quality_gain')
     return {'passed': not failures, 'failures': failures,
             'comparison_available': baseline is not None}
+
+
+def _encode(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+
+def register_scenario(db, manifest: dict) -> None:
+    for name in ('id', 'version', 'pack_id', 'category', 'objective'):
+        if not isinstance(manifest.get(name), str) or not manifest[name].strip():
+            raise ValueError(f'invalid scenario:{name}')
+    for name in ('expected', 'budgets'):
+        if not isinstance(manifest.get(name), dict):
+            raise ValueError(f'invalid scenario:{name}')
+    for name in ('allowed_capabilities', 'forbidden_capabilities'):
+        if not isinstance(manifest.get(name), list) or any(not isinstance(item, str) for item in manifest[name]):
+            raise ValueError(f'invalid scenario:{name}')
+    encoded = _encode(manifest)
+    existing = db.execute('SELECT manifest_json FROM eval_scenarios_v6 WHERE id=? AND version=?',
+                          (manifest['id'], manifest['version'])).fetchone()
+    if existing:
+        if existing['manifest_json'] != encoded:
+            raise ValueError('scenario version already has different contents')
+        return
+    db.execute('INSERT INTO eval_scenarios_v6 VALUES(?,?,?,?,?)',
+               (manifest['id'], manifest['version'], encoded, hashlib.sha256(encoded.encode()).hexdigest(),
+                datetime.now(timezone.utc).isoformat()))
+
+
+def record_eval_run(db, *, scenario_id: str, scenario_version: str, run_id: str,
+                    artifact_id: str, subject: dict, metrics: dict, baseline_id: str | None = None) -> str:
+    """Trusted fixture runners record measured results in their existing transaction."""
+    if not db.execute('SELECT 1 FROM eval_scenarios_v6 WHERE id=? AND version=?',
+                      (scenario_id, scenario_version)).fetchone():
+        raise ValueError('scenario not registered')
+    required_subject = {'model', 'profile', 'prompt_sha256', 'policy_sha256', 'pack_version', 'scheduler'}
+    if not required_subject <= subject.keys() or not isinstance(subject['scheduler'], dict):
+        raise ValueError('Eval subject version metadata is incomplete')
+    artifact = db.execute('SELECT * FROM artifacts WHERE id=? AND run_id=?', (artifact_id, run_id)).fetchone()
+    if not artifact or not db.execute('SELECT 1 FROM analysis_runs WHERE id=?', (run_id,)).fetchone():
+        raise ValueError('Eval artifact or Run not found')
+    path = Path(artifact['uri'])
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != artifact['sha256']:
+        raise ValueError('Eval result artifact is missing or changed')
+    captured = json.loads(path.read_text())
+    if (captured.get('metrics') != metrics or captured.get('subject') != subject
+            or captured.get('scenario_id') != scenario_id or captured.get('scenario_version') != scenario_version):
+        raise ValueError('Eval metrics or subject conflict with the captured artifact')
+    baseline = None
+    if baseline_id:
+        row = db.execute('SELECT * FROM eval_runs_v6 WHERE id=? AND scenario_id=? AND scenario_version=?',
+                         (baseline_id, scenario_id, scenario_version)).fetchone()
+        if not row:
+            raise ValueError('baseline scenario differs or is missing')
+        prior_artifact = db.execute('SELECT uri,sha256 FROM artifacts WHERE id=? AND run_id=?',
+                                    (row['artifact_id'], row['run_id'])).fetchone()
+        if (not prior_artifact or prior_artifact['sha256'] != row['artifact_sha256']
+                or not Path(prior_artifact['uri']).is_file()
+                or hashlib.sha256(Path(prior_artifact['uri']).read_bytes()).hexdigest() != row['artifact_sha256']):
+            raise ValueError('baseline result artifact is missing or changed')
+        baseline = json.loads(row['metrics_json'])
+    result = compare_regression(metrics, baseline)
+    eval_id = f'eval-{uuid.uuid4().hex}'
+    db.execute('INSERT INTO eval_runs_v6 VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+               (eval_id, scenario_id, scenario_version, run_id, artifact_id, artifact['sha256'], baseline_id,
+                _encode(subject), _encode(metrics), _encode(result), datetime.now(timezone.utc).isoformat()))
+    return eval_id

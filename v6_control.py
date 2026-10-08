@@ -1,6 +1,8 @@
 """Read-only V6 compatibility endpoints over the existing runtime state."""
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Query
 
 import final_core
@@ -26,3 +28,22 @@ def task_model_call_snapshots(task_id: str):
 def runners():
     with final_core.connect() as db:
         return {"runners": list_runners(db)}
+
+
+@router.get('/eval-scenarios')
+def eval_scenarios():
+    with final_core.connect() as db:
+        return {'scenarios': [json.loads(row['manifest_json']) for row in db.execute(
+            'SELECT manifest_json FROM eval_scenarios_v6 ORDER BY id,version')]}
+
+
+@router.get('/eval-runs')
+def eval_runs(limit: int = Query(100, ge=1, le=500)):
+    with final_core.connect() as db:
+        result = []
+        for row in db.execute('SELECT * FROM eval_runs_v6 ORDER BY created_at DESC,id LIMIT ?', (limit,)):
+            value = dict(row)
+            for name in ('subject', 'metrics', 'result'):
+                value[name] = json.loads(value.pop(name + '_json'))
+            result.append(value)
+        return {'runs': result}

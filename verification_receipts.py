@@ -17,6 +17,28 @@ def candidate_fingerprint(candidate):
     return _digest({key: candidate[key] for key in ('id', 'run_id', 'target', 'category', 'title', 'hypothesis')})
 
 
+def _policy_binding(db, run):
+    row = db.execute('''SELECT p.id,p.policy,e.current_policy_id,e.current_scope_snapshot_id FROM execution_policies p
+        JOIN engagements_v2 e ON e.id=p.engagement_id WHERE p.id=? AND e.id=?''',
+        (run['policy_id'], run['engagement_id'])).fetchone()
+    if (not row or row['id'] != row['current_policy_id']
+            or row['current_scope_snapshot_id'] != run['scope_snapshot_id']):
+        raise HTTPException(409, '复验执行策略已变化，请重新复验')
+    return {'policy_id': row['id'], 'policy_sha256': _digest(row['policy'])}
+
+
+def _evidence_binding(db, candidate):
+    import final_core as core
+    result = {}
+    for evidence_id in set(core.load(candidate['evidence_ids'], [])):
+        row = db.execute('SELECT * FROM evidence_v2 WHERE id=? AND run_id=?',
+                         (evidence_id, candidate['run_id'])).fetchone()
+        if not row:
+            raise HTTPException(409, '候选证据缺失或不属于当前运行')
+        result[evidence_id] = _digest(dict(row))
+    return result
+
+
 def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
     """Called only after a registered runtime has executed and persisted its proof."""
     import final_core as core
@@ -25,12 +47,13 @@ def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
     if not proof.reproduced or proof.attempts < 2 or not proof.counterevidence_checked or not proof.counterevidence_summary.strip():
         raise HTTPException(409, '不完整复验不能签发成功收据')
     with core.connect() as db:
-        if v5_receipt_id:
-            db.execute('BEGIN IMMEDIATE')
+        db.execute('BEGIN IMMEDIATE')
         candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (candidate_id,)).fetchone()
         if not candidate or candidate['status'] in {'verified', 'archived'}:
             raise HTTPException(409, '候选不可签发复验收据')
         run = db.execute('SELECT * FROM analysis_runs WHERE id=?', (candidate['run_id'],)).fetchone()
+        policy_binding = _policy_binding(db, run)
+        evidence_binding = _evidence_binding(db, candidate)
         scope = db.execute('SELECT * FROM scope_snapshots WHERE id=? AND confirmed_at IS NOT NULL', (run['scope_snapshot_id'],)).fetchone()
         if not scope or not proof.poc_artifact_ids:
             raise HTTPException(409, '复验缺少 Scope 或实际 Artifact')
@@ -62,6 +85,7 @@ def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
         payload = {
             'schema': 'verification-receipt/1', 'candidate_fingerprint': candidate_fingerprint(candidate),
             'run_id': run['id'], 'scope_snapshot_id': scope['id'], 'scope_sha256': _digest(scope['rules']),
+            **policy_binding, 'evidence_sha256': evidence_binding,
             'artifacts': artifacts, 'proof': proof.model_dump(exclude={'receipt_id'}),
             'program_snapshot': program_snapshot,
             'expires_at': (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
@@ -84,6 +108,9 @@ def validate_receipt(db, candidate, run, scope, proof):
     if proof.oracle == 'http-authorization-read-v2':
         _validate_current_http_scope(db, candidate, scope)
     payload = core.load(receipt['result'], {})
+    if (any(payload.get(key) != value for key, value in _policy_binding(db, run).items())
+            or payload.get('evidence_sha256') != _evidence_binding(db, candidate)):
+        raise HTTPException(409, '收据与当前执行策略或证据不一致，请重新复验')
     if payload.get('v5_verification_receipt_id'):
         _validate_v5_http_binding(db, candidate, proof, payload['v5_verification_receipt_id'])
     if (payload.get('schema') != 'verification-receipt/1' or payload.get('run_id') != run['id']

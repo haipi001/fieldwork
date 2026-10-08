@@ -147,6 +147,11 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 ## Next implementation order
 
+### P0.8 success receipt authority and evidence binding
+
+- Source 0.68.33 / build 111 / schema 34 adds Policy ID/content hash and candidate Evidence row hashes to server-issued success receipts. Issuance captures them under an immediate transaction; validation requires the current engagement Scope/Policy to match the Run and rejects changed policy contents, changed/missing Evidence or missing legacy bindings. Historical receipt rows are retained but cannot establish these new checks without re-verification.
+- Core changes passed repository regression (874 passed, 3 skipped, one existing warning in 309.36 seconds). Subsequent transaction/current-Scope checks passed the focused receipt/business-boundary suite (26 passed). Independent verifier identity/context and immutable V6 receipt-binding storage remain open; this does not complete P0.8. Installed app and service were not upgraded.
+
 1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
 2. P0.6: wire the existing read-only HTTP execution boundaries to these decisions. Preserve the current runtime budget ledger and domain guards.
 4. Continue through evidence, evals, packs, incident handling, and the measured V6.5 scale ladder in the source roadmap. Do not mark V6 complete before its release gates pass.

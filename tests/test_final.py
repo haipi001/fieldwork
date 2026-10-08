@@ -3182,7 +3182,7 @@ def test_observation_is_not_test_coverage_and_success_reason_is_normalized(clien
     assert next(x for x in details['stages'] if x['id']=='verification')['status'] == 'human_review'
 
 
-@pytest.mark.parametrize('mutation', ['missing', 'unknown', 'changed_proof', 'changed_candidate', 'tampered_artifact', 'missing_artifact', 'expired', 'other_candidate'])
+@pytest.mark.parametrize('mutation', ['missing', 'unknown', 'changed_proof', 'changed_candidate', 'tampered_artifact', 'missing_artifact', 'expired', 'other_candidate', 'changed_policy', 'changed_evidence', 'changed_current_scope'])
 def test_verification_receipt_rejects_untrusted_or_stale_proof(client, tmp_path, mutation):
     import hashlib
     import verification_receipts
@@ -3222,6 +3222,19 @@ def test_verification_receipt_rejects_untrusted_or_stale_proof(client, tmp_path,
             db.execute('UPDATE verification_attempts SET result=? WHERE id=?',(json.dumps(value),proof.receipt_id))
     elif mutation == 'other_candidate':
         candidate = client.post(f'/api/v1/runs/{run_id}/candidates',json={**payload,'title':'Other candidate'}).json()
+    elif mutation == 'changed_policy':
+        with final_core.connect() as db:
+            db.execute("UPDATE execution_policies SET policy=? WHERE id=?",
+                       (json.dumps({'changed': True}), engagement['current_policy_id']))
+    elif mutation == 'changed_evidence':
+        with final_core.connect() as db:
+            evidence_id = final_core.load(db.execute('SELECT evidence_ids FROM candidate_findings WHERE id=?',
+                                                     (candidate['id'],)).fetchone()[0])[0]
+            db.execute('UPDATE evidence_v2 SET summary=? WHERE id=?', ('Changed after verification', evidence_id))
+    elif mutation == 'changed_current_scope':
+        with final_core.connect() as db:
+            db.execute('UPDATE engagements_v2 SET current_scope_snapshot_id=? WHERE id=?',
+                       ('different-scope', engagement['id']))
     response = client.post(f"/api/v1/candidates/{candidate['id']}/verify",json=proof.model_dump())
     assert response.status_code == 409, response.text
     assert client.get(f'/api/v1/findings?run_id={run_id}').json()['verified'] == []

@@ -20,25 +20,76 @@ class ContainmentInput(BaseModel):
     reason_code: Literal['compromised', 'operator_containment']
 
 
+class ReleaseInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    expected_generation: int
+    artifact_id: str
+
+
 @router.post('/runs/{run_id}/contain')
 def contain_run(run_id: str, body: ContainmentInput):
     from v6_intents import LOCAL_SESSION_PRINCIPAL
+    from v6_containment import containment_state
     with final_core.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if not db.execute('SELECT 1 FROM analysis_runs WHERE id=?', (run_id,)).fetchone():
             raise HTTPException(404, 'Run not found')
         now = final_core.utcnow()
+        if not containment_state(db, run_id)['active']:
+            db.execute('INSERT INTO run_containment_events_v6(run_id,state,reason_code,principal_id,created_at) '
+                       'VALUES(?,?,?,?,?)', (run_id, 'contained', body.reason_code, LOCAL_SESSION_PRINCIPAL, now))
         db.execute('INSERT OR IGNORE INTO run_containment_v6 VALUES(?,?,?,?)',
                    (run_id, body.reason_code, LOCAL_SESSION_PRINCIPAL, now))
         db.execute('INSERT OR IGNORE INTO capability_revocations_v6 '
                    'SELECT id,?,?,? FROM capability_grants_v6 WHERE run_id=?',
                    (LOCAL_SESSION_PRINCIPAL, now,
                     'compromised' if body.reason_code == 'compromised' else 'operator_revoked', run_id))
-        return {'containment': dict(db.execute('SELECT * FROM run_containment_v6 WHERE run_id=?',
-                                               (run_id,)).fetchone()),
+        record = db.execute('SELECT * FROM run_containment_events_v6 WHERE run_id=? ORDER BY id DESC LIMIT 1',
+                            (run_id,)).fetchone() or db.execute('SELECT * FROM run_containment_v6 WHERE run_id=?', (run_id,)).fetchone()
+        return {'containment': dict(record),
                 'boundary': 'subsequent_v6_authorized_operations',
+                **containment_state(db, run_id),
                 'revoked_grants': db.execute('SELECT COUNT(*) FROM capability_revocations_v6 r '
                     'JOIN capability_grants_v6 g ON g.id=r.grant_id WHERE g.run_id=?', (run_id,)).fetchone()[0]}
+
+
+@router.post('/runs/{run_id}/release-containment')
+def release_containment(run_id: str, body: ReleaseInput):
+    from v6_intents import LOCAL_SESSION_PRINCIPAL
+    from v6_containment import containment_state
+    with final_core.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = containment_state(db, run_id)
+        if not current['active'] or current['generation'] != body.expected_generation:
+            raise HTTPException(409, 'Containment state changed')
+        run = db.execute('SELECT r.*,e.current_scope_snapshot_id,e.current_policy_id,e.status engagement_status,s.confirmed_at '
+            'FROM analysis_runs r JOIN engagements_v2 e ON e.id=r.engagement_id '
+            'JOIN scope_snapshots s ON s.id=r.scope_snapshot_id WHERE r.id=?', (run_id,)).fetchone()
+        if (not run or run['engagement_status'] != 'ready' or not run['confirmed_at']
+                or run['scope_snapshot_id'] != run['current_scope_snapshot_id'] or run['policy_id'] != run['current_policy_id']):
+            raise HTTPException(409, 'Run authority is stale')
+        if db.execute("SELECT 1 FROM runtime_calls c JOIN agent_tasks t ON t.id=c.task_id WHERE t.run_id=? "
+                      "AND c.state IN ('reserved','calling','unknown') LIMIT 1", (run_id,)).fetchone():
+            raise HTTPException(409, 'Run has active or unresolved model consumption')
+        if db.execute('SELECT 1 FROM http_gateway_executions_v6 x JOIN agent_tasks t ON t.id=x.task_id '
+                      'LEFT JOIN http_gateway_receipts_v6 r ON r.action_id=x.action_id '
+                      'WHERE t.run_id=? AND r.action_id IS NULL LIMIT 1', (run_id,)).fetchone():
+            raise HTTPException(409, 'Run has an active or unresolved read execution')
+        if db.execute("SELECT 1 FROM agent_incidents i JOIN candidate_findings c ON c.id=i.candidate_id WHERE c.run_id=? "
+            "AND COALESCE((SELECT state FROM incident_response_events_v6 WHERE candidate_id=c.id ORDER BY id DESC LIMIT 1),'DETECTED') "
+            "NOT IN ('RECOVERED','CLOSED') LIMIT 1", (run_id,)).fetchone():
+            raise HTTPException(409, 'Run has unresolved incident response')
+        artifact = db.execute('SELECT uri,sha256 FROM artifacts WHERE id=? AND run_id=?', (body.artifact_id, run_id)).fetchone()
+        try:
+            intact = artifact and hashlib.sha256(Path(artifact['uri']).read_bytes()).hexdigest() == artifact['sha256']
+        except OSError:
+            intact = False
+        if not intact:
+            raise HTTPException(409, 'Release review evidence is missing or changed')
+        db.execute('INSERT INTO run_containment_events_v6(run_id,state,reason_code,artifact_id,artifact_sha256,principal_id,created_at) '
+                   'VALUES(?,?,?,?,?,?,?)', (run_id, 'released', 'operator_reviewed', body.artifact_id,
+                                           artifact['sha256'], LOCAL_SESSION_PRINCIPAL, final_core.utcnow()))
+        return {**containment_state(db, run_id), 'previous_grants_remain_revoked': True}
 
 
 @router.get('/packs')

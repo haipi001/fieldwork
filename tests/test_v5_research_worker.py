@@ -186,6 +186,11 @@ def test_pause_interrupts_active_model_and_retains_unknown_consumption(client, c
             assert db.execute("SELECT COUNT(*) FROM runtime_calls WHERE state='unknown'").fetchone()[0] == 1
             assert db.execute('SELECT COUNT(*) FROM runtime_usage').fetchone()[0] == 0
             assert db.execute("SELECT COUNT(*) FROM research_nodes WHERE source_type='team_research'").fetchone()[0] == 0
+        if control == 'contain':
+            state = client.post(f'/api/v1/v6/runs/{run_id}/contain', json={'reason_code':'compromised'}).json()
+            rejected = client.post(f'/api/v1/v6/runs/{run_id}/release-containment',
+                json={'expected_generation':state['generation'],'artifact_id':'unused-review'})
+            assert rejected.status_code == 409 and 'unresolved model' in rejected.json()['detail']
     finally:
         research.stop_workers()
         server.shutdown()

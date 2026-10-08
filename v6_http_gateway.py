@@ -29,8 +29,9 @@ class ReadContained(ValueError):
 
 
 def check_read_containment(run_id: str) -> None:
+    from v6_containment import is_contained
     with final_core.connect() as db:
-        if db.execute('SELECT 1 FROM run_containment_v6 WHERE run_id=?', (run_id,)).fetchone():
+        if is_contained(db, run_id):
             raise ReadContained('Run V6 read execution is contained')
 
 

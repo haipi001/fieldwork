@@ -189,7 +189,7 @@ def test_native_browser_gateway_denial_is_audited_without_start_or_grant_use(cli
         assert db.execute("SELECT status FROM agent_tasks").fetchone()[0] == "failed"
 
 
-def test_run_containment_revokes_grants_and_blocks_new_read_gateway(client):
+def test_run_containment_revokes_grants_and_blocks_new_read_gateway(client, tmp_path):
     engagement = prepare(client, "https://native-browser.example.test", None)
     action = authorize_native_browser_read('native-discovery-run', engagement['id'],
                                            'https://native-browser.example.test/')
@@ -203,6 +203,24 @@ def test_run_containment_revokes_grants_and_blocks_new_read_gateway(client):
                                       'https://native-browser.example.test/')
     with final_core.connect() as db:
         assert db.execute('SELECT COUNT(*) FROM http_gateway_executions_v6').fetchone()[0] == 1
+        review = tmp_path / 'review.json'
+        review.write_text('{"review":"operator fixture"}')
+        db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)', ('release-review','native-discovery-run',
+            'containment.review',str(review),hashlib.sha256(review.read_bytes()).hexdigest(),'application/json',1,final_core.utcnow()))
+    released = client.post('/api/v1/v6/runs/native-discovery-run/release-containment',
+        json={'expected_generation':response.json()['generation'],'artifact_id':'release-review'})
+    assert released.status_code == 200 and released.json()['active'] is False
+    action = authorize_native_browser_read('native-discovery-run', engagement['id'], 'https://native-browser.example.test/')
+    contained = client.post('/api/v1/v6/runs/native-discovery-run/contain', json={'reason_code':'compromised'})
+    assert contained.json()['active'] and contained.json()['generation'] > response.json()['generation']
+    blocked = client.post('/api/v1/v6/runs/native-discovery-run/release-containment',
+        json={'expected_generation':contained.json()['generation'],'artifact_id':'release-review'})
+    assert blocked.status_code == 409 and 'unresolved read' in blocked.json()['detail']
+    finish_http_read(action, cancelled=True, error_type='ReadContained')
+    assert client.post('/api/v1/v6/runs/native-discovery-run/release-containment',
+        json={'expected_generation':response.json()['generation'],'artifact_id':'release-review'}).status_code == 409
+    with pytest.raises(ValueError, match='denied by V6 policy'):
+        authorize_native_browser_read('native-discovery-run', engagement['id'], 'https://native-browser.example.test/')
 
 
 def test_body_bearing_get_is_rejected_before_budget_or_gateway(client):

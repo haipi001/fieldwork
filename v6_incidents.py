@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 import final_core as core
 from v6_intents import LOCAL_SESSION_PRINCIPAL
+from v6_containment import is_contained
 
 router = APIRouter(prefix='/api/v1/v6', tags=['V6 Incident Response'])
 STATES = ('DETECTED', 'TRIAGED', 'CONTAINED', 'INVESTIGATING', 'REMEDIATING', 'RECOVERED', 'CLOSED')
@@ -42,8 +43,7 @@ def response_history(candidate_id: str):
         return {'candidate_id': candidate_id, 'run_id': incident['run_id'],
                 'state': history[-1]['state'] if history else 'DETECTED', 'history': history,
                 'state_authority': 'operator_response_record',
-                'run_containment_active': bool(db.execute('SELECT 1 FROM run_containment_v6 WHERE run_id=?',
-                                                          (incident['run_id'],)).fetchone()),
+                'run_containment_active': is_contained(db, incident['run_id']),
                 'containment_boundary': 'subsequent_v6_authorized_operations'}
 
 
@@ -56,8 +56,7 @@ def transition_response(candidate_id: str, body: Transition):
         current = history[-1]['state'] if history else 'DETECTED'
         if current != body.expected_state or STATES.index(body.state) != STATES.index(current) + 1:
             raise HTTPException(409, 'Incident response state changed or transition is invalid')
-        if body.state == 'CONTAINED' and not db.execute('SELECT 1 FROM run_containment_v6 WHERE run_id=?',
-                                                       (incident['run_id'],)).fetchone():
+        if body.state == 'CONTAINED' and not is_contained(db, incident['run_id']):
             raise HTTPException(409, 'Run has no effective V6 containment record')
         artifact = db.execute('SELECT uri,sha256 FROM artifacts WHERE id=? AND run_id=?',
                                (body.artifact_id, incident['run_id'])).fetchone()

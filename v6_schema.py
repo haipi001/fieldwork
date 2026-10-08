@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-V6_SCHEMA_VERSION = 9
+V6_SCHEMA_VERSION = 10
 V6_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS v6_schema_meta(
          key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)""",
@@ -81,6 +81,10 @@ V6_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS run_containment_v6(
          run_id TEXT PRIMARY KEY,reason_code TEXT NOT NULL,principal_id TEXT NOT NULL,
          created_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS incident_response_events_v6(
+         id INTEGER PRIMARY KEY AUTOINCREMENT,candidate_id TEXT NOT NULL,run_id TEXT NOT NULL,
+         state TEXT NOT NULL,artifact_id TEXT NOT NULL,artifact_sha256 TEXT NOT NULL,
+         principal_id TEXT NOT NULL,created_at TEXT NOT NULL)""",
     *(
         f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation}
              BEFORE {operation.upper()} ON {table}
@@ -89,7 +93,8 @@ V6_SCHEMA_STATEMENTS = (
                       "policy_decisions_v6", "model_gateway_bindings_v6", "model_gateway_starts_v6",
                       "http_gateway_executions_v6", "http_gateway_receipts_v6",
                       "runtime_artifact_links_v6", "verification_receipt_bindings_v6",
-                      "eval_scenarios_v6", "eval_runs_v6", "run_containment_v6")
+                      "eval_scenarios_v6", "eval_runs_v6", "run_containment_v6",
+                      "incident_response_events_v6")
         for operation in ("update", "delete")
     ),
 )

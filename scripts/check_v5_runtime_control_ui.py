@@ -66,6 +66,20 @@ def run():
                 authorize_native_browser_read('ui-policy-run',project['id'],'https://outside-ui.example.test/')
             except ValueError:
                 pass
+            import agent_audit
+            from tests.test_agent_audit import create, upload, analyze
+            agent_audit.init_agent_audit_db()
+            audit_fixture=agent_audit.demo_fixture()
+            audit_id=create(client,audit_fixture)
+            for body in audit_fixture['imports']:
+                upload(client,audit_id,body)
+            analyze(client,audit_id)
+            with final_core.connect() as db:
+                incident=db.execute('SELECT i.candidate_id,c.run_id,e.artifact_id,a.uri FROM agent_incidents i '
+                    'JOIN candidate_findings c ON c.id=i.candidate_id JOIN agent_events e ON e.id=i.event_id '
+                    'JOIN artifacts a ON a.id=e.artifact_id WHERE i.audit_id=? LIMIT 1',(audit_id,)).fetchone()
+            incident_route=f"/api/v1/v6/incidents/{incident['candidate_id']}/response"
+            assert client.post(incident_route,json=dict(expected_state='DETECTED',state='TRIAGED',artifact_id=incident['artifact_id'])).status_code==200
             campaign=client.post(f"/api/v1/engagements/{project['id']}/campaigns",json={"name":"Runtime UI fixture","objective":"Inspect configuration and scheduling"}).json()
             assert client.post("/api/v1/research/nodes",json={"campaign_id":campaign["id"],"node_type":"observation","title":"Explicit scheduling fixture"}).status_code==201
             writes,errors=[],[]
@@ -77,6 +91,7 @@ def run():
                 elif path.startswith("/static/"):route.fulfill(path=str(ROOT/path.lstrip("/")))
                 elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs", "/api/v1/v6/policy-decisions"} or path.startswith("/api/v1/orchestration/")
                       or path.startswith('/api/v1/v6/runs/') and path.endswith('/evidence-lineage')
+                      or path.startswith('/api/v1/v6/incidents/') and path.endswith('/response')
                       or path==f"/api/v1/engagements/{project['id']}/campaigns"
                       or path.startswith("/api/v1/continuous-research/")
                       or path.startswith("/api/v1/runtime/") and path!="/api/v1/runtime/readiness"):
@@ -124,6 +139,22 @@ def run():
                 page.locator('#rcEvidenceRun').fill('ui-eval-run')
                 page.locator('#rcEvidenceRead').click()
                 page.wait_for_selector('[data-evidence-integrity="missing_or_changed"]')
+                page.locator('#rcIncident').locator('..').locator('summary').first.click()
+                page.locator('#rcIncidentId').fill(incident['candidate_id'])
+                page.locator('#rcIncidentRead').click()
+                page.wait_for_selector('[data-incident-state="TRIAGED"]')
+                page.wait_for_selector('[data-incident-integrity="intact"]')
+                Path(incident['uri']).write_text('{}')
+                page.locator('#rcIncidentRead').click()
+                page.wait_for_selector('[data-incident-integrity="missing_or_changed"]')
+                page.locator('#rcIncidentId').fill('missing-incident')
+                page.locator('#rcIncidentRead').click()
+                page.wait_for_function("document.querySelector('#rcIncident').textContent.includes('404')")
+                assert page.locator('[data-incident-state]').count()==0
+                assert page.locator('[data-incident-integrity]').count()==0
+                page.locator('#rcIncidentId').fill(incident['candidate_id'])
+                page.locator('#rcIncidentRead').click()
+                page.wait_for_selector('[data-incident-integrity="missing_or_changed"]')
                 flags['fail_summary']=True;page.locator('#rcRefresh').click()
                 page.wait_for_function("document.querySelector('#rcSummary').textContent.includes('503')")
                 assert page.locator('[data-summary-total]').count()==0
@@ -197,6 +228,14 @@ def run():
                 assert page.locator("#rcKey").input_value()==""
                 assert "Frozen UI offline profile" in page.locator("#rcRouteProfile").text_content()
                 assert "fixture-key-no-real-credential" not in page.evaluate("JSON.stringify(localStorage)")
+                page.locator('#rcIncident').locator('..').locator('summary').first.click()
+                page.locator('#rcIncidentId').fill(incident['candidate_id'])
+                page.locator('#rcIncidentRead').click()
+                page.wait_for_selector('[data-incident-integrity="missing_or_changed"]')
+                page.locator('#rcEvidence').locator('..').locator('summary').first.click()
+                page.locator('#rcEvidenceRun').fill('ui-eval-run')
+                page.locator('#rcEvidenceRead').click()
+                page.wait_for_selector('[data-evidence-integrity="missing_or_changed"]')
                 output=ROOT/"build/acceptance/v5-runtime-ui";output.mkdir(parents=True,exist_ok=True)
                 for language in ("en","zh-CN"):
                     page.set_viewport_size({"width":1440,"height":1000})

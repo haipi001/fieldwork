@@ -259,3 +259,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.53 / build 131 / schema 39 rechecks every immutable response event against its same-Run Artifact metadata and actual file bytes in a database read snapshot. History exposes per-event integrity and aggregate not_recorded/intact/missing_or_changed without changing recorded operator response state. No raw material or local path is exposed.
 - Incident regression passes with real Agent Audit evidence: file replacement, file removal and stored Artifact hash mutation are surfaced; restoring intact material restores the read integrity status. Append-only response records and transition gates remain enforced. Full repository regression and Incident UI remain open; no installed-app or main-database changes.
+
+### P1.8 Incident response history UI
+
+- Source 0.68.54 / build 132 / schema 39 adds a candidate-scoped response-history read form in Runtime, displaying operator state, effective Run containment, aggregate/per-event evidence integrity, Artifact ID/hash and time. Loading/empty/error states and reset invalidate stale reads. Scope text identifies the operator authority and bounded containment, without claiming verified remediation.
+- Real Chrome acceptance creates/analyzes an isolated Agent Audit fixture through actual APIs, records TRIAGED, reads intact evidence, tampers material and observes missing_or_changed, then verifies a missing incident clears the previous state and rows. The screenshot/layout loop now reopens Incident and Evidence tables after reload to test rendered data in both languages/themes at widths 1440/680. JS syntax passes. Incident action controls, full domain response convergence and complete release gates remain open.

@@ -15,6 +15,7 @@
     let summary=null, summaryError="";
     let evalRuns=null, evalError="";
     let policyDecisions=null, policyError="";
+    let incidentResponse=null, incidentError="", incidentGeneration=0;
     let evidencePage=null, evidenceError="", evidenceGeneration=0;
     const panel = document.createElement("article");
     panel.id="runtimeControl"; panel.className="panel runtime-control";
@@ -25,6 +26,7 @@
       <details><summary>${copy("回归评估记录","Regression Eval records")}</summary><p>${copy("状态仅适用于记录的场景。材料完整性由后端在读取时核对。","Status applies to the recorded scenario. The backend checks material integrity on read.")}</p><div id="rcEvals" aria-live="polite"></div></details>
       <details><summary>${copy("策略判定记录","Policy decision records")}</summary><p>${copy("判定记录不代表操作已执行。","A decision record does not establish execution.")}</p><div id="rcDecisions" aria-live="polite"></div></details>
       <details><summary>${copy("证据血缘","Evidence lineage")}</summary><form id="rcEvidenceForm" class="form-stack">${label("Run ID","Run ID",input("rcEvidenceRun","text","required maxlength=200 autocomplete=off"))}${button("rcEvidenceRead","读取血缘","Read lineage","submit")}</form><p>${copy("读取时核对材料哈希。确认发现需独立复验。","Material hashes are checked on read. Confirmed findings require independent verification.")}</p><div id="rcEvidence" aria-live="polite"></div></details>
+      <details><summary>${copy("事件响应历史","Incident response history")}</summary><form id="rcIncidentForm" class="form-stack">${label("事件 Candidate ID","Incident candidate ID",input("rcIncidentId","text","required maxlength=200 autocomplete=off"))}${button("rcIncidentRead","读取响应历史","Read response history","submit")}</form><p>${copy("状态来自操作员响应记录。证据完整性不代表修复已验证；Run 隔离仅约束后续 V6 授权操作。","States come from operator response records. Evidence integrity does not establish verified remediation; Run containment covers subsequent V6 authorized operations.")}</p><div id="rcIncident" aria-live="polite"></div></details>
       <details><summary>${copy("新增 V5 Provider","Add V5 provider")}</summary><form id="rcProviderForm" class="form-stack">
         <div class="form-pair">${label("名称","Name",input("rcProviderName","text","required maxlength=120 autocomplete=off"))}
           ${label("位置","Location",`<select id="rcLocation"><option value="local">Local</option><option value="cloud">Cloud</option></select>`)}</div>
@@ -85,7 +87,7 @@
     const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
     function localize() {
       panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
-      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();renderEvidence();
+      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();renderEvidence();renderIncident();
     }
     async function send(url, body, method="POST") {
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
@@ -144,6 +146,21 @@
       if(token!==generation)return;
       calls=list(value);renderCalls();
     }
+    function renderIncident() {
+      const host=$("#rcIncident");
+      if(incidentError){host.textContent=incidentError;return}
+      if(!incidentResponse){host.textContent=t("输入事件 Candidate ID 后读取历史。","Enter an incident candidate ID to read history.");return}
+      const data=incidentResponse,states={DETECTED:t("已检测","Detected"),TRIAGED:t("已分诊","Triaged"),CONTAINED:t("已隔离","Contained"),INVESTIGATING:t("调查中","Investigating"),REMEDIATING:t("修复中","Remediating"),RECOVERED:t("已恢复","Recovered"),CLOSED:t("已关闭","Closed")};
+      const integrity=value=>value==="intact"?t("完整","Intact"):value==="not_recorded"?t("未记录","Not recorded"):t("缺失或已变化","Missing or changed");
+      host.innerHTML=`<p data-incident-state="${esc(data.state)}">${esc(states[data.state]||data.state)} · Run: ${esc(data.run_id)} · ${data.run_containment_active?t("当前隔离有效","Containment active"):t("当前未隔离","Containment inactive")} · ${integrity(data.response_evidence_integrity)}</p>${data.history.length?`<div class="table-wrap"><table><thead><tr><th>${t("响应状态","Response state")}</th><th>Artifact</th><th>${t("证据完整性","Evidence integrity")}</th><th>${t("记录时间","Recorded at")}</th></tr></thead><tbody>${data.history.map(row=>`<tr data-incident-integrity="${esc(row.evidence_integrity)}"><td>${esc(states[row.state]||row.state)}</td><td>${esc(row.artifact_id)}<small class="cell-subline">SHA256: ${esc(row.artifact_sha256)}</small></td><td>${integrity(row.evidence_integrity)}</td><td>${esc(row.created_at)}</td></tr>`).join("")}</tbody></table></div>`:`<p>${t("没有操作员响应记录。","No operator response records.")}</p>`}`;
+    }
+    $("#rcIncidentForm").onsubmit=async event=>{
+      event.preventDefault();const token=++incidentGeneration,id=$("#rcIncidentId").value.trim();
+      incidentResponse=null;incidentError=t("正在读取…","Reading…");renderIncident();$("#rcIncidentRead").disabled=true;
+      try{const value=await request(`/api/v1/v6/incidents/${encodeURIComponent(id)}/response`);if(token!==incidentGeneration)return;incidentResponse=value;incidentError=""}
+      catch(error){if(token!==incidentGeneration)return;incidentError=error.message}
+      finally{if(token===incidentGeneration){$("#rcIncidentRead").disabled=false;renderIncident()}}
+    };
     function renderEvidence() {
       const host=$("#rcEvidence");
       if(evidenceError){host.textContent=evidenceError;return}
@@ -257,6 +274,6 @@
     }
     document.addEventListener("fieldwork:languagechange",localize);
     localize();
-    return {refresh,reset(){generation++;evidenceGeneration++;evidencePage=null;evidenceError="";$("#rcEvidenceRun").value="";$("#rcEvidenceRead").disabled=false;renderEvidence();engagementId=campaignId="";policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true}};
+    return {refresh,reset(){generation++;incidentGeneration++;incidentResponse=null;incidentError="";$("#rcIncidentId").value="";$("#rcIncidentRead").disabled=false;renderIncident();evidenceGeneration++;evidencePage=null;evidenceError="";$("#rcEvidenceRun").value="";$("#rcEvidenceRead").disabled=false;renderEvidence();engagementId=campaignId="";policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true}};
   };
 })();

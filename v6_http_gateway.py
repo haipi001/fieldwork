@@ -19,6 +19,9 @@ BROWSER_AGENT = "fieldwork:native-browser-agent-v1"
 REPLAY_RUNNER_ID = f"builtin-http-replay-{uuid.uuid4().hex[:12]}"
 REPLAY_PRINCIPAL = "fieldwork:http-replay-worker"
 REPLAY_AGENT = "fieldwork:http-replay-agent-v1"
+RUN_READ_RUNNER_ID = f"builtin-run-http-{uuid.uuid4().hex[:12]}"
+RUN_READ_PRINCIPAL = "fieldwork:run-http-worker"
+RUN_READ_AGENT = "fieldwork:run-http-agent-v1"
 
 
 def _emit(db: sqlite3.Connection, campaign_id: str, action_id: str, kind: str, payload: dict) -> None:
@@ -45,9 +48,25 @@ def authorize_http_replay_read(run_id: str, engagement_id: str, candidate_id: st
                            arguments_hash=arguments_hash, replay_round=replay_round, replay_role=replay_role)
 
 
+def authorize_run_http_read(run_id: str, engagement_id: str, url: str, *,
+                            headers: dict[str, str], source: str) -> str:
+    """Authorize a GET from the HTTP workbench or guided page collector."""
+    if source.startswith("campaign-recovery:") and source.removeprefix("campaign-recovery:"):
+        source = "campaign_recovery"
+    elif source.startswith("campaign:") and source.removeprefix("campaign:"):
+        source = "campaign_workflow"
+    if source not in {"manual", "replay", "guided_page_read", "campaign_workflow", "campaign_recovery"}:
+        raise ValueError("unsupported Run HTTP read source")
+    arguments_hash = hashlib.sha256(json.dumps({"url": url, "method": "GET", "headers": headers},
+                                       sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return _authorize_read(run_id, engagement_id, url, kind="run_http", arguments_hash=arguments_hash,
+                           source=source)
+
+
 def _authorize_read(run_id: str, engagement_id: str, url: str, *, kind: str,
                     candidate_id: str | None = None, arguments_hash: str | None = None,
-                    replay_round: int | None = None, replay_role: str | None = None) -> str:
+                    replay_round: int | None = None, replay_role: str | None = None,
+                    source: str | None = None) -> str:
     if kind == "native_browser":
         runner_id, runner_kind = BROWSER_RUNNER_ID, "native-browser"
         principal, agent = BROWSER_PRINCIPAL, BROWSER_AGENT
@@ -62,6 +81,12 @@ def _authorize_read(run_id: str, engagement_id: str, url: str, *, kind: str,
         statuses = {"running", "paused", "completed"}
         if not candidate_id:
             raise ValueError("HTTP replay requires a candidate")
+    elif kind == "run_http":
+        runner_id, runner_kind = RUN_READ_RUNNER_ID, "run-http"
+        principal, agent = RUN_READ_PRINCIPAL, RUN_READ_AGENT
+        capability, operation, role = "network.request", "get", "run-http-reader"
+        rule_id, reason = "v5.run_http_network_guard", "investigation"
+        statuses = {"running", "paused", "completed"}
     else:
         raise ValueError("unsupported read gateway kind")
     parsed = urlsplit(url)
@@ -96,7 +121,9 @@ def _authorize_read(run_id: str, engagement_id: str, url: str, *, kind: str,
                 raise ValueError("HTTP replay candidate is missing or no longer eligible")
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
-        campaign_name = f"{'Native browser reads' if kind == 'native_browser' else 'HTTP replay reads'} {run_id}"
+        campaign_prefix = {"native_browser": "Native browser reads", "http_replay": "HTTP replay reads",
+                           "run_http": "Run HTTP reads"}[kind]
+        campaign_name = f"{campaign_prefix} {run_id}"
         campaign = db.execute("SELECT id FROM research_campaigns WHERE engagement_id=? AND name=?",
                               (engagement_id, campaign_name)).fetchone()
         campaign_id = campaign["id"] if campaign else f"read-campaign-{uuid.uuid4().hex}"
@@ -131,6 +158,7 @@ def _authorize_read(run_id: str, engagement_id: str, url: str, *, kind: str,
                                         f"intent-{uuid.uuid4().hex}", f"grant-{uuid.uuid4().hex}")
         capsule = json.dumps({"native_browser_read": kind == "native_browser",
                               "http_replay_read": kind == "http_replay", "candidate_id": candidate_id,
+                              "first_party_run_read": kind == "run_http", "source": source,
                               "replay_round": replay_round, "replay_role": replay_role,
                               "scope_snapshot_id": authority["run_scope_id"],
                               "policy_id": authority["run_policy_id"], "resource": resource},

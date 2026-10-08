@@ -68,7 +68,8 @@ def _intent_current(db: sqlite3.Connection, intent: sqlite3.Row) -> bool:
     """, (intent["task_id"], intent["campaign_id"])).fetchone()
     try:
         capsule = json.loads(row["context_capsule_json"]) if row else {}
-        extended_run = bool(capsule.get("team_plan") or capsule.get("http_replay_read"))
+        extended_run = bool(capsule.get("team_plan") or capsule.get("http_replay_read")
+                            or capsule.get("first_party_run_read"))
     except (TypeError, ValueError, AttributeError):
         extended_run = False
     return bool(row and row["run_id"] == intent["run_id"]

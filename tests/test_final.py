@@ -595,7 +595,7 @@ def test_campaign_schedule_only_auto_executes_explicit_read_only_plan(client, mo
         assert configured.status_code == 200
         outcome = client.post(f"/api/v1/campaigns/{campaign['id']}/schedule/run-now")
         assert outcome.status_code == 200, outcome.text
-        assert outcome.json()["status"] == "completed" and outcome.json()["execution"] == "read_only"
+        assert outcome.json()["status"] == "completed" and outcome.json()["execution"] == "read_only", outcome.json().get("error")
         assert outcome.json()["tested"] >= 1 and state["requests"] >= 1
         detail = client.get(f"/api/v1/campaigns/{campaign['id']}").json()
         assert detail["iterations"][0]["status"] == "completed" and detail["iterations_completed"] == 1

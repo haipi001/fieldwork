@@ -1,4 +1,5 @@
 import hashlib
+import json
 import pytest
 import guided_pages as pages
 import guided_research as guided
@@ -30,7 +31,11 @@ def test_real_exchange_saved_and_visited_not_repeated(client,monkeypatch):
     assert checkpoints[0][0]['status']=='requesting' and reads[0]['status']=='recorded'
     with core.connect() as db:
         row=db.execute('SELECT * FROM http_exchanges WHERE id=?',(reads[0]['exchange_id'],)).fetchone()
+        gateway=db.execute("SELECT x.action_id,t.context_capsule_json,r.status FROM http_gateway_executions_v6 x "
+                           "JOIN agent_tasks t ON t.id=x.task_id JOIN http_gateway_receipts_v6 r ON r.action_id=x.action_id "
+                           "WHERE t.role='run-http-reader'").fetchone()
     assert row['source']=='guided_page_read' and row['identity_id'] is None
+    assert gateway['status']=='completed' and json.loads(gateway['context_capsule_json'])['source']=='guided_page_read'
     assert pages.collect(run['id'],[],lambda _:None,lambda:None)==[]
 
 

@@ -139,12 +139,21 @@ def test_reviewed_live_replay_requires_authorization_and_preserves_unconfirmed_r
     assert persisted['result']['reviewed_execution'] is True
     with core.connect() as db:
         assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM http_gateway_executions_v6 WHERE capability='network.request'").fetchone()[0] == 10
-        assert db.execute("SELECT COUNT(*) FROM http_gateway_receipts_v6 WHERE status='completed'").fetchone()[0] == 10
-        assert db.execute("SELECT COUNT(*) FROM capability_uses_v6").fetchone()[0] == 10
-        assert db.execute("SELECT COUNT(*) FROM policy_decisions_v6 WHERE decision='allow_with_limit'").fetchone()[0] == 10
+        assert db.execute("SELECT COUNT(*) FROM http_gateway_executions_v6 e JOIN agent_tasks t ON t.id=e.task_id "
+                          "WHERE t.role='run-http-reader'").fetchone()[0] == 3
+        replay_count = "FROM http_gateway_executions_v6 e JOIN agent_tasks t ON t.id=e.task_id WHERE t.role='http-replay-reader'"
+        assert db.execute("SELECT COUNT(*) " + replay_count).fetchone()[0] == 10
+        assert db.execute("SELECT COUNT(*) FROM http_gateway_receipts_v6 r JOIN http_gateway_executions_v6 e "
+                          "ON e.action_id=r.action_id JOIN agent_tasks t ON t.id=e.task_id "
+                          "WHERE t.role='http-replay-reader' AND r.status='completed'").fetchone()[0] == 10
+        assert db.execute("SELECT COUNT(*) FROM capability_uses_v6 u JOIN http_gateway_executions_v6 e "
+                          "ON e.action_id=u.action_id JOIN agent_tasks t ON t.id=e.task_id "
+                          "WHERE t.role='http-replay-reader'").fetchone()[0] == 10
+        assert db.execute("SELECT COUNT(*) FROM policy_decisions_v6 d JOIN action_intents_v6 a ON a.id=d.intent_id "
+                          "JOIN agent_tasks t ON t.id=a.task_id WHERE t.role='http-replay-reader' "
+                          "AND d.decision='allow_with_limit'").fetchone()[0] == 10
         intents = db.execute("SELECT t.context_capsule_json,a.arguments_hash,a.resource FROM action_intents_v6 a "
-                             "JOIN agent_tasks t ON t.id=a.task_id WHERE a.capability='network.request'").fetchall()
+                             "JOIN agent_tasks t ON t.id=a.task_id WHERE t.role='http-replay-reader'").fetchall()
         roles = [json.loads(row['context_capsule_json'])['replay_role'] for row in intents]
         assert {role: roles.count(role) for role in set(roles)} == {
             'baseline': 2, 'attack': 2, 'negative_control': 2,
@@ -247,8 +256,11 @@ def test_cancel_preserves_immutable_http_checkpoints(client, monkeypatch, object
     assert job['status'] == 'cancelled' and job['result']['requests_sent'] == stop_after
     assert len(calls) == 3 + stop_after
     with core.connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM http_gateway_executions_v6 WHERE capability='network.request'").fetchone()[0] == stop_after
-        assert db.execute("SELECT COUNT(*) FROM http_gateway_receipts_v6 WHERE status='completed'").fetchone()[0] == stop_after
+        assert db.execute("SELECT COUNT(*) FROM http_gateway_executions_v6 e JOIN agent_tasks t ON t.id=e.task_id "
+                          "WHERE t.role='http-replay-reader'").fetchone()[0] == stop_after
+        assert db.execute("SELECT COUNT(*) FROM http_gateway_receipts_v6 r JOIN http_gateway_executions_v6 e "
+                          "ON e.action_id=r.action_id JOIN agent_tasks t ON t.id=e.task_id "
+                          "WHERE t.role='http-replay-reader' AND r.status='completed'").fetchone()[0] == stop_after
     assert not job['result']['verification_executed']
     item = next(item for item in job['result']['items'] if item['candidate_id'] == candidate['id'])
     checkpoint = item['replay_checkpoint']

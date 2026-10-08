@@ -270,11 +270,30 @@ def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, pare
     engagement = final_core.get_engagement(run["engagement_id"])
     identity_headers = resolve_identity_headers(body.identity_id) if body.identity_id else {}
     spec = ReplayRequest(url=body.url, method=method, headers={**body.headers, **identity_headers}, body=body.body)
+    if method == "GET" and spec.body is not None:
+        raise HTTPException(409, "body-bearing GET requires a separate effectful authorization")
     network_guard(engagement, spec)
     consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
     if not consumed:
         raise HTTPException(409, reason)
-    result = request_once(spec)
+    action_id = None
+    if method == "GET" and spec.body is None:
+        from v6_http_gateway import authorize_run_http_read
+        action_id = authorize_run_http_read(run_id, run["engagement_id"], spec.url,
+                                            headers=spec.headers, source=source)
+    try:
+        result = request_once(spec)
+        if action_id:
+            from v6_http_gateway import finish_http_read
+            finish_http_read(action_id, response=result)
+    except Exception as error:
+        if action_id:
+            from v6_http_gateway import finish_http_read
+            try:
+                finish_http_read(action_id, error_type=type(error).__name__)
+            except ValueError:
+                pass
+        raise
     exchange = _record_exchange(run, spec, result, body.identity_id, source, parent_exchange_id)
     if include_transient:
         exchange["_transient_body"] = result.get("_transient_body", "")
@@ -508,6 +527,8 @@ def prepare_http_replay(run_id: str, body: HttpReplayInput):
         specs.extend([assertion.baseline_identity, assertion.attack_identity])
         names.extend(["baseline_identity", "attack_identity"])
     for spec in specs:
+        if spec.method.upper() == "GET" and spec.body is not None:
+            raise HTTPException(409, "body-bearing GET requires a separate effectful authorization")
         network_guard(engagement, spec)
     return run, engagement, specs, names
 

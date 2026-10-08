@@ -1,11 +1,14 @@
 import hashlib
+import json
 import sqlite3
 
 import pytest
+from fastapi import HTTPException
 
 import final_core
 import lifecycle
 import native_agent
+import traditional_runtime as http
 from tests.test_final import client
 from tests.test_http_business_boundary import object_server
 from tests.test_v5_native_discovery import prepare
@@ -115,6 +118,32 @@ def test_native_browser_gateway_denial_is_audited_without_start_or_grant_use(cli
         assert db.execute("SELECT COUNT(*) FROM capability_uses_v6").fetchone()[0] == 0
         assert db.execute("SELECT decision FROM policy_decisions_v6").fetchone()[0] == "deny"
         assert db.execute("SELECT status FROM agent_tasks").fetchone()[0] == "failed"
+
+
+def test_body_bearing_get_is_rejected_before_budget_or_gateway(client):
+    engagement = prepare(client, "https://native-browser.example.test", None)
+    with pytest.raises(HTTPException, match="body-bearing GET"):
+        http.create_http_exchange("native-discovery-run", http.ExchangeRequestInput(
+            url="https://native-browser.example.test/", method="GET", body="fixture"))
+    with final_core.connect() as db:
+        assert db.execute("SELECT requests_used FROM run_budgets_v2 WHERE run_id='native-discovery-run'").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM http_gateway_executions_v6").fetchone()[0] == 0
+
+
+def test_manual_exchange_and_replay_each_receive_read_receipt(client, object_server):
+    origin, calls = object_server
+    prepare(client, origin, None)
+    original = http.create_http_exchange("native-discovery-run", http.ExchangeRequestInput(url=origin + "/object"))
+    replay = http.replay_http_exchange(original["id"], http.ExchangeReplayInput())
+    assert original["response_status"] == replay["response_status"] == 403
+    assert calls == [("/object", None), ("/object", None)]
+    with final_core.connect() as db:
+        rows = db.execute("SELECT t.context_capsule_json,r.status FROM http_gateway_executions_v6 e "
+                          "JOIN agent_tasks t ON t.id=e.task_id "
+                          "JOIN http_gateway_receipts_v6 r ON r.action_id=e.action_id "
+                          "ORDER BY e.started_at,e.action_id").fetchall()
+        assert sorted(json.loads(row["context_capsule_json"])["source"] for row in rows) == ["manual", "replay"]
+        assert all(row["status"] == "completed" for row in rows)
 
 
 def test_native_browser_gateway_schema_upgrade_keeps_prior_records(tmp_path):

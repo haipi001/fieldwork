@@ -60,11 +60,20 @@ def collect(run_id, links, checkpoint, check_cancel, previous_attempts=(), limit
             http.network_guard(fresh_engagement,spec)
             # Persist intent before transport. Uncertain attempts are not automatically repeated.
             record['status']='requesting';record['attempted']=True;reads.append(record);attempted.add(item['url']);checkpoint(reads)
-            response=http.request_once(spec)
+            from v6_http_gateway import authorize_run_http_read, finish_http_read
+            action_id=authorize_run_http_read(run_id,run['engagement_id'],spec.url,
+                                              headers=spec.headers,source='guided_page_read')
+            try:
+                response=http.request_once(spec)
+                finish_http_read(action_id,response=response)
+            except Exception as error:
+                try:finish_http_read(action_id,error_type=type(error).__name__)
+                except ValueError:pass
+                raise
             exchange=http._record_exchange(current,spec,response,None,'guided_page_read',item.get('source_id'))
             record.update(status='recorded',exchange_id=exchange['id'],response_status=exchange['response_status'])
             checkpoint(reads)
-        except HTTPException:
+        except (HTTPException,ValueError):
             record['status']='not_completed'
             if record not in reads:reads.append(record)
             checkpoint(reads)

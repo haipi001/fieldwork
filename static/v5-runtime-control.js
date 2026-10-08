@@ -13,12 +13,14 @@
     let calls=[], providers=[], profiles=[], campaigns=[], campaignId="", engagementId="", policy=null;
     let generation=0, busy=false, offset=0, routes=[], routePage={}, failure="";
     let summary=null, summaryError="";
+    let evalRuns=null, evalError="";
     const panel = document.createElement("article");
     panel.id="runtimeControl"; panel.className="panel runtime-control";
     panel.innerHTML=`<header><h2>${copy("V5 模型配置与研究策略","V5 model configuration and research policy")}</h2>${button("rcRefresh","刷新配置","Refresh configuration")}</header>
       <p>${copy("Profile 是不可变配置版本。研究组引用指定版本；创建或浏览配置不会调用模型。","Profiles are immutable configuration versions referenced by research teams. Creating or viewing configuration does not invoke a model.")}</p>
       <p id="rcMessage" role="status"></p>
       <section aria-labelledby="rcSummaryTitle"><h3 id="rcSummaryTitle">${copy("运行状态快照","Runtime state snapshot")}</h3><div id="rcSummary" aria-live="polite"></div></section>
+      <details><summary>${copy("回归评估记录","Regression Eval records")}</summary><p>${copy("状态仅适用于记录的场景。材料完整性由后端在读取时核对。","Status applies to the recorded scenario. The backend checks material integrity on read.")}</p><div id="rcEvals" aria-live="polite"></div></details>
       <details><summary>${copy("新增 V5 Provider","Add V5 provider")}</summary><form id="rcProviderForm" class="form-stack">
         <div class="form-pair">${label("名称","Name",input("rcProviderName","text","required maxlength=120 autocomplete=off"))}
           ${label("位置","Location",`<select id="rcLocation"><option value="local">Local</option><option value="cloud">Cloud</option></select>`)}</div>
@@ -79,7 +81,7 @@
     const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
     function localize() {
       panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
-      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();
+      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();
     }
     async function send(url, body, method="POST") {
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
@@ -138,6 +140,14 @@
       if(token!==generation)return;
       calls=list(value);renderCalls();
     }
+    function renderEvals() {
+      const host=$("#rcEvals");
+      if(evalError){host.textContent=evalError;return}
+      if(evalRuns===null){host.textContent=t("等待读取评估记录。","Awaiting Eval records.");return}
+      if(!evalRuns.length){host.textContent=t("没有已记录的 Eval。","No recorded Evals.");return}
+      const labels={passed:t("通过","Passed"),failed:t("失败","Failed"),invalid:t("材料失效","Materials invalid")};
+      host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>${t("场景 / 版本","Scenario / version")}</th><th>${t("模型 / Profile","Model / profile")}</th><th>${t("状态","Status")}</th><th>${t("失败项 / 材料","Failures / materials")}</th></tr></thead><tbody>${evalRuns.map(row=>`<tr data-eval-id="${esc(row.id)}" data-eval-status="${esc(row.status)}"><td>${esc(row.scenario_id)} / ${esc(row.scenario_version)}<small class="cell-subline">${esc(row.id)}</small></td><td>${esc(row.subject?.model??t("未记录","Not recorded"))}<small class="cell-subline">${esc(row.subject?.profile??"—")}</small></td><td>${esc(labels[row.status]||row.status)}</td><td>${(row.result?.failures||[]).map(esc).join(" · ")||"—"}<small class="cell-subline">Artifact: ${esc(row.artifact_id)} · ${row.integrity?.artifact?t("完整","Intact"):t("失效","Invalid")}</small></td></tr>`).join("")}</tbody></table></div>`;
+    }
     function renderSummary() {
       const host=$("#rcSummary");
       if(!summary){host.textContent=summaryError||t("等待状态快照。","Awaiting state snapshot.");return}
@@ -155,9 +165,10 @@
     async function refresh() {
       const token=++generation;failure="";
       try {
-        const [config,ledger,snapshot]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0"),request("/api/v1/v6/runtime-summary").then(data=>({data}),error=>({error:error.message}))]);
+        const [config,ledger,snapshot,evals]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0"),request("/api/v1/v6/runtime-summary").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/eval-runs?limit=50").then(data=>({data}),error=>({error:error.message}))]);
         if(token!==generation)return;
         summary=snapshot.data||null;summaryError=snapshot.error||"";renderSummary();
+        evalRuns=evals.data?.runs||[];evalError=evals.error||"";renderEvals();
         providers=list(config.providers);profiles=list(config.profiles);state.remote.runtimeConfig={ok:true,data:config};
         onConfig();
         routes=list(ledger);offset=routes.length;routePage=ledger.page||{};renderProviders();renderRoutes();await loadCalls(token);

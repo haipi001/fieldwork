@@ -51,6 +51,13 @@ def run():
             app.init_db();final_core.init_final_db();app.apply_v5_schema(app.DB);app.apply_v6_schema(app.DB);app.finalize_database_version(app.DB)
             client=TestClient(app.app,base_url="http://127.0.0.1:8000",headers={"X-Fieldwork-Session":os.environ["FIELDWORK_SESSION_TOKEN"]})
             project=create_ready(client,target="https://runtime-ui.example.test")
+            from v6_eval_seeds import run_policy_seed
+            with final_core.connect() as db:
+                db.execute('INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    ('ui-eval-run',project['id'],'traditional',project['current_scope_snapshot_id'],project['current_policy_id'],
+                     'completed','report',1,None,None,None,None,final_core.utcnow()))
+                eval_id=run_policy_seed(db,'ui-eval-run',root/'eval-artifacts')
+                eval_path=Path(db.execute('SELECT a.uri FROM eval_runs_v6 e JOIN artifacts a ON a.id=e.artifact_id WHERE e.id=?',(eval_id,)).fetchone()[0])
             campaign=client.post(f"/api/v1/engagements/{project['id']}/campaigns",json={"name":"Runtime UI fixture","objective":"Inspect configuration and scheduling"}).json()
             assert client.post("/api/v1/research/nodes",json={"campaign_id":campaign["id"],"node_type":"observation","title":"Explicit scheduling fixture"}).status_code==201
             writes,errors=[],[]
@@ -60,7 +67,7 @@ def run():
                 assert parsed.hostname=="127.0.0.1"
                 if path=="/v5":route.fulfill(path=str(ROOT/"templates/v5.html"),content_type="text/html")
                 elif path.startswith("/static/"):route.fulfill(path=str(ROOT/path.lstrip("/")))
-                elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary"} or path.startswith("/api/v1/orchestration/")
+                elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs"} or path.startswith("/api/v1/orchestration/")
                       or path==f"/api/v1/engagements/{project['id']}/campaigns"
                       or path.startswith("/api/v1/continuous-research/")
                       or path.startswith("/api/v1/runtime/") and path!="/api/v1/runtime/readiness"):
@@ -87,6 +94,11 @@ def run():
                 assert page.locator('[data-summary-total="tasks"]').inner_text() == str(client.get('/api/v1/v6/runtime-summary').json()['tasks']['total'])
                 page.wait_for_function("document.querySelector('#rcCampaign').value !== ''")
                 assert not writes and counts=={"health":0,"model":0}
+                page.locator('#rcEvals').locator('..').locator('summary').click()
+                page.wait_for_selector('[data-eval-status="passed"]')
+                eval_path.write_text('{}')
+                page.locator('#rcRefresh').click()
+                page.wait_for_selector('[data-eval-status="invalid"]')
                 flags['fail_summary']=True;page.locator('#rcRefresh').click()
                 page.wait_for_function("document.querySelector('#rcSummary').textContent.includes('503')")
                 assert page.locator('[data-summary-total]').count()==0

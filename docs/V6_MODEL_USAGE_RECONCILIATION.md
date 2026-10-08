@@ -30,3 +30,7 @@ Evidence import UI, paged reconciliation read/integrity UI, authenticated provid
 ## Read audit
 
 `GET /api/v1/v6/model-usage-reconciliations?limit=50&offset=0` returns immutable reconciliation metadata, recorded usage/runtime and current integrity; maximum limit is 100. It rechecks same-Run Artifact kind/hash/file contents, Task/Call ownership, settled usage/timing and the usage report binding. No storage URI or raw material is returned. A changed or missing material produces `missing_or_changed`; booked usage is retained. Pagination reflects current records.
+
+## Import review
+
+`POST /api/v1/v6/model-calls/{call_id}/usage-review` accepts the exact ReviewMaterial JSON above and returns a generated Artifact ID/hash. It requires an unknown call, existing Run and matching call/decision/provider IDs. Storage filenames are generated internally; no path/content outside the strict material is accepted. Import leaves consumption unknown and does not settle or dispatch anything. File/DB failures clean up the newly written file. A separate confirmed reconcile request is required.

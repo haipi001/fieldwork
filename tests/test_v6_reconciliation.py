@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -68,6 +69,22 @@ def test_unknown_reconciliation_is_evidence_bound_atomic_and_does_not_resume(cli
         assert db.execute('SELECT state FROM runtime_calls WHERE id=?', (call['id'],)).fetchone()[0] == 'unknown'
         assert db.execute('SELECT COUNT(*) FROM runtime_usage').fetchone()[0] == 0
         db.execute('DROP TRIGGER reject_review')
+    import_route = f"/api/v1/v6/model-calls/{call['id']}/usage-review"
+    assert client.post(import_route, json={**material, 'provider_id':'wrong'}).status_code == 409
+    assert client.post(import_route, json={**material, 'raw_secret':'not-allowed'}).status_code == 422
+    imported = client.post(import_route, json=material)
+    assert imported.status_code == 201, imported.text
+    assert imported.json()['consumption_state'] == 'unknown'
+    assert 'uri' not in imported.json()
+    imported_id = imported.json()['artifact_id']
+    with core.connect() as db:
+        imported_row = db.execute('SELECT * FROM artifacts WHERE id=?', (imported_id,)).fetchone()
+        assert imported_row['run_id'] == 'review-run'
+        assert hashlib.sha256(Path(imported_row['uri']).read_bytes()).hexdigest() == imported.json()['sha256']
+        assert db.execute('SELECT state FROM runtime_calls WHERE id=?', (call['id'],)).fetchone()[0] == 'unknown'
+    # Use the imported material to settle, then test its current integrity.
+    path = Path(imported_row['uri'])
+    body = dict(artifact_id=imported_id, confirmed=True)
     response = client.post(route, json=body)
     assert response.status_code == 200, response.text
     assert client.post(route, json=body).json() == response.json()
@@ -88,12 +105,17 @@ def test_unknown_reconciliation_is_evidence_bound_atomic_and_does_not_resume(cli
     assert 'uri' not in record
     assert client.get(read_route + '?offset=1').json()['items'] == []
     assert client.get(read_route + '?limit=101').status_code == 422
-    store({**material, 'input_tokens':11})
+    def change_imported(value):
+        path.write_text(json.dumps(value, sort_keys=True, separators=(',', ':')))
+        with core.connect() as db:
+            db.execute('UPDATE artifacts SET sha256=? WHERE id=?',
+                       (hashlib.sha256(path.read_bytes()).hexdigest(), imported_id))
+    change_imported({**material, 'input_tokens':11})
     assert client.post(route, json=body).status_code == 409
     assert client.get(read_route).json()['items'][0]['integrity'] == 'missing_or_changed'
     with core.connect() as db:
         assert db.execute('SELECT state FROM runtime_calls WHERE id=?', (call['id'],)).fetchone()[0] == 'settled'
-    store(material)
+    change_imported(material)
     assert client.get(read_route).json()['items'][0]['integrity'] == 'intact'
     path.unlink()
     assert client.get(read_route).json()['items'][0]['integrity'] == 'missing_or_changed'

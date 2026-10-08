@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from typing import Literal
 
 import final_core
-from v6_reconciliation import ReviewInput
+from v6_reconciliation import ReviewInput, ReviewMaterial
 from v6_runtime_bridge import list_events, list_model_call_snapshots, list_runners
 
 router = APIRouter(prefix="/api/v1/v6", tags=["V6 Control Plane"])
@@ -238,3 +238,9 @@ def reconcile_model_call(call_id: str, body: ReviewInput):
 def model_usage_reconciliations(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
     from v6_reconciliation import read_reconciliations
     return read_reconciliations(limit, offset)
+
+
+@router.post('/model-calls/{call_id}/usage-review', status_code=201)
+def import_model_usage_review(call_id: str, body: ReviewMaterial):
+    from v6_reconciliation import import_review
+    return import_review(call_id, body)

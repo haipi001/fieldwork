@@ -120,3 +120,43 @@ def read_reconciliations(limit=50, offset=0):
             value['runtime_ms'] = timing['runtime_ms'] if timing else None
             items.append(value)
         return {'items':items, 'offset':offset, 'has_more':len(rows)>limit}
+
+
+def import_review(call_id: str, material: ReviewMaterial):
+    import json
+    import uuid
+    path = None
+    created = False
+    try:
+        with core.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            call = db.execute('SELECT c.*,t.run_id FROM runtime_calls c JOIN agent_tasks t ON t.id=c.task_id '
+                              'WHERE c.id=?', (call_id,)).fetchone()
+            if not call:
+                raise HTTPException(404, 'Model call not found')
+            if call['state'] != 'unknown' or not call['run_id'] or not db.execute(
+                    'SELECT 1 FROM analysis_runs WHERE id=?', (call['run_id'],)).fetchone():
+                raise HTTPException(409, 'Review import requires unknown consumption with a recorded Run')
+            if (material.call_id, material.decision_id, material.provider_id) != (
+                    call_id, call['decision_id'], call['provider_id']):
+                raise HTTPException(409, 'Usage review belongs to another call or provider')
+            artifact_id = 'usage-review-' + uuid.uuid4().hex
+            directory = Path(core.LOCAL_DATA_ROOT) / 'v6-usage-reviews'
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / (artifact_id + '.json')
+            raw = json.dumps(material.model_dump(), sort_keys=True, separators=(',', ':')).encode()
+            with path.open('xb') as output:
+                created = True
+                output.write(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)',
+                       (artifact_id, call['run_id'], 'runtime.usage_review', str(path), digest,
+                        'application/json', 1, core.utcnow()))
+            runtime._emit(db, call_id, 'call.review_imported', {'artifact_id':artifact_id,
+                'artifact_sha256':digest, 'principal_id':LOCAL_SESSION_PRINCIPAL}, call['campaign_id'])
+        return {'artifact_id':artifact_id, 'sha256':digest, 'run_id':call['run_id'],
+                'call_id':call_id, 'consumption_state':'unknown'}
+    except Exception:
+        if created and path is not None:
+            path.unlink(missing_ok=True)
+        raise

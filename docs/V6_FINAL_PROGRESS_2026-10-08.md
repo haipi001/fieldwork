@@ -315,3 +315,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Browser acceptance on source 0.68.62/build140/schema40 now creates a leased model-call reservation using the existing configured local provider, marks the fixture dispatch unknown without sending a model request, attaches a same-Run review and invokes the real reconciliation API. No additional provider/profile configuration is introduced.
 - Real Chrome verifies populated audit tokens 10/5, duration50ms, intact→changed review integrity, 503 clearing a previously populated table, and successful reread. The rendered audit table remains visible during both language/theme and 1440/680-width overflow checks. No page errors, zero model requests. This closes the earlier populated-table browser verification gap, not the evidence-import/action UI or full release gates.
+
+### Structured usage review import
+
+- Source 0.68.63/build141/schema40 adds explicit review import for unknown calls with existing Run and exact call/decision/provider binding. Strict material is stored as a hashed same-Run Artifact using generated filenames; the API returns no local URI. Import leaves usage unknown and does not dispatch. Failed transaction cleans up only its newly created file.
+- Targeted tests use the actual imported Artifact for reconciliation and subsequent read-integrity checks, reject wrong provider/extra raw fields, verify hash/Run ownership and unchanged call state before reconciliation. Full UI and release gates remain open.

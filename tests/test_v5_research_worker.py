@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+import pytest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import final_core
@@ -139,7 +140,8 @@ def test_missing_local_provider_does_not_claim_team_tasks(client):
         assert db.execute('SELECT COUNT(*) FROM runtime_calls').fetchone()[0] == 0
 
 
-def test_pause_interrupts_active_model_and_retains_unknown_consumption(client):
+@pytest.mark.parametrize('control', ['pause', 'contain'])
+def test_pause_interrupts_active_model_and_retains_unknown_consumption(client, control):
     campaign, body = team(client, count=2)
     requested, disconnected = threading.Event(), threading.Event()
     class Handler(BaseHTTPRequestHandler):
@@ -171,7 +173,12 @@ def test_pause_interrupts_active_model_and_retains_unknown_consumption(client):
         assert client.post(f'/api/v1/workers/research/groups/{group_id}/start').status_code == 202
         assert requested.wait(3)
         start = time.monotonic()
-        assert client.post(f'/api/v1/orchestration/groups/{group_id}/pause').status_code == 200
+        if control == 'pause':
+            assert client.post(f'/api/v1/orchestration/groups/{group_id}/pause').status_code == 200
+        else:
+            with final_core.connect() as db:
+                run_id = db.execute('SELECT run_id FROM agent_tasks WHERE group_id=?', (group_id,)).fetchone()[0]
+            assert client.post(f'/api/v1/v6/runs/{run_id}/contain', json={'reason_code': 'compromised'}).status_code == 200
         wait_group(group_id)
         assert time.monotonic() - start < 2 and disconnected.wait(1)
         with final_core.connect() as db:

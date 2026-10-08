@@ -208,3 +208,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.43 / build 121 / schema 37 rechecks Run containment before and after workbench/guided GET transport and in the pinned browser/HTTP replay supervisor callback. A containment interruption records a cancelled gateway receipt and prevents result persistence. The existing urllib paths cannot be interrupted while blocked inside their synchronous call; supervised paths check during worker execution. These checks cannot retract already-transmitted requests.
 - Focused HTTP gateway/guided/workflow suite: 45 passed. A real local transport fixture contains the Run immediately after authorization and proves no target request is sent and the receipt is cancelled. The post-response check was limited to containment after initial regression exposed changed legacy cancellation semantics; prior cancellation checkpoints now pass unchanged. Model/legacy-path cancellation and recovery remain open.
+
+### P1.6 supervised model containment
+
+- Source 0.68.44 / build 122 / schema 37 checks Run containment in the shared model-authority callback used by supervised local/cloud model transport. The existing child lifetime and usage accounting paths handle interruption; uncertain provider consumption remains unknown and no output is admitted.
+- Real streaming model fixture proves containment disconnects within two seconds, retains one unknown call and writes no usage settlement or research node. Transport/gateway/Worker suite: 28 passed; full research/native-discovery focused suite: 8 passed. No repository-wide rerun or installed-service validation was performed. Legacy execution paths, Incident linkage and recovery remain open.

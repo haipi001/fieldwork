@@ -236,6 +236,9 @@ def _check_model_authority(provider, task):
     with _core().connect() as db:
         db.execute("PRAGMA busy_timeout=50")
         current = _owned_running(db, task["id"], task["lease_owner"])
+        if current['run_id'] and db.execute('SELECT 1 FROM run_containment_v6 WHERE run_id=?',
+                                            (current['run_id'],)).fetchone():
+            raise HTTPException(409, 'Run model execution is contained')
         _check_lease_attempt(current, task["attempt"])
         _validate_current(db, current)
         if current["run_id"] and _load(current["context_capsule_json"], {}).get("structured_worker"):

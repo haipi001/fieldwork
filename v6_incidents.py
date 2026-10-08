@@ -35,14 +35,32 @@ def _history(db, candidate_id):
                 'WHERE candidate_id=? ORDER BY id', (candidate_id,))]
 
 
+def _response_evidence_intact(db, event):
+    artifact = db.execute('SELECT uri,sha256 FROM artifacts WHERE id=? AND run_id=?',
+                          (event['artifact_id'], event['run_id'])).fetchone()
+    if not artifact or artifact['sha256'] != event['artifact_sha256']:
+        return False
+    try:
+        return hashlib.sha256(Path(artifact['uri']).read_bytes()).hexdigest() == event['artifact_sha256']
+    except OSError:
+        return False
+
+
 @router.get('/incidents/{candidate_id}/response')
 def response_history(candidate_id: str):
     with core.connect() as db:
+        db.execute('BEGIN')
         incident = _incident(db, candidate_id)
         history = _history(db, candidate_id)
+        for event in history:
+            event['evidence_integrity'] = ('intact' if _response_evidence_intact(db, event)
+                                           else 'missing_or_changed')
         return {'candidate_id': candidate_id, 'run_id': incident['run_id'],
                 'state': history[-1]['state'] if history else 'DETECTED', 'history': history,
                 'state_authority': 'operator_response_record',
+                'response_evidence_integrity': ('not_recorded' if not history else
+                    'intact' if all(event['evidence_integrity'] == 'intact' for event in history)
+                    else 'missing_or_changed'),
                 'run_containment_active': is_contained(db, incident['run_id']),
                 'containment_boundary': 'subsequent_v6_authorized_operations'}
 

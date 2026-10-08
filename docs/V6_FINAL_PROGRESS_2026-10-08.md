@@ -254,3 +254,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.52 / build 130 / schema 39 adds a Run-scoped read form and material table in the runtime page. It displays Artifact kind/ID/hash/integrity plus recorded event/Observation/Evidence links, with explicit loading, empty and error states. Reset invalidates pending reads and clears prior Run results. The current UI shows the first 50 records and identifies additional pages.
 - Real Chrome acceptance verifies intact→changed material, missing Run clearing old rows, and Chinese/English dark/light 1440/680-width layout with the evidence table rendered. No page errors or model calls; JS syntax passed. Interactive pagination, Incident controls, complete producer lineage and release gates remain open; no main-data/installed-service changes were performed.
+
+### Incident response evidence integrity on read
+
+- Source 0.68.53 / build 131 / schema 39 rechecks every immutable response event against its same-Run Artifact metadata and actual file bytes in a database read snapshot. History exposes per-event integrity and aggregate not_recorded/intact/missing_or_changed without changing recorded operator response state. No raw material or local path is exposed.
+- Incident regression passes with real Agent Audit evidence: file replacement, file removal and stored Artifact hash mutation are surfaced; restoring intact material restores the read integrity status. Append-only response records and transition gates remain enforced. Full repository regression and Incident UI remain open; no installed-app or main-database changes.

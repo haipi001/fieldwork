@@ -94,15 +94,20 @@ def test_exchange_lineage_failure_rolls_back_exchange_and_artifact(client):
     assert not list(http.ARTIFACT_ROOT.glob("artifact-*.json"))
 
 
-def test_native_browser_request_uses_pinned_transport_and_v6_receipt(client, object_server):
+def test_native_browser_request_uses_pinned_transport_and_v6_receipt(client, object_server, monkeypatch, tmp_path):
     origin, calls = object_server
+    monkeypatch.setattr(native_agent, "WORKSPACE_ROOT", tmp_path / "native")
     engagement = prepare(client, origin, None)
     with final_core.connect() as db:
         run = dict(db.execute("SELECT * FROM analysis_runs WHERE id='native-discovery-run'").fetchone())
+    action_ids = []
     response = native_agent._pinned_browser_get(run, final_core.get_engagement(engagement["id"]),
-                                                origin + "/object", lambda: None)
+                                                origin + "/object", lambda: None, action_ids)
     assert response["status"] == 403 and response["process_execution"]["network_connect_denied"] is True
     assert calls == [("/object", None)]
+    assert len(action_ids) == 1
+    artifact_id, observation_id = native_agent._persist_browser_artifact(
+        run, origin + "/object", {"status": response["status"], "title": "Fixture"}, action_ids)
     with final_core.connect() as db:
         assert db.execute("SELECT requests_used FROM run_budgets_v2 WHERE run_id=?", (run["id"],)).fetchone()[0] == 1
         receipt = db.execute("SELECT r.*,x.task_id FROM http_gateway_receipts_v6 r "
@@ -110,6 +115,11 @@ def test_native_browser_request_uses_pinned_transport_and_v6_receipt(client, obj
         assert receipt["status"] == "completed" and receipt["http_status"] == 403
         assert receipt["body_sha256"] == response["body_sha256"]
         assert db.execute("SELECT status FROM agent_tasks WHERE id=?", (receipt["task_id"],)).fetchone()[0] == "succeeded"
+        assert db.execute("SELECT raw_ref FROM observations WHERE id=?", (observation_id,)).fetchone()[0] == artifact_id
+        assert db.execute("SELECT artifact_id FROM runtime_artifact_links_v6 WHERE action_id=?",
+                          (action_ids[0],)).fetchone()[0] == artifact_id
+        completed = [event for event in list_events(db) if event["event_type"] == "tool.execution.completed"]
+        assert len(completed) == 1 and completed[0]["artifact_ids"] == [artifact_id]
 
 
 def test_native_browser_cancellation_before_transport_records_failure_without_network(client, object_server):

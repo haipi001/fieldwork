@@ -43,29 +43,38 @@ def _workspace(run_id: str) -> Path:
     return root
 
 
-def _persist_browser_artifact(run: dict[str, Any], url: str, page_data: dict[str, Any]) -> tuple[str, str]:
+def _persist_browser_artifact(run: dict[str, Any], url: str, page_data: dict[str, Any],
+                              action_ids: list[str]) -> tuple[str, str]:
     import final_core
     workspace = _workspace(run["id"])
     artifact_id = final_core.uid("artifact")
     artifact_path = workspace / f"{artifact_id}.json"
-    artifact_path.write_text(json.dumps(page_data, ensure_ascii=False, indent=2))
-    artifact_path.chmod(0o600)
-    digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
     observation_id = final_core.uid("obs")
-    with final_core.connect() as db:
-        db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
-            artifact_id, run["id"], "native_agent.browser_observation", str(artifact_path),
-            digest, "application/json", 1, final_core.utcnow(),
-        ))
-        db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
-            observation_id, run["id"], run["engagement_id"], run["mode"], "browser.page_observation",
-            url, f"Browser observed HTTP {page_data['status']} · {page_data['title'] or 'untitled page'}",
-            .7, "native-agent-browser", artifact_id, final_core.utcnow(),
-        ))
+    try:
+        artifact_path.write_text(json.dumps(page_data, ensure_ascii=False, indent=2))
+        artifact_path.chmod(0o600)
+        digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        with final_core.connect() as db:
+            db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
+                artifact_id, run["id"], "native_agent.browser_observation", str(artifact_path),
+                digest, "application/json", 1, final_core.utcnow(),
+            ))
+            db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                observation_id, run["id"], run["engagement_id"], run["mode"], "browser.page_observation",
+                url, f"Browser observed HTTP {page_data['status']} · {page_data['title'] or 'untitled page'}",
+                .7, "native-agent-browser", artifact_id, final_core.utcnow(),
+            ))
+            from v6_http_gateway import link_completed_reads_to_artifact
+            link_completed_reads_to_artifact(db, action_ids=action_ids,
+                                             artifact_id=artifact_id, run_id=run["id"])
+    except Exception:
+        artifact_path.unlink(missing_ok=True)
+        raise
     return artifact_id, observation_id
 
 
-def _pinned_browser_get(run: dict[str, Any], engagement: dict[str, Any], url: str, check_current):
+def _pinned_browser_get(run: dict[str, Any], engagement: dict[str, Any], url: str, check_current,
+                        completed_actions: list[str] | None = None):
     """Run one browser document GET through existing guards and the V6 read gate."""
     import final_core
     from traditional_runtime import ReplayRequest, network_guard
@@ -86,6 +95,8 @@ def _pinned_browser_get(run: dict[str, Any], engagement: dict[str, Any], url: st
         response = request_once(ReplayRequest(url=url), addresses, check_current)
         check_current()
         finish_http_read(action_id, response=response)
+        if completed_actions is not None:
+            completed_actions.append(action_id)
         return response
     except Exception as error:
         try:
@@ -116,6 +127,7 @@ def _observe_page(run: dict[str, Any], engagement: dict[str, Any], url: str) -> 
     check_current()
     from playwright.sync_api import sync_playwright
     blocked: list[str] = []
+    completed_actions: list[str] = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             executable_path=str(CHROME), headless=True,
@@ -136,7 +148,8 @@ def _observe_page(run: dict[str, Any], engagement: dict[str, Any], url: str) -> 
                     route.abort('blockedbyclient')
                     return
                 try:
-                    response = _pinned_browser_get(run, engagement, request.url, check_current)
+                    response = _pinned_browser_get(run, engagement, request.url, check_current,
+                                                   completed_actions)
                     route.fulfill(status=response['status'],
                         headers={key: value for key, value in response['headers'].items()
                                  if key.lower() in {'content-type', 'location', 'etag'}},
@@ -168,7 +181,7 @@ def _observe_page(run: dict[str, Any], engagement: dict[str, Any], url: str) -> 
         finally:
             browser.close()
     check_current()
-    artifact_id, observation_id = _persist_browser_artifact(run, final_url, data)
+    artifact_id, observation_id = _persist_browser_artifact(run, final_url, data, completed_actions)
     return {**data, "artifact_id": artifact_id, "observation_id": observation_id}
 
 

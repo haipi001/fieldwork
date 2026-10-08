@@ -75,6 +75,9 @@ def test_browser_discovery_uses_pinned_get_and_v5_model_ledger(client, monkeypat
             assert db.execute("SELECT COUNT(*) FROM runtime_calls WHERE state='settled'").fetchone()[0]==2
             assert db.execute('SELECT COUNT(*) FROM runtime_call_inputs').fetchone()[0]==2
             assert db.execute('SELECT COUNT(*) FROM runtime_call_timings').fetchone()[0]==2
+            assert db.execute("SELECT COUNT(*) FROM runtime_artifact_links_v6 l "
+                              "JOIN artifacts a ON a.id=l.artifact_id "
+                              "WHERE a.kind='native_agent.browser_observation'").fetchone()[0]==2
             assert db.execute('SELECT COUNT(*) FROM canonical_findings').fetchone()[0]==0
             assert db.execute('SELECT COUNT(*) FROM candidate_findings').fetchone()[0]==0
         with pytest.raises(RuntimeError,match='checkpoint_review'):

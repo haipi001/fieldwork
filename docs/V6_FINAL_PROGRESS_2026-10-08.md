@@ -138,6 +138,13 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 - Repository-wide regression after the core changes: 870 passed, 4 skipped, 1 existing deprecation warning in 316.60 seconds. A subsequent file-cleanup guard and rollback test passed with the focused workbench/guided checks (3 passed). The rollback fixture proves that a missing gateway action leaves no exchange, Artifact, Observation or orphan metadata file.
 - Native browser reads, other first-party Artifact producers, and VerificationReceipt binding remain P0.7/P0.8 work. Source changes have not been installed or checked against the running service.
 
+### P0.7 native browser page artifact lineage
+
+- Source is now 0.68.32 / build 110 / schema 34. The native browser's pinned document GET records its completed gateway action ID; the page-observation Artifact and Observation are committed with immutable links from every document GET contributing to that page. A missing or failed action blocks the page Artifact transaction and cleans up its file. The existing same-Run and completed-receipt checks apply.
+- The real local Chrome/Playwright two-page discovery test now runs in this environment after installing the already-declared Playwright dependency. It verifies two page artifacts linked to two bounded GET actions, along with the existing model ledger and no candidate promotion. A direct pinned-transport test verifies RuntimeEvent → Artifact → Observation for a 403 response. This proves that fixture path only; it does not establish broad browser compatibility or release readiness.
+- Repository-wide regression: 872 passed, 3 skipped, 1 existing deprecation warning in 292.54 seconds. The full native browser fixture is included in this run.
+- VerificationReceipt binding, evidence polarity across other producer types, complete unknown-outcome recovery and later phases remain open. Main database, installed app and running service have not been upgraded to this source version.
+
 ## Next implementation order
 
 1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.

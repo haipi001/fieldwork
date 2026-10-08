@@ -61,6 +61,13 @@ def normalize_event(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str, Any
             task = _task(db, policy["task_id"])
             if event["campaign_id"] != policy["campaign_id"]:
                 raise ValueError("policy event campaign conflicts with intent")
+    tool = None
+    if kind.startswith("tool.execution.") and entity_id:
+        tool = db.execute("SELECT x.task_id,x.runner_id,x.resource,a.principal_id,a.agent_id "
+                          "FROM http_gateway_executions_v6 x JOIN action_intents_v6 a ON a.id=x.intent_id "
+                          "WHERE x.action_id=?", (entity_id,)).fetchone()
+        if tool:
+            task = _task(db, tool["task_id"])
     campaign_id = event["campaign_id"]
     if task and campaign_id and campaign_id != task["campaign_id"]:
         raise ValueError("event campaign conflicts with task")
@@ -76,6 +83,8 @@ def normalize_event(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str, Any
         runner_id = None
     if call:
         runner_id = call["runner_id"]
+    if tool:
+        runner_id = tool["runner_id"]
     return {
         "schema": "fieldwork.runtime-event/v6",
         "event_id": f"v5:{event['id']}",
@@ -91,10 +100,10 @@ def normalize_event(db: sqlite3.Connection, event: sqlite3.Row) -> dict[str, Any
         "group_id": group_id,
         "task_id": task_id,
         "runner_id": runner_id,
-        "principal_id": None,
-        "agent_id": None,
+        "principal_id": tool["principal_id"] if tool else None,
+        "agent_id": tool["agent_id"] if tool else None,
         "operation": kind,
-        "resource": None,
+        "resource": tool["resource"] if tool else None,
         "policy_decision": None,
         "artifact_ids": [],
         "node_id": None,

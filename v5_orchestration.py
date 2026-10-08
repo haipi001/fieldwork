@@ -834,7 +834,8 @@ def _continuous_scope_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool
 
 @router.post("/lease")
 def lease_task(body: LeaseRequest):
-    if body.runner_id.startswith(("builtin-verifier-", "builtin-structured-", "builtin-research-")):
+    if body.runner_id.startswith(("builtin-verifier-", "builtin-structured-", "builtin-research-",
+                                   "builtin-native-browser-")):
         raise HTTPException(409, "built-in runners use their dedicated local executor")
     recover_expired_leases()
     f = _core()

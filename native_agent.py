@@ -65,6 +65,36 @@ def _persist_browser_artifact(run: dict[str, Any], url: str, page_data: dict[str
     return artifact_id, observation_id
 
 
+def _pinned_browser_get(run: dict[str, Any], engagement: dict[str, Any], url: str, check_current):
+    """Run one browser document GET through existing guards and the V6 read gate."""
+    import final_core
+    from traditional_runtime import ReplayRequest, network_guard
+    decision = final_core.execution_policy_check(final_core.PolicyCheckInput(
+        engagement_id=engagement["id"], target=url, action="read",
+    ))
+    if not decision["allowed"]:
+        raise ValueError(f"navigation_denied:{decision['reason']}")
+    check_current()
+    addresses = network_guard(engagement, ReplayRequest(url=url))
+    consumed, reason = final_core.consume_run_budget(run["id"], "request", 1)
+    if not consumed:
+        raise ValueError(f"navigation_budget_denied:{reason}")
+    from v5_http_transport import request_once
+    from v6_http_gateway import authorize_native_browser_read, finish_native_browser_read
+    action_id = authorize_native_browser_read(run["id"], engagement["id"], url)
+    try:
+        response = request_once(ReplayRequest(url=url), addresses, check_current)
+        check_current()
+        finish_native_browser_read(action_id, response=response)
+        return response
+    except Exception as error:
+        try:
+            finish_native_browser_read(action_id, error_type=type(error).__name__)
+        except ValueError:
+            pass
+        raise
+
+
 def _observe_page(run: dict[str, Any], engagement: dict[str, Any], url: str) -> dict[str, Any]:
     import final_core
     from traditional_runtime import ReplayRequest, network_guard
@@ -105,29 +135,8 @@ def _observe_page(run: dict[str, Any], engagement: dict[str, Any], url: str) -> 
                     blocked.append(f"{redact(request.url)} · non_document_or_non_get")
                     route.abort('blockedbyclient')
                     return
-                decision = final_core.execution_policy_check(final_core.PolicyCheckInput(
-                    engagement_id=engagement["id"], target=request.url, action="read",
-                ))
-                if not decision["allowed"]:
-                    blocked.append(f"{redact(request.url)} · {decision['reason']}")
-                    route.abort("blockedbyclient")
-                    return
                 try:
-                    check_current()
-                    addresses = network_guard(engagement, ReplayRequest(url=request.url))
-                except Exception as error:
-                    blocked.append(f"{redact(request.url)} · {redact(str(error))}")
-                    route.abort("blockedbyclient")
-                    return
-                consumed, budget_reason = final_core.consume_run_budget(run["id"], "request", 1)
-                if not consumed:
-                    blocked.append(f"{redact(request.url)} · {budget_reason}")
-                    route.abort("blockedbyclient")
-                    return
-                try:
-                    from v5_http_transport import request_once
-                    response = request_once(ReplayRequest(url=request.url), addresses, check_current)
-                    check_current()
+                    response = _pinned_browser_get(run, engagement, request.url, check_current)
                     route.fulfill(status=response['status'],
                         headers={key: value for key, value in response['headers'].items()
                                  if key.lower() in {'content-type', 'location', 'etag'}},

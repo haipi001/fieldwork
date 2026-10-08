@@ -101,6 +101,14 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 - Historical no-Run structured tasks, complete execution-event lineage and other model execution routes remain open. P0.6 HTTP/browser and later phases are still pending.
 - Focused Worker/gateway/native/research/call/orchestration suite: 46 passed, 1 skipped; Evolution suite: 8 passed. Repository-wide regression: 861 passed, 4 skipped, 1 existing deprecation warning in 227.91 seconds.
 
+## P0.6 native browser read gateway
+
+- Source is now 0.68.27 / build 105 / schema 33. Additive V6 schema v5 creates immutable browser HTTP execution and receipt rows; it does not duplicate the existing Run request budget or network transport. The native browser's document GET callback uses the existing execution policy, DNS/private-address guard, Run budget and supervised pinned-socket transport, with V6 authorization before the transport.
+- Each actual document GET receives a bounded existing `agent_tasks` record tied to its Run, a built-in browser Runner, a metadata-only ActionIntent, one-use Grant, deterministic PolicyDecision and immutable execution event. The response receipt stores only HTTP status, body hash, byte count and outcome; URL query values are hashed in the intent argument hash rather than stored as resource text. The V6 RuntimeEvent bridge resolves the task, Run, Runner, principal and Agent for these execution events.
+- A local HTTP server test verifies one real pinned GET, sandbox attestation, budget consumption, execution lineage and receipt. Cancellation before transport records failure without a network request. Direct tests cover stale Run, embedded credentials, audited V6 denial without Grant use, replayed receipt and isolated 32→33 backup/recovery. Focused gateway/transport/native/bridge suite: 23 passed, 1 skipped before the added denial test; the gateway suite then passed 6 tests.
+- Repository-wide regression after this increment: 866 passed, 4 skipped, 1 existing deprecation warning in 283.20 seconds.
+- The full Playwright browser journey is still skipped in this environment. Formal HTTP replay, guided HTTP, other browser/API paths, artifact-to-receipt links and complete cancellation/unknown-outcome coverage remain P0.6 work. The main database, installed app and running service have not been upgraded to schema 33.
+
 ## Next implementation order
 
 1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.

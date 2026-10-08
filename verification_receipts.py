@@ -102,6 +102,18 @@ def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
     return receipt_id
 
 
+def validate_stored_binding(db, receipt, run_id):
+    import final_core as core
+    payload = core.load(receipt['result'], {})
+    binding = db.execute('SELECT * FROM verification_receipt_bindings_v6 WHERE receipt_id=?',
+                         (receipt['id'],)).fetchone()
+    if (not binding or binding['candidate_id'] != receipt['candidate_id'] or binding['run_id'] != run_id
+            or binding['receipt_sha256'] != _digest({'candidate_id': receipt['candidate_id'],
+                'oracle': receipt['oracle'], 'attempts': receipt['attempts'], 'payload': payload})):
+        raise HTTPException(409, '复验收据缺少不可变绑定或内容已变化，请重新复验')
+    return payload
+
+
 def validate_receipt(db, candidate, run, scope, proof):
     """Resolve proof from stored execution, never from a caller's success claims."""
     import final_core as core
@@ -111,13 +123,7 @@ def validate_receipt(db, candidate, run, scope, proof):
         raise HTTPException(409, '需要服务端真实复验收据；填写已复现字段不能生成 Verified Finding')
     if proof.oracle == 'http-authorization-read-v2':
         _validate_current_http_scope(db, candidate, scope)
-    payload = core.load(receipt['result'], {})
-    binding = db.execute('SELECT * FROM verification_receipt_bindings_v6 WHERE receipt_id=?',
-                         (receipt['id'],)).fetchone()
-    if (not binding or binding['candidate_id'] != candidate['id'] or binding['run_id'] != run['id']
-            or binding['receipt_sha256'] != _digest({'candidate_id': receipt['candidate_id'],
-                'oracle': receipt['oracle'], 'attempts': receipt['attempts'], 'payload': payload})):
-        raise HTTPException(409, '复验收据缺少不可变绑定或内容已变化，请重新复验')
+    payload = validate_stored_binding(db, receipt, run['id'])
     if (any(payload.get(key) != value for key, value in _policy_binding(db, run).items())
             or payload.get('evidence_sha256') != _evidence_binding(db, candidate)):
         raise HTTPException(409, '收据与当前执行策略或证据不一致，请重新复验')
@@ -185,8 +191,7 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_
     if oracle != 'http-authorization-read-v2' or len(repair_checks) < 2 or not all(item.get('passed') is True for item in repair_checks):
         raise HTTPException(409, '负向复测未满足已注册的修复确认协议')
     with core.connect() as db:
-        if v5_receipt_id:
-            db.execute('BEGIN IMMEDIATE')
+        db.execute('BEGIN IMMEDIATE')
         candidate = db.execute('SELECT * FROM candidate_findings WHERE id=?', (candidate_id,)).fetchone()
         if not candidate or candidate['status'] != 'candidate':
             raise HTTPException(409, '修复复测候选不存在或状态无效')
@@ -209,6 +214,8 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_
         ).fetchone()
         if not lifecycle or not run or not scope or not artifact:
             raise HTTPException(409, '修复复测缺少生命周期、Scope 或实际 Artifact')
+        policy_binding = _policy_binding(db, run)
+        evidence_binding = _evidence_binding(db, candidate)
         if v5_receipt_id:
             from v5_http_receipts import fixed_plan
             current_plan = fixed_plan(v5_receipt_id, db=db)
@@ -228,6 +235,7 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_
             'finding_fingerprint': lifecycle['fingerprint'], 'candidate_fingerprint': candidate_fingerprint(candidate),
             'run_id': run['id'], 'scope_snapshot_id': scope['id'], 'scope_sha256': _digest(scope['rules']),
             'oracle': oracle, 'artifact_id': artifact_id, 'artifact_sha256': digest,
+            **policy_binding, 'evidence_sha256': evidence_binding,
             'repair_checks': repair_checks,
             'expires_at': (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
         }
@@ -237,6 +245,10 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_
             receipt_id, candidate_id, oracle, 'machine_negative_receipt', len(repair_checks),
             core.dump(payload), timestamp, timestamp,
         ))
+        db.execute('INSERT INTO verification_receipt_bindings_v6 VALUES(?,?,?,?,?)', (
+            receipt_id, candidate_id, run['id'],
+            _digest({'candidate_id': candidate_id, 'oracle': oracle,
+                     'attempts': len(repair_checks), 'payload': payload}), timestamp))
         history = core.load(lifecycle['history'], [])
         history.append({'at': timestamp, 'kind': 'verified_fixed', 'run_id': run['id'],
                         'candidate_id': candidate_id, 'receipt_id': receipt_id})

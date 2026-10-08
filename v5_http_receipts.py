@@ -363,7 +363,7 @@ def fixed_plan(receipt_id, *, db=None):
 def confirm_fixed(receipt_id, source_fingerprint):
     import final_core as f
     from fastapi import HTTPException
-    from verification_receipts import issue_fixed_receipt
+    from verification_receipts import issue_fixed_receipt, validate_stored_binding
     plan = fixed_plan(receipt_id)
     if plan['source_fingerprint'] != source_fingerprint:
         raise HTTPException(409, '修复确认计划已变化，请重新核对')
@@ -371,6 +371,9 @@ def confirm_fixed(receipt_id, source_fingerprint):
         stored = db.execute("SELECT * FROM verification_attempts WHERE candidate_id=? AND status='machine_negative_receipt'", (plan['candidate_id'],)).fetchall()
         for row in stored:
             if f.load(row['result'], {}).get('v5_verification_receipt_id') == receipt_id:
+                candidate = db.execute('SELECT run_id FROM candidate_findings WHERE id=?',
+                                       (plan['candidate_id'],)).fetchone()
+                validate_stored_binding(db, row, candidate['run_id'])
                 return {'id': plan['finding_id'], 'candidate_id': plan['candidate_id'], 'status':'verified_fixed', 'receipt_id':row['id']}
         artifact = db.execute('SELECT uri FROM artifacts WHERE id=?', (plan['artifact_id'],)).fetchone()
     replay = json.loads(Path(artifact['uri']).read_text())

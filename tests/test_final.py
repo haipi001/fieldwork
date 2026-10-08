@@ -3057,6 +3057,11 @@ def test_real_http_replay_oracle_with_negative_control(client, changed_principal
             ).fetchone()
         assert negative is not None and final_core.load(negative['result'], {})['schema'] == 'fix-verification-receipt/1'
         assert final_core.load(negative['result'])['v5_verification_receipt_id'] == fixed.json()['independent_verification']['receipt_id']
+        from verification_receipts import validate_stored_binding
+        with final_core.connect() as db:
+            bound = validate_stored_binding(db, negative, retest_run)
+            assert bound['policy_id'] == engagement['current_policy_id']
+            assert 'evidence_sha256' in bound
         (traditional_runtime.ARTIFACT_ROOT/f"{data['artifact_id']}.json").write_text('tampered')
         rejected = client.post(f'/api/v1/findings/{finding_id}/reports/hackerone/export')
         assert rejected.status_code == 409 and ('哈希' in rejected.json()['detail'] or 'inputs changed' in rejected.json()['detail'])

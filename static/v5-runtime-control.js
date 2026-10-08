@@ -25,7 +25,7 @@
       <section aria-labelledby="rcSummaryTitle"><h3 id="rcSummaryTitle">${copy("运行状态快照","Runtime state snapshot")}</h3><div id="rcSummary" aria-live="polite"></div></section>
       <details><summary>${copy("回归评估记录","Regression Eval records")}</summary><p>${copy("状态仅适用于记录的场景。材料完整性由后端在读取时核对。","Status applies to the recorded scenario. The backend checks material integrity on read.")}</p><div id="rcEvals" aria-live="polite"></div></details>
       <details><summary>${copy("策略判定记录","Policy decision records")}</summary><p>${copy("判定记录不代表操作已执行。","A decision record does not establish execution.")}</p><div id="rcDecisions" aria-live="polite"></div></details>
-      <details><summary>${copy("证据血缘","Evidence lineage")}</summary><form id="rcEvidenceForm" class="form-stack">${label("Run ID","Run ID",input("rcEvidenceRun","text","required maxlength=200 autocomplete=off"))}${button("rcEvidenceRead","读取血缘","Read lineage","submit")}</form><p>${copy("读取时核对材料哈希。确认发现需独立复验。","Material hashes are checked on read. Confirmed findings require independent verification.")}</p><div id="rcEvidence" aria-live="polite"></div></details>
+      <details><summary>${copy("证据血缘","Evidence lineage")}</summary><form id="rcEvidenceForm" class="form-stack">${label("Run ID","Run ID",input("rcEvidenceRun","text","required maxlength=200 autocomplete=off"))}${button("rcEvidenceRead","读取血缘","Read lineage","submit")}</form><p>${copy("读取时核对材料哈希。确认发现需独立复验。","Material hashes are checked on read. Confirmed findings require independent verification.")}</p><div id="rcEvidence" aria-live="polite"></div><div class="form-pair">${button("rcEvidencePrevious","上一页","Previous page")}${button("rcEvidenceNext","下一页","Next page")}</div></details>
       <details><summary>${copy("事件响应历史","Incident response history")}</summary><form id="rcIncidentForm" class="form-stack">${label("事件 Candidate ID","Incident candidate ID",input("rcIncidentId","text","required maxlength=200 autocomplete=off"))}${button("rcIncidentRead","读取响应历史","Read response history","submit")}</form><p>${copy("状态来自操作员响应记录。证据完整性不代表修复已验证；Run 隔离仅约束后续 V6 授权操作。","States come from operator response records. Evidence integrity does not establish verified remediation; Run containment covers subsequent V6 authorized operations.")}</p><div id="rcIncident" aria-live="polite"></div></details>
       <details><summary>${copy("新增 V5 Provider","Add V5 provider")}</summary><form id="rcProviderForm" class="form-stack">
         <div class="form-pair">${label("名称","Name",input("rcProviderName","text","required maxlength=120 autocomplete=off"))}
@@ -163,18 +163,23 @@
     };
     function renderEvidence() {
       const host=$("#rcEvidence");
+      $("#rcEvidencePrevious").disabled=!evidencePage||evidencePage.offset===0;
+      $("#rcEvidenceNext").disabled=!evidencePage||!evidencePage.has_more;
       if(evidenceError){host.textContent=evidenceError;return}
       if(!evidencePage){host.textContent=t("输入 Run ID 后读取材料。","Enter a Run ID to read materials.");return}
       if(!evidencePage.items.length){host.textContent=t("该 Run 没有已记录的 Artifact。","This Run has no recorded Artifacts.");return}
-      host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Artifact</th><th>${t("材料完整性","Material integrity")}</th><th>${t("事件 / Observation / Evidence","Events / observations / evidence")}</th></tr></thead><tbody>${evidencePage.items.map(item=>`<tr data-evidence-integrity="${esc(item.integrity)}"><td>${esc(item.kind)}<small class="cell-subline">${esc(item.artifact_id)}</small><small class="cell-subline">SHA256: ${esc(item.sha256||t("未记录","Not recorded"))}</small></td><td>${item.integrity==="intact"?t("完整","Intact"):t("缺失或已变化","Missing or changed")}</td><td>${item.runtime_event_ids.length} / ${item.observations.length} / ${item.evidence.length}<details><summary>${t("关联记录","Linked records")}</summary><pre>${esc(JSON.stringify({events:item.runtime_event_ids,observations:item.observations,evidence:item.evidence},null,2))}</pre></details></td></tr>`).join("")}</tbody></table></div>${evidencePage.has_more?`<p>${t("还有后续材料；当前显示首批 50 条。","More materials exist; showing the first 50 records.")}</p>`:""}`;
+      host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Artifact</th><th>${t("材料完整性","Material integrity")}</th><th>${t("事件 / Observation / Evidence","Events / observations / evidence")}</th></tr></thead><tbody>${evidencePage.items.map(item=>`<tr data-evidence-integrity="${esc(item.integrity)}"><td>${esc(item.kind)}<small class="cell-subline">${esc(item.artifact_id)}</small><small class="cell-subline">SHA256: ${esc(item.sha256||t("未记录","Not recorded"))}</small></td><td>${item.integrity==="intact"?t("完整","Intact"):t("缺失或已变化","Missing or changed")}</td><td>${item.runtime_event_ids.length} / ${item.observations.length} / ${item.evidence.length}<details><summary>${t("关联记录","Linked records")}</summary><pre>${esc(JSON.stringify({events:item.runtime_event_ids,observations:item.observations,evidence:item.evidence},null,2))}</pre></details></td></tr>`).join("")}</tbody></table></div><p>${t("当前显示","Showing")} ${evidencePage.offset+1}–${evidencePage.offset+evidencePage.items.length} · Run: ${esc(evidencePage.run_id)}</p>`;
     }
-    $("#rcEvidenceForm").onsubmit=async event=>{
-      event.preventDefault();const token=++evidenceGeneration,runId=$("#rcEvidenceRun").value.trim();
+    async function readEvidence(runId,offset=0) {
+      const token=++evidenceGeneration;
       evidencePage=null;evidenceError=t("正在读取…","Reading…");renderEvidence();$("#rcEvidenceRead").disabled=true;
-      try{const value=await request(`/api/v1/v6/runs/${encodeURIComponent(runId)}/evidence-lineage?limit=50`);if(token!==evidenceGeneration)return;evidencePage=value;evidenceError=""}
+      try{const value=await request(`/api/v1/v6/runs/${encodeURIComponent(runId)}/evidence-lineage?limit=50&offset=${offset}`);if(token!==evidenceGeneration)return;evidencePage=value;evidenceError=""}
       catch(error){if(token!==evidenceGeneration)return;evidenceError=error.message}
       finally{if(token===evidenceGeneration){$("#rcEvidenceRead").disabled=false;renderEvidence()}}
-    };
+    }
+    $("#rcEvidenceForm").onsubmit=event=>{event.preventDefault();readEvidence($("#rcEvidenceRun").value.trim())};
+    $("#rcEvidencePrevious").onclick=()=>{if(evidencePage)readEvidence(evidencePage.run_id,Math.max(0,evidencePage.offset-50))};
+    $("#rcEvidenceNext").onclick=()=>{if(evidencePage?.has_more)readEvidence(evidencePage.run_id,evidencePage.offset+50)};
     function renderDecisions() {
       const host=$("#rcDecisions");
       if(policyError){host.textContent=policyError;return}

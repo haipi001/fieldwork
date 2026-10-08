@@ -58,6 +58,11 @@ def run():
                      'completed','report',1,None,None,None,None,final_core.utcnow()))
                 eval_id=run_policy_seed(db,'ui-eval-run',root/'eval-artifacts')
                 eval_path=Path(db.execute('SELECT a.uri FROM eval_runs_v6 e JOIN artifacts a ON a.id=e.artifact_id WHERE e.id=?',(eval_id,)).fetchone()[0])
+                artifact_hash=db.execute('SELECT sha256 FROM artifacts WHERE uri=?',(str(eval_path),)).fetchone()[0]
+                for index in range(51):
+                    db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)',
+                        (f'ui-page-material-{index:03d}','ui-eval-run','pagination_fixture',str(eval_path),artifact_hash,
+                         'application/json',1,final_core.utcnow()))
                 db.execute('INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     ('ui-policy-run',project['id'],'traditional',project['current_scope_snapshot_id'],project['current_policy_id'],
                      'running','target',0,None,None,None,None,final_core.utcnow()))
@@ -127,6 +132,18 @@ def run():
                 page.locator('#rcEvidenceRun').fill('ui-eval-run')
                 page.locator('#rcEvidenceRead').click()
                 page.wait_for_selector('[data-evidence-integrity="intact"]')
+                assert page.locator('[data-evidence-integrity]').count()==50
+                assert page.locator('#rcEvidencePrevious').is_disabled()
+                page.locator('#rcEvidenceRun').fill('missing-run')
+                page.locator('#rcEvidenceNext').click()
+                page.wait_for_function("document.querySelector('#rcEvidence').textContent.includes('51–52')")
+                assert page.locator('[data-evidence-integrity]').count()==2
+                assert page.locator('#rcEvidenceNext').is_disabled()
+                assert 'ui-eval-run' in page.locator('#rcEvidence').inner_text()
+                page.locator('#rcEvidencePrevious').click()
+                page.wait_for_function("document.querySelector('#rcEvidence').textContent.includes('1–50')")
+                assert page.locator('[data-evidence-integrity]').count()==50
+                page.locator('#rcEvidenceRun').fill('ui-eval-run')
                 eval_path.write_text('{}')
                 page.locator('#rcRefresh').click()
                 page.wait_for_selector('[data-eval-status="invalid"]')

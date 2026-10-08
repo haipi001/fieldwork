@@ -330,3 +330,10 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.64/build142/schema40 adds Runtime form fields for call/decision/provider/source and actual tokens/cost/duration, imports a structured review, then requires a separate explicit checkbox before reconciliation. Editing the form invalidates the imported selection/confirmation; reset invalidates pending results. Successful reconciliation refreshes audit and retains task state. No model dispatch is performed.
 - Real Chrome/API acceptance completes import and confirmed reconciliation, verifies no unchecked reconciliation occurs, editing disables stale confirmation, actual10/5 tokens/50ms and paused task retention. Existing audit tamper/error/language/theme/narrow-layout checks remain. Full repository regression and full release gates are not established by this browser check.
+
+### Reconciled actual overrun accounting
+
+- Source 0.68.65/build143/schema40 exposes token/cost/runtime reservation exceedance in read audit. Actual measured consumption is never clipped to the reservation.
+- Targeted reconciliation tests: 2 passed. A125-token review against60-token reservation is recorded intact, flags token/runtime excess, releases pending reservation, and exhausts the100-token profile budget so the next reservation is denied. Full snapshot regression follows for Git synchronization.
+
+- Git synchronization acceptance for0.68.65/build143/schema40: full `PYTHONPATH=. python3 -m pytest -q` =896 passed,3 skipped,1 existing warning in278.75s. Tested source unchanged during regression; only this result note was appended afterward. Development snapshot requested by user; complete V6 goal remains active.

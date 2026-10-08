@@ -135,3 +135,36 @@ def test_unknown_reconciliation_is_evidence_bound_atomic_and_does_not_resume(cli
     assert client.get(read_route).json()['items'][0]['integrity'] == 'intact'
     path.unlink()
     assert client.get(read_route).json()['items'][0]['integrity'] == 'missing_or_changed'
+
+
+def test_actual_reconciled_overrun_is_not_clipped_and_blocks_next_budget(client):
+    from fastapi import HTTPException
+    from v5_runtime_calls import _spent
+    cid, profile = setup(client, concurrency=2, hourly=100)
+    task, decision = task_route(client, cid, profile, 'overrun')
+    call = reserve_call(decision['id'], task['id'], 'call-runner', task['attempt'])
+    start_call(call['id']); fail_call(call['id'])
+    ready = create_ready(client, target='https://overrun-review.example.test')
+    with core.connect() as db:
+        db.execute('INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ('overrun-run', ready['id'], 'traditional', ready['current_scope_snapshot_id'], ready['current_policy_id'],
+             'completed', 'report', 1, None, None, None, None, core.utcnow()))
+        db.execute("UPDATE agent_tasks SET run_id='overrun-run',status='paused' WHERE id=?", (task['id'],))
+    material = dict(call_id=call['id'], decision_id=decision['id'], provider_id=call['provider_id'],
+        review_kind='provider_record', input_tokens=100, output_tokens=25, cost_micros=0,
+        runtime_ms=call['max_runtime_ms'] + 1)
+    imported = client.post(f"/api/v1/v6/model-calls/{call['id']}/usage-review", json=material)
+    assert imported.status_code == 201
+    response = client.post(f"/api/v1/v6/model-calls/{call['id']}/reconcile",
+        json=dict(artifact_id=imported.json()['artifact_id'], confirmed=True))
+    assert response.status_code == 200, response.text
+    audit = client.get('/api/v1/v6/model-usage-reconciliations').json()['items'][0]
+    assert audit['integrity'] == 'intact'
+    assert audit['usage']['input_tokens'] + audit['usage']['output_tokens'] == 125
+    assert audit['reservation_exceeded'] == dict(tokens=True, cost=False, runtime=True)
+    with core.connect() as db:
+        assert _spent(db, 'profile_id', profile)[0] == 125
+        assert _pending(db, 'profile_id', profile)[0] == 0
+    next_task, next_route = task_route(client, cid, profile, 'after-overrun')
+    with pytest.raises(HTTPException, match='token budget exhausted'):
+        reserve_call(next_route['id'], next_task['id'], 'call-runner', next_task['attempt'])

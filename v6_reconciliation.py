@@ -118,6 +118,11 @@ def read_reconciliations(limit=50, offset=0):
             value['usage'] = ({key:usage[key] for key in ('input_tokens','output_tokens','cost_micros')}
                               if usage else None)
             value['runtime_ms'] = timing['runtime_ms'] if timing else None
+            value['reservation_exceeded'] = ({
+                'tokens': usage['input_tokens'] + usage['output_tokens'] > call['reserved_tokens'],
+                'cost': usage['cost_micros'] > call['reserved_cost_micros'],
+                'runtime': timing['runtime_ms'] > call['max_runtime_ms'] if timing else None,
+            } if call and usage else None)
             items.append(value)
         return {'items':items, 'offset':offset, 'has_more':len(rows)>limit}
 

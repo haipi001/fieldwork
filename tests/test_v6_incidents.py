@@ -63,6 +63,23 @@ def test_response_state_requires_current_state_containment_and_intact_evidence(c
     assert client.get(route).json()['response_evidence_integrity'] == 'intact'
     Path(incident['uri']).unlink()
     assert client.get(route).json()['response_evidence_integrity'] == 'missing_or_changed'
+    from tests.test_final import create_ready
+    ready = create_ready(client, target='https://incident-release.example.test')
+    with core.connect() as db:
+        db.execute('UPDATE analysis_runs SET engagement_id=?,scope_snapshot_id=?,policy_id=? WHERE id=?',
+            (ready['id'], ready['current_scope_snapshot_id'], ready['current_policy_id'], incident['run_id']))
+        generation = db.execute('SELECT MAX(id) FROM run_containment_events_v6 WHERE run_id=?',
+                                (incident['run_id'],)).fetchone()[0]
+    release_route = f"/api/v1/v6/runs/{incident['run_id']}/release-containment"
+    release_body = dict(expected_generation=generation, artifact_id='new-review')
+    blocked_release = client.post(release_route, json=release_body)
+    assert blocked_release.status_code == 409
+    assert 'incident response evidence' in blocked_release.json()['detail']
+    assert client.get(route).json()['run_containment_active'] is True
+    Path(incident['uri']).write_bytes(original)
+    released = client.post(release_route, json=release_body)
+    assert released.status_code == 200, released.text
+    assert released.json()['active'] is False
     with core.connect() as db:
         assert db.execute('SELECT COUNT(*) FROM incident_response_events_v6').fetchone()[0] == 6
         with pytest.raises(sqlite3.IntegrityError, match='immutable'):

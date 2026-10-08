@@ -79,6 +79,13 @@ def release_containment(run_id: str, body: ReleaseInput):
             "AND COALESCE((SELECT state FROM incident_response_events_v6 WHERE candidate_id=c.id ORDER BY id DESC LIMIT 1),'DETECTED') "
             "NOT IN ('RECOVERED','CLOSED') LIMIT 1", (run_id,)).fetchone():
             raise HTTPException(409, 'Run has unresolved incident response')
+        from v6_incidents import _response_evidence_intact
+        response_events = db.execute('SELECT e.* FROM incident_response_events_v6 e '
+            'JOIN agent_incidents i ON i.candidate_id=e.candidate_id '
+            'JOIN candidate_findings c ON c.id=i.candidate_id WHERE c.run_id=?', (run_id,)).fetchall()
+        if any(event['run_id'] != run_id or not _response_evidence_intact(db, event)
+               for event in response_events):
+            raise HTTPException(409, 'Run incident response evidence is missing or changed')
         artifact = db.execute('SELECT uri,sha256 FROM artifacts WHERE id=? AND run_id=?', (body.artifact_id, run_id)).fetchone()
         try:
             intact = artifact and hashlib.sha256(Path(artifact['uri']).read_bytes()).hexdigest() == artifact['sha256']

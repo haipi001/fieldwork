@@ -320,3 +320,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.63/build141/schema40 adds explicit review import for unknown calls with existing Run and exact call/decision/provider binding. Strict material is stored as a hashed same-Run Artifact using generated filenames; the API returns no local URI. Import leaves usage unknown and does not dispatch. Failed transaction cleans up only its newly created file.
 - Targeted tests use the actual imported Artifact for reconciliation and subsequent read-integrity checks, reject wrong provider/extra raw fields, verify hash/Run ownership and unchanged call state before reconciliation. Full UI and release gates remain open.
+
+### Usage review import failure acceptance
+
+- Tested source 37ed05b / 0.68.63/build141/schema40. Fault injection independently rejects Artifact insertion and runtime audit-event insertion after review file creation. Both failures leave no new file, no Artifact/event rows, and preserve the full unknown reservation. Successful import/reconciliation/read checks continue to pass.
+- Current V6 test suite: 49 passed, 1 existing warning in6.66s. This supplies explicit exception-path evidence; process-kill/fsync recovery is not covered by these injections. Full UI and release gates remain open.

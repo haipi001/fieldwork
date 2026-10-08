@@ -72,6 +72,22 @@ def test_unknown_reconciliation_is_evidence_bound_atomic_and_does_not_resume(cli
     import_route = f"/api/v1/v6/model-calls/{call['id']}/usage-review"
     assert client.post(import_route, json={**material, 'provider_id':'wrong'}).status_code == 409
     assert client.post(import_route, json={**material, 'raw_secret':'not-allowed'}).status_code == 422
+    directory = Path(core.LOCAL_DATA_ROOT) / 'v6-usage-reviews'
+    for table, condition in [('artifacts', "NEW.kind='runtime.usage_review'"),
+                             ('v5_events', "NEW.event_type='call.review_imported'")]:
+        with core.connect() as db:
+            before_artifacts = db.execute('SELECT COUNT(*) FROM artifacts').fetchone()[0]
+            before_events = db.execute('SELECT COUNT(*) FROM v5_events').fetchone()[0]
+            db.execute(f"CREATE TRIGGER fail_import BEFORE INSERT ON {table} WHEN {condition} "
+                       "BEGIN SELECT RAISE(ABORT,'injected import failure'); END")
+        with pytest.raises(sqlite3.IntegrityError, match='injected import failure'):
+            client.post(import_route, json=material)
+        assert list(directory.glob('*.json')) == []
+        with core.connect() as db:
+            assert db.execute('SELECT COUNT(*) FROM artifacts').fetchone()[0] == before_artifacts
+            assert db.execute('SELECT COUNT(*) FROM v5_events').fetchone()[0] == before_events
+            assert _pending(db, 'task_id', task['id'])[0] == call['reserved_tokens']
+            db.execute('DROP TRIGGER fail_import')
     imported = client.post(import_route, json=material)
     assert imported.status_code == 201, imported.text
     assert imported.json()['consumption_state'] == 'unknown'

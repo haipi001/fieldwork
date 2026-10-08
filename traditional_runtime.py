@@ -677,19 +677,39 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
                 consumed, reason = final_core.consume_run_budget(run_id, "request", 1)
                 if not consumed:
                     raise HTTPException(409, reason)
-                if isolated_transport:
-                    from v5_http_transport import request_once as isolated_request
-                    def check_current():
-                        if finalize:
-                            check_formal_inputs()
-                        if job_id and _job_cancel_requested(job_id):
-                            raise VerificationCancelled("用户取消了复验")
-                        if before_request:
-                            before_request(replay_index, name)
-                    fields = (body.authorization.principal_field, body.authorization.owner_field) if body.authorization else ()
-                    results[name] = isolated_request(spec, addresses, check_current, scalar_fields=fields)
-                else:
-                    results[name] = request_once(spec)
+                def check_current():
+                    if finalize:
+                        check_formal_inputs()
+                    if job_id and _job_cancel_requested(job_id):
+                        raise VerificationCancelled("用户取消了复验")
+                    if before_request:
+                        before_request(replay_index, name)
+                action_id = None
+                if spec.method.upper() == "GET" and spec.body is None:
+                    from v6_http_gateway import authorize_http_replay_read
+                    action_id = authorize_http_replay_read(run_id, run['engagement_id'], body.candidate_id, spec.url,
+                                                           headers=spec.headers, replay_round=replay_index,
+                                                           replay_role=name)
+                try:
+                    if isolated_transport:
+                        from v5_http_transport import request_once as isolated_request
+                        fields = (body.authorization.principal_field, body.authorization.owner_field) if body.authorization else ()
+                        results[name] = isolated_request(spec, addresses, check_current, scalar_fields=fields)
+                    else:
+                        check_current()
+                        results[name] = request_once(spec)
+                    if action_id:
+                        from v6_http_gateway import finish_http_read
+                        finish_http_read(action_id, response=results[name])
+                except Exception as error:
+                    if action_id:
+                        from v6_http_gateway import finish_http_read
+                        try:
+                            finish_http_read(action_id, error_type=type(error).__name__,
+                                             cancelled=isinstance(error, VerificationCancelled))
+                        except ValueError:
+                            pass
+                    raise
                 completed_requests += 1
                 checkpoint("in_progress")
                 if after_response:

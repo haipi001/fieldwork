@@ -50,7 +50,13 @@ def test_live_object_read_controls_do_not_self_confirm(client, monkeypatch, scen
         detail = client.get(f"/api/v1/candidates/{created['id']}").json()['candidate']
         engagement = final_core.get_engagement(detail['engagement_id'])
         engagement['scope'].update(allow_authentication=True, allow_private_ips=True)
+        engagement['scope']['allowed_targets'] = [origin + '/object', origin + '/api/me']
         engagement['policy']['max_requests_per_second'] = 1000
+        with final_core.connect() as db:
+            db.execute('UPDATE scope_snapshots SET rules=? WHERE id=?',
+                       (final_core.dump(engagement['scope']), engagement['current_scope_snapshot_id']))
+            db.execute('UPDATE execution_policies SET policy=? WHERE id=?',
+                       (final_core.dump(engagement['policy']), engagement['current_policy_id']))
         monkeypatch.setattr(final_core, 'get_engagement', lambda _: engagement)
         # Only the fixture's authorization decision and credential provider are substituted.
         # network_guard performs real DNS/private-IP checks; request_once is unmodified.

@@ -9,7 +9,7 @@ import native_agent
 from tests.test_final import client
 from tests.test_http_business_boundary import object_server
 from tests.test_v5_native_discovery import prepare
-from v6_http_gateway import authorize_native_browser_read, finish_native_browser_read
+from v6_http_gateway import authorize_native_browser_read, finish_http_read
 from v6_runtime_bridge import list_events
 from v6_schema import V6_SCHEMA_STATEMENTS, V6_SCHEMA_VERSION, apply_v6_schema
 from version import SCHEMA_VERSION
@@ -20,7 +20,7 @@ def test_native_browser_read_has_one_use_policy_event_and_receipt(client):
     url = "https://native-browser.example.test/page?fixture=redacted"
     action_id = authorize_native_browser_read("native-discovery-run", engagement["id"], url)
     body = b"fixture browser response"
-    finish_native_browser_read(action_id, response={
+    finish_http_read(action_id, response={
         "status": 200, "body_sha256": hashlib.sha256(body).hexdigest(), "body_bytes": len(body),
     })
     with final_core.connect() as db:
@@ -46,7 +46,7 @@ def test_native_browser_read_has_one_use_policy_event_and_receipt(client):
         assert all(event["task_id"] == execution["task_id"] and event["run_id"] == "native-discovery-run"
                    for event in events)
     with pytest.raises(ValueError, match="already settled"):
-        finish_native_browser_read(action_id, response={
+        finish_http_read(action_id, response={
             "status": 200, "body_sha256": hashlib.sha256(body).hexdigest(), "body_bytes": len(body),
         })
 

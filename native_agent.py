@@ -80,16 +80,16 @@ def _pinned_browser_get(run: dict[str, Any], engagement: dict[str, Any], url: st
     if not consumed:
         raise ValueError(f"navigation_budget_denied:{reason}")
     from v5_http_transport import request_once
-    from v6_http_gateway import authorize_native_browser_read, finish_native_browser_read
+    from v6_http_gateway import authorize_native_browser_read, finish_http_read
     action_id = authorize_native_browser_read(run["id"], engagement["id"], url)
     try:
         response = request_once(ReplayRequest(url=url), addresses, check_current)
         check_current()
-        finish_native_browser_read(action_id, response=response)
+        finish_http_read(action_id, response=response)
         return response
     except Exception as error:
         try:
-            finish_native_browser_read(action_id, error_type=type(error).__name__)
+            finish_http_read(action_id, error_type=type(error).__name__)
         except ValueError:
             pass
         raise

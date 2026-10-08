@@ -67,13 +67,14 @@ def _intent_current(db: sqlite3.Connection, intent: sqlite3.Row) -> bool:
         WHERE t.id=? AND t.campaign_id=?
     """, (intent["task_id"], intent["campaign_id"])).fetchone()
     try:
-        team_plan = bool(row and json.loads(row["context_capsule_json"]).get("team_plan"))
+        capsule = json.loads(row["context_capsule_json"]) if row else {}
+        extended_run = bool(capsule.get("team_plan") or capsule.get("http_replay_read"))
     except (TypeError, ValueError, AttributeError):
-        team_plan = False
+        extended_run = False
     return bool(row and row["run_id"] == intent["run_id"]
                 and row["task_status"] in {"queued", "leased", "running"}
                 and row["campaign_status"] == "active" and row["engagement_status"] == "ready"
-                and row["run_status"] in ({"queued", "running", "paused", "completed"} if team_plan else {"queued", "running"})
+                and row["run_status"] in ({"queued", "running", "paused", "completed"} if extended_run else {"queued", "running"})
                 and row["confirmed_at"]
                 and row["current_scope_snapshot_id"] == row["run_scope_id"] == intent["scope_snapshot_id"]
                 and row["current_policy_id"] == row["run_policy_id"] == intent["policy_id"]

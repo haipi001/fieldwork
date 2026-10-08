@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import sqlite3
@@ -3482,7 +3483,7 @@ def test_http_verification_job_can_be_cancelled_without_persisting_credentials(c
 
     def delayed_request(*args, **kwargs):
         entered.set(); release.wait(2)
-        return {'status': 200, 'body_sha256':'fixture', 'body_bytes':2,
+        return {'status': 200, 'body_sha256':hashlib.sha256(b'{}').hexdigest(), 'body_bytes':2,
                 'headers':{}, 'body_preview':'{}', '_transient_body':'{}'}
 
     import v5_http_transport
@@ -3516,6 +3517,10 @@ def test_http_verification_job_can_be_cancelled_without_persisting_credentials(c
     with final_core.connect() as db:
         stored = json.dumps(dict(db.execute('SELECT * FROM verification_jobs WHERE id=?',(job['id'],)).fetchone()))
         assert 'owner-secret' not in stored and 'other-secret' not in stored
+        for table in ('action_intents_v6', 'agent_tasks', 'capability_grants_v6',
+                      'policy_decisions_v6', 'http_gateway_executions_v6', 'http_gateway_receipts_v6'):
+            records = json.dumps([dict(row) for row in db.execute(f'SELECT * FROM {table}')])
+            assert 'owner-secret' not in records and 'other-secret' not in records
 
 
 def test_web3_property_job_can_be_cancelled_between_forge_rounds(client, monkeypatch, tmp_path):

@@ -95,6 +95,10 @@ def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
         db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (
             receipt_id, candidate_id, proof.oracle, 'machine_receipt', proof.attempts,
             core.dump(payload), core.utcnow(), core.utcnow()))
+        db.execute('INSERT INTO verification_receipt_bindings_v6 VALUES(?,?,?,?,?)', (
+            receipt_id, candidate_id, run['id'],
+            _digest({'candidate_id': candidate_id, 'oracle': proof.oracle,
+                     'attempts': proof.attempts, 'payload': payload}), core.utcnow()))
     return receipt_id
 
 
@@ -108,6 +112,12 @@ def validate_receipt(db, candidate, run, scope, proof):
     if proof.oracle == 'http-authorization-read-v2':
         _validate_current_http_scope(db, candidate, scope)
     payload = core.load(receipt['result'], {})
+    binding = db.execute('SELECT * FROM verification_receipt_bindings_v6 WHERE receipt_id=?',
+                         (receipt['id'],)).fetchone()
+    if (not binding or binding['candidate_id'] != candidate['id'] or binding['run_id'] != run['id']
+            or binding['receipt_sha256'] != _digest({'candidate_id': receipt['candidate_id'],
+                'oracle': receipt['oracle'], 'attempts': receipt['attempts'], 'payload': payload})):
+        raise HTTPException(409, '复验收据缺少不可变绑定或内容已变化，请重新复验')
     if (any(payload.get(key) != value for key, value in _policy_binding(db, run).items())
             or payload.get('evidence_sha256') != _evidence_binding(db, candidate)):
         raise HTTPException(409, '收据与当前执行策略或证据不一致，请重新复验')

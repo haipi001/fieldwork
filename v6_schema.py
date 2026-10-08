@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-V6_SCHEMA_VERSION = 6
+V6_SCHEMA_VERSION = 7
 V6_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS v6_schema_meta(
          key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)""",
@@ -67,6 +67,9 @@ V6_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS runtime_artifact_links_v6(
          action_id TEXT NOT NULL,artifact_id TEXT NOT NULL,linked_at TEXT NOT NULL,
          PRIMARY KEY(action_id,artifact_id))""",
+    """CREATE TABLE IF NOT EXISTS verification_receipt_bindings_v6(
+         receipt_id TEXT PRIMARY KEY,candidate_id TEXT NOT NULL,run_id TEXT NOT NULL,
+         receipt_sha256 TEXT NOT NULL,created_at TEXT NOT NULL)""",
     *(
         f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation}
              BEFORE {operation.upper()} ON {table}
@@ -74,7 +77,7 @@ V6_SCHEMA_STATEMENTS = (
         for table in ("capability_grants_v6", "capability_revocations_v6", "capability_uses_v6",
                       "policy_decisions_v6", "model_gateway_bindings_v6", "model_gateway_starts_v6",
                       "http_gateway_executions_v6", "http_gateway_receipts_v6",
-                      "runtime_artifact_links_v6")
+                      "runtime_artifact_links_v6", "verification_receipt_bindings_v6")
         for operation in ("update", "delete")
     ),
 )

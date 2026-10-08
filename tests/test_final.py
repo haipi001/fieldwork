@@ -3182,7 +3182,7 @@ def test_observation_is_not_test_coverage_and_success_reason_is_normalized(clien
     assert next(x for x in details['stages'] if x['id']=='verification')['status'] == 'human_review'
 
 
-@pytest.mark.parametrize('mutation', ['missing', 'unknown', 'changed_proof', 'changed_candidate', 'tampered_artifact', 'missing_artifact', 'expired', 'other_candidate', 'changed_policy', 'changed_evidence', 'changed_current_scope'])
+@pytest.mark.parametrize('mutation', ['missing', 'unknown', 'changed_proof', 'changed_candidate', 'tampered_artifact', 'missing_artifact', 'expired', 'other_candidate', 'changed_policy', 'changed_evidence', 'changed_current_scope', 'unbound_copy'])
 def test_verification_receipt_rejects_untrusted_or_stale_proof(client, tmp_path, mutation):
     import hashlib
     import verification_receipts
@@ -3235,6 +3235,11 @@ def test_verification_receipt_rejects_untrusted_or_stale_proof(client, tmp_path,
         with final_core.connect() as db:
             db.execute('UPDATE engagements_v2 SET current_scope_snapshot_id=? WHERE id=?',
                        ('different-scope', engagement['id']))
+    elif mutation == 'unbound_copy':
+        with final_core.connect() as db:
+            db.execute('INSERT INTO verification_attempts SELECT ?,candidate_id,oracle,status,attempts,result,started_at,completed_at '
+                       'FROM verification_attempts WHERE id=?', ('receipt-unbound-copy', proof.receipt_id))
+        proof.receipt_id = 'receipt-unbound-copy'
     response = client.post(f"/api/v1/candidates/{candidate['id']}/verify",json=proof.model_dump())
     assert response.status_code == 409, response.text
     assert client.get(f'/api/v1/findings?run_id={run_id}').json()['verified'] == []

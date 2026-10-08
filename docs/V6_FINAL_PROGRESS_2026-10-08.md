@@ -290,3 +290,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.58/build136/schema39 factors existing usage settlement into an active-transaction-only helper; the existing API still owns its BEGIN IMMEDIATE. The reconciliation path can now atomically persist an audit alongside immutable usage and call settlement. No unknown call is automatically released or replayed.
 - Runtime ledger regression: 18 passed, 1 existing warning (5.74s), including rollback after a simulated review-persistence failure: call remains unknown, no usage/report persists and reserved tokens remain held; subsequent valid settlement retains idempotency. The actual evidence-bound reconciliation endpoint/audit storage and UI remain unimplemented, so P2.2 is not complete.
+
+### Evidence-bound unknown consumption reconciliation
+
+- Source 0.68.59/build137/schema40 (V6 schema12) adds append-only model_usage_reconciliations_v6 and explicit local operator POST /v6/model-calls/{id}/reconcile. Same-Run runtime.usage_review material must hash-match and exactly bind call/decision/provider plus strict measured usage/duration. Only unknown calls are eligible; settlement and audit are one transaction, tasks remain unchanged. Contract and limitations are in V6_MODEL_USAGE_RECONCILIATION.md.
+- Runtime/reconciliation/HTTP gateway regression: 22 passed; after audit-write failure injection, reconciliation test passed again. It verifies rollback leaves unknown/no usage, tamper and wrong-provider rejection, confirmation, immutable audit, repeat idempotency, actual usage accounting and paused-task retention. Full migration/repository acceptance and review import/read UI remain open; no main DB/app upgrade performed.

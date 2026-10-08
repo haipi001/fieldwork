@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from typing import Literal
 
 import final_core
+from v6_reconciliation import ReviewInput
 from v6_runtime_bridge import list_events, list_model_call_snapshots, list_runners
 
 router = APIRouter(prefix="/api/v1/v6", tags=["V6 Control Plane"])
@@ -225,3 +226,9 @@ def eval_runs(limit: int = Query(100, ge=1, le=500)):
             value['status'] = ('passed' if value['result']['passed'] else 'failed') if artifact_valid and scenario_valid else 'invalid'
             result.append(value)
         return {'runs': result}
+
+
+@router.post('/model-calls/{call_id}/reconcile')
+def reconcile_model_call(call_id: str, body: ReviewInput):
+    from v6_reconciliation import reconcile
+    return reconcile(call_id, body)

@@ -670,60 +670,67 @@ def list_routes(campaign_id: str | None = None, limit: int = Query(100, ge=1, le
 
 @router.post("/usage", status_code=201)
 def record_usage(body: UsageReport):
+    with _core().connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        return record_usage_in_transaction(db, body)
+
+
+def record_usage_in_transaction(db: sqlite3.Connection, body: UsageReport):
+    """Settle usage inside the caller transaction, including any reconciliation audit."""
+    if not db.in_transaction:
+        raise RuntimeError("usage settlement requires an active transaction")
     payload = body.model_dump(mode="json")
     if body.call_id is None:
         payload.pop("call_id", None)
     if body.runtime_ms is None:
         payload.pop("runtime_ms", None)
-    digest, f, now = _sha(payload), _core(), _now()
-    with f.connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        existing = db.execute("SELECT * FROM runtime_usage_reports WHERE idempotency_key=?",
-                              (body.idempotency_key,)).fetchone()
-        if existing:
-            if existing["payload_sha256"] != digest:
-                raise HTTPException(409, "usage idempotency key was reused with a different report")
-            usage = db.execute("SELECT * FROM runtime_usage WHERE id=?", (existing["usage_id"],)).fetchone()
-            return _usage_value(usage, db)
-        decision = db.execute("SELECT * FROM runtime_route_decisions WHERE id=?", (body.decision_id,)).fetchone()
-        if not decision or decision["status"] != "selected" or not decision["provider_id"]:
-            raise HTTPException(409, "usage requires a selected runtime route decision")
-        call = db.execute("SELECT * FROM runtime_calls WHERE decision_id=?", (body.decision_id,)).fetchone()
-        if call and (body.call_id != call["id"] or call["state"] not in {"calling", "unknown"}):
-            raise HTTPException(409, "usage must settle the reserved model call")
-        if body.call_id and not call:
-            raise HTTPException(409, "model call reservation not found")
-        if body.runtime_ms is not None and not call:
-            raise HTTPException(409, "model timing requires a call reservation")
-        selected_provider = db.execute("SELECT * FROM runtime_providers WHERE id=?", (decision["provider_id"],)).fetchone()
-        if selected_provider and _location(selected_provider) == "local" and body.cost_micros:
-            raise HTTPException(422, "local route usage cannot report cloud cost")
-        cursor = db.execute(
-            "INSERT INTO runtime_usage(campaign_id,task_id,provider_id,route,input_tokens,output_tokens,cost_micros,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (decision["campaign_id"], decision["task_id"], decision["provider_id"], decision["route"],
-             body.input_tokens, body.output_tokens, body.cost_micros, now),
-        )
-        usage_id = cursor.lastrowid
-        if call:
-            db.execute("UPDATE runtime_calls SET state='settled',usage_id=?,updated_at=? WHERE id=?",
-                       (usage_id, now, call["id"]))
-            if body.runtime_ms is not None:
-                prior = db.execute("SELECT COALESCE(SUM(COALESCE(t.runtime_ms,c.max_runtime_ms)),0),"
-                                   "COALESCE(MAX(t.legacy_runtime_ms),0) FROM runtime_calls c "
-                                   "LEFT JOIN runtime_call_timings t ON t.call_id=c.id "
-                                   "WHERE c.task_id=? AND c.id!=? AND c.state!='released'",
-                                   (call['task_id'], call['id'])).fetchone()
-                legacy = db.execute('SELECT runtime_ms FROM agent_task_usage WHERE task_id=?', (call['task_id'],)).fetchone()
-                baseline = max(prior[1], (legacy[0] if legacy else 0) - prior[0])
-                db.execute("INSERT INTO runtime_call_timings VALUES(?,?,?,?)", (call["id"], body.runtime_ms, baseline, now))
-        db.execute("INSERT INTO runtime_usage_reports VALUES(?,?,?,?,?)",
-                   (body.idempotency_key, body.decision_id, usage_id, digest, now))
-        _emit(db, str(usage_id), "usage.recorded",
-              {"decision_id": body.decision_id, "route": decision["route"], "cost_micros": body.cost_micros},
-              decision["campaign_id"])
-        usage = db.execute("SELECT * FROM runtime_usage WHERE id=?", (usage_id,)).fetchone()
+    digest, now = _sha(payload), _now()
+    existing = db.execute("SELECT * FROM runtime_usage_reports WHERE idempotency_key=?",
+                          (body.idempotency_key,)).fetchone()
+    if existing:
+        if existing["payload_sha256"] != digest:
+            raise HTTPException(409, "usage idempotency key was reused with a different report")
+        usage = db.execute("SELECT * FROM runtime_usage WHERE id=?", (existing["usage_id"],)).fetchone()
         return _usage_value(usage, db)
+    decision = db.execute("SELECT * FROM runtime_route_decisions WHERE id=?", (body.decision_id,)).fetchone()
+    if not decision or decision["status"] != "selected" or not decision["provider_id"]:
+        raise HTTPException(409, "usage requires a selected runtime route decision")
+    call = db.execute("SELECT * FROM runtime_calls WHERE decision_id=?", (body.decision_id,)).fetchone()
+    if call and (body.call_id != call["id"] or call["state"] not in {"calling", "unknown"}):
+        raise HTTPException(409, "usage must settle the reserved model call")
+    if body.call_id and not call:
+        raise HTTPException(409, "model call reservation not found")
+    if body.runtime_ms is not None and not call:
+        raise HTTPException(409, "model timing requires a call reservation")
+    selected_provider = db.execute("SELECT * FROM runtime_providers WHERE id=?", (decision["provider_id"],)).fetchone()
+    if selected_provider and _location(selected_provider) == "local" and body.cost_micros:
+        raise HTTPException(422, "local route usage cannot report cloud cost")
+    cursor = db.execute(
+        "INSERT INTO runtime_usage(campaign_id,task_id,provider_id,route,input_tokens,output_tokens,cost_micros,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (decision["campaign_id"], decision["task_id"], decision["provider_id"], decision["route"],
+         body.input_tokens, body.output_tokens, body.cost_micros, now),
+    )
+    usage_id = cursor.lastrowid
+    if call:
+        db.execute("UPDATE runtime_calls SET state='settled',usage_id=?,updated_at=? WHERE id=?",
+                   (usage_id, now, call["id"]))
+        if body.runtime_ms is not None:
+            prior = db.execute("SELECT COALESCE(SUM(COALESCE(t.runtime_ms,c.max_runtime_ms)),0),"
+                               "COALESCE(MAX(t.legacy_runtime_ms),0) FROM runtime_calls c "
+                               "LEFT JOIN runtime_call_timings t ON t.call_id=c.id "
+                               "WHERE c.task_id=? AND c.id!=? AND c.state!='released'",
+                               (call['task_id'], call['id'])).fetchone()
+            legacy = db.execute('SELECT runtime_ms FROM agent_task_usage WHERE task_id=?', (call['task_id'],)).fetchone()
+            baseline = max(prior[1], (legacy[0] if legacy else 0) - prior[0])
+            db.execute("INSERT INTO runtime_call_timings VALUES(?,?,?,?)", (call["id"], body.runtime_ms, baseline, now))
+    db.execute("INSERT INTO runtime_usage_reports VALUES(?,?,?,?,?)",
+               (body.idempotency_key, body.decision_id, usage_id, digest, now))
+    _emit(db, str(usage_id), "usage.recorded",
+          {"decision_id": body.decision_id, "route": decision["route"], "cost_micros": body.cost_micros},
+          decision["campaign_id"])
+    usage = db.execute("SELECT * FROM runtime_usage WHERE id=?", (usage_id,)).fetchone()
+    return _usage_value(usage, db)
 
 
 def _usage_value(row: sqlite3.Row, db: sqlite3.Connection) -> dict[str, Any]:

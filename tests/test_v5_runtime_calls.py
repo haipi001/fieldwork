@@ -230,3 +230,30 @@ def test_cloud_cost_reservations_cannot_overbook_campaign(client):
     assert 'campaign model cost budget exhausted' in results
     with final_core.connect() as db:
         assert db.execute('SELECT SUM(reserved_cost_micros) FROM runtime_calls').fetchone()[0] == 60
+
+
+def test_usage_settlement_rolls_back_with_reconciliation_transaction(client):
+    cid, profile = setup(client)
+    task, decision = task_route(client, cid, profile, 'atomic-reconciliation')
+    call = reserve_call(decision['id'], task['id'], 'call-runner', task['attempt'])
+    start_call(call['id'])
+    fail_call(call['id'])
+    report = runtime.UsageReport(decision_id=decision['id'], call_id=call['id'],
+                                idempotency_key='atomic-review', input_tokens=10, output_tokens=5)
+    with final_core.connect() as db:
+        with pytest.raises(RuntimeError, match='active transaction'):
+            runtime.record_usage_in_transaction(db, report)
+    with pytest.raises(RuntimeError, match='review persistence failed'):
+        with final_core.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            runtime.record_usage_in_transaction(db, report)
+            assert db.execute('SELECT state FROM runtime_calls WHERE id=?', (call['id'],)).fetchone()[0] == 'settled'
+            raise RuntimeError('review persistence failed')
+    with final_core.connect() as db:
+        assert db.execute('SELECT state,usage_id FROM runtime_calls WHERE id=?', (call['id'],)).fetchone()['state'] == 'unknown'
+        assert db.execute('SELECT COUNT(*) FROM runtime_usage_reports').fetchone()[0] == 0
+        assert db.execute('SELECT COUNT(*) FROM runtime_usage').fetchone()[0] == 0
+        from v5_runtime_calls import _pending
+        assert _pending(db, 'task_id', task['id'])[0] == call['reserved_tokens']
+    settled = runtime.record_usage(report)
+    assert runtime.record_usage(report)['id'] == settled['id']

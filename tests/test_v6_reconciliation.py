@@ -64,5 +64,21 @@ def test_unknown_reconciliation_is_evidence_bound_atomic_and_does_not_resume(cli
         assert db.execute('SELECT COUNT(*) FROM runtime_usage_reports').fetchone()[0] == 1
         with pytest.raises(sqlite3.IntegrityError, match='immutable'):
             db.execute('DELETE FROM model_usage_reconciliations_v6')
+    read_route = '/api/v1/v6/model-usage-reconciliations'
+    page = client.get(read_route + '?limit=1').json()
+    assert page['offset'] == 0 and page['has_more'] is False
+    record = page['items'][0]
+    assert record['integrity'] == 'intact'
+    assert record['usage']['input_tokens'] == 10 and record['runtime_ms'] == 50
+    assert 'uri' not in record
+    assert client.get(read_route + '?offset=1').json()['items'] == []
+    assert client.get(read_route + '?limit=101').status_code == 422
     store({**material, 'input_tokens':11})
     assert client.post(route, json=body).status_code == 409
+    assert client.get(read_route).json()['items'][0]['integrity'] == 'missing_or_changed'
+    with core.connect() as db:
+        assert db.execute('SELECT state FROM runtime_calls WHERE id=?', (call['id'],)).fetchone()[0] == 'settled'
+    store(material)
+    assert client.get(read_route).json()['items'][0]['integrity'] == 'intact'
+    path.unlink()
+    assert client.get(read_route).json()['items'][0]['integrity'] == 'missing_or_changed'

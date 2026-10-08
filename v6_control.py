@@ -232,3 +232,9 @@ def eval_runs(limit: int = Query(100, ge=1, le=500)):
 def reconcile_model_call(call_id: str, body: ReviewInput):
     from v6_reconciliation import reconcile
     return reconcile(call_id, body)
+
+
+@router.get('/model-usage-reconciliations')
+def model_usage_reconciliations(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    from v6_reconciliation import read_reconciliations
+    return read_reconciliations(limit, offset)

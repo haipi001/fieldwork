@@ -26,3 +26,7 @@ Only `unknown` calls with recorded Run ownership are eligible. The transaction a
 Repeated identical review returns the original reconciliation. Another review or changed material conflicts. Tasks are not resumed, retried or dispatched. Missing Run legacy calls remain unresolved through this endpoint. The existing worker/provider usage-report path remains available; this endpoint supplies explicit operator evidence review.
 
 Evidence import UI, paged reconciliation read/integrity UI, authenticated provider receipt adapters and historical null-Run handling remain open. This implementation does not finish P2.2 or the full release gates.
+
+## Read audit
+
+`GET /api/v1/v6/model-usage-reconciliations?limit=50&offset=0` returns immutable reconciliation metadata, recorded usage/runtime and current integrity; maximum limit is 100. It rechecks same-Run Artifact kind/hash/file contents, Task/Call ownership, settled usage/timing and the usage report binding. No storage URI or raw material is returned. A changed or missing material produces `missing_or_changed`; booked usage is retained. Pagination reflects current records.

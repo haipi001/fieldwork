@@ -68,3 +68,47 @@ def reconcile(call_id: str, body: ReviewInput):
             'artifact_sha256':artifact['sha256'], 'usage_id':usage['id'],
             'principal_id':LOCAL_SESSION_PRINCIPAL, 'review_kind':material.review_kind}, call['campaign_id'])
         return dict(db.execute('SELECT * FROM model_usage_reconciliations_v6 WHERE call_id=?', (call_id,)).fetchone())
+
+
+def read_reconciliations(limit=50, offset=0):
+    with core.connect() as db:
+        db.execute('BEGIN')
+        rows = db.execute('SELECT * FROM model_usage_reconciliations_v6 ORDER BY created_at DESC,call_id '
+                          'LIMIT ? OFFSET ?', (limit + 1, offset)).fetchall()
+        items = []
+        for row in rows[:limit]:
+            value = dict(row)
+            artifact = db.execute('SELECT * FROM artifacts WHERE id=? AND run_id=?',
+                                  (row['artifact_id'], row['run_id'])).fetchone()
+            call = db.execute('SELECT c.*,t.run_id current_run_id FROM runtime_calls c '
+                'JOIN agent_tasks t ON t.id=c.task_id WHERE c.id=?', (row['call_id'],)).fetchone()
+            usage = db.execute('SELECT * FROM runtime_usage WHERE id=?', (row['usage_id'],)).fetchone()
+            timing = db.execute('SELECT runtime_ms FROM runtime_call_timings WHERE call_id=?',
+                                (row['call_id'],)).fetchone()
+            report = db.execute('SELECT * FROM runtime_usage_reports WHERE usage_id=?',
+                                (row['usage_id'],)).fetchone()
+            valid = False
+            try:
+                raw = Path(artifact['uri']).read_bytes() if artifact else None
+                material = ReviewMaterial.model_validate_json(raw) if raw else None
+                valid = bool(material and call and usage and timing and report
+                    and artifact['kind'] == 'runtime.usage_review'
+                    and artifact['sha256'] == row['artifact_sha256']
+                    and hashlib.sha256(raw).hexdigest() == row['artifact_sha256']
+                    and report['decision_id'] == call['decision_id']
+                    and report['idempotency_key'] == f"v6-reconciliation:{row['call_id']}"
+                    and call['state'] == 'settled' and call['usage_id'] == row['usage_id']
+                    and call['task_id'] == row['task_id'] and call['current_run_id'] == row['run_id']
+                    and material.call_id == row['call_id'] and material.decision_id == call['decision_id']
+                    and material.provider_id == call['provider_id'] and material.review_kind == row['review_kind']
+                    and usage['task_id'] == row['task_id'] and usage['provider_id'] == call['provider_id']
+                    and (material.input_tokens, material.output_tokens, material.cost_micros, material.runtime_ms)
+                        == (usage['input_tokens'], usage['output_tokens'], usage['cost_micros'], timing['runtime_ms']))
+            except (OSError, ValueError, ValidationError):
+                pass
+            value['integrity'] = 'intact' if valid else 'missing_or_changed'
+            value['usage'] = ({key:usage[key] for key in ('input_tokens','output_tokens','cost_micros')}
+                              if usage else None)
+            value['runtime_ms'] = timing['runtime_ms'] if timing else None
+            items.append(value)
+        return {'items':items, 'offset':offset, 'has_more':len(rows)>limit}

@@ -295,3 +295,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.59/build137/schema40 (V6 schema12) adds append-only model_usage_reconciliations_v6 and explicit local operator POST /v6/model-calls/{id}/reconcile. Same-Run runtime.usage_review material must hash-match and exactly bind call/decision/provider plus strict measured usage/duration. Only unknown calls are eligible; settlement and audit are one transaction, tasks remain unchanged. Contract and limitations are in V6_MODEL_USAGE_RECONCILIATION.md.
 - Runtime/reconciliation/HTTP gateway regression: 22 passed; after audit-write failure injection, reconciliation test passed again. It verifies rollback leaves unknown/no usage, tamper and wrong-provider rejection, confirmation, immutable audit, repeat idempotency, actual usage accounting and paused-task retention. Full migration/repository acceptance and review import/read UI remain open; no main DB/app upgrade performed.
+
+### Reconciliation read audit
+
+- Source 0.68.60/build138/schema40 adds paged read audit with current material, ownership, usage/timing and usage-report consistency checks, retaining actual booked usage when integrity fails. No local URI/raw material is exposed.
+- Regression covers intact/changed/restored/missing review material, pagination bounds/empty offset, recorded token/runtime and retaining settled state after tamper. Reconciliation and runtime-summary targeted tests pass; full repository acceptance/UI remain open.

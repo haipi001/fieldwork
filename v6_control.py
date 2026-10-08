@@ -98,6 +98,36 @@ def packs():
     return {'packs': list_packs()}
 
 
+@router.get('/runtime-summary')
+def runtime_summary():
+    from v6_containment import is_contained
+    with final_core.connect() as db:
+        db.execute('BEGIN')
+        def states(table, column='status'):
+            counts = {row['state']: row['count'] for row in db.execute(
+                f'SELECT {column} state,COUNT(*) count FROM {table} GROUP BY {column}')}
+            return {'total': sum(counts.values()), 'states': counts}
+        loads = [dict(row) for row in db.execute("SELECT r.id,r.status,r.max_concurrency,"
+            "COUNT(t.id) running_tasks FROM runner_registry_v5 r LEFT JOIN agent_tasks t "
+            "ON t.lease_owner=r.id AND t.status='running' GROUP BY r.id ORDER BY r.id")]
+        containment_runs = {row[0] for row in db.execute('SELECT run_id FROM run_containment_v6 UNION '
+                                                         'SELECT run_id FROM run_containment_events_v6')}
+        return {'snapshot_at': final_core.utcnow(),
+                'groups': states('research_groups'), 'tasks': states('agent_tasks'),
+                'task_roles': {row['role']: row['count'] for row in db.execute(
+                    'SELECT role,COUNT(*) count FROM agent_tasks GROUP BY role')},
+                'runners': states('runner_registry_v5'), 'runner_load': loads,
+                'model_calls': states('runtime_calls', 'state'),
+                'http_receipts': states('http_gateway_receipts_v6'),
+                'http_unsettled': db.execute('SELECT COUNT(*) FROM http_gateway_executions_v6 x '
+                    'LEFT JOIN http_gateway_receipts_v6 r ON r.action_id=x.action_id WHERE r.action_id IS NULL').fetchone()[0],
+                'contained_runs': sum(is_contained(db, run) for run in containment_runs),
+                'event_count': db.execute('SELECT COUNT(*) FROM v5_events').fetchone()[0],
+                'grants': {'issued': db.execute('SELECT COUNT(*) FROM capability_grants_v6').fetchone()[0],
+                           'revoked': db.execute('SELECT COUNT(*) FROM capability_revocations_v6').fetchone()[0],
+                           'uses': db.execute('SELECT COUNT(*) FROM capability_uses_v6').fetchone()[0]}}
+
+
 @router.get("/campaigns/{campaign_id}/runtime-events")
 def campaign_runtime_events(campaign_id: str, after_id: int = Query(0, ge=0),
                             limit: int = Query(100, ge=1, le=500)):

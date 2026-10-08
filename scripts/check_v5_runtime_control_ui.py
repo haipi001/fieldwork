@@ -58,6 +58,14 @@ def run():
                      'completed','report',1,None,None,None,None,final_core.utcnow()))
                 eval_id=run_policy_seed(db,'ui-eval-run',root/'eval-artifacts')
                 eval_path=Path(db.execute('SELECT a.uri FROM eval_runs_v6 e JOIN artifacts a ON a.id=e.artifact_id WHERE e.id=?',(eval_id,)).fetchone()[0])
+                db.execute('INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    ('ui-policy-run',project['id'],'traditional',project['current_scope_snapshot_id'],project['current_policy_id'],
+                     'running','target',0,None,None,None,None,final_core.utcnow()))
+            from v6_http_gateway import authorize_native_browser_read
+            try:
+                authorize_native_browser_read('ui-policy-run',project['id'],'https://outside-ui.example.test/')
+            except ValueError:
+                pass
             campaign=client.post(f"/api/v1/engagements/{project['id']}/campaigns",json={"name":"Runtime UI fixture","objective":"Inspect configuration and scheduling"}).json()
             assert client.post("/api/v1/research/nodes",json={"campaign_id":campaign["id"],"node_type":"observation","title":"Explicit scheduling fixture"}).status_code==201
             writes,errors=[],[]
@@ -67,7 +75,7 @@ def run():
                 assert parsed.hostname=="127.0.0.1"
                 if path=="/v5":route.fulfill(path=str(ROOT/"templates/v5.html"),content_type="text/html")
                 elif path.startswith("/static/"):route.fulfill(path=str(ROOT/path.lstrip("/")))
-                elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs"} or path.startswith("/api/v1/orchestration/")
+                elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs", "/api/v1/v6/policy-decisions"} or path.startswith("/api/v1/orchestration/")
                       or path==f"/api/v1/engagements/{project['id']}/campaigns"
                       or path.startswith("/api/v1/continuous-research/")
                       or path.startswith("/api/v1/runtime/") and path!="/api/v1/runtime/readiness"):
@@ -94,6 +102,9 @@ def run():
                 assert page.locator('[data-summary-total="tasks"]').inner_text() == str(client.get('/api/v1/v6/runtime-summary').json()['tasks']['total'])
                 page.wait_for_function("document.querySelector('#rcCampaign').value !== ''")
                 assert not writes and counts=={"health":0,"model":0}
+                page.locator('#rcDecisions').locator('..').locator('summary').click()
+                page.wait_for_selector('[data-policy-decision="deny"]')
+                assert 'outside-ui.example.test' in page.locator('#rcDecisions').inner_text()
                 page.locator('#rcEvals').locator('..').locator('summary').click()
                 page.wait_for_selector('[data-eval-status="passed"]')
                 eval_path.write_text('{}')
@@ -158,7 +169,7 @@ def run():
                 page.wait_for_function("document.querySelector('#rcPolicyState').textContent.includes('配置版本: 2')")
                 assert client.get(f"/api/v1/orchestration/tasks?campaign_id={campaign['id']}").json()["items"][0]["status"]=="cancelled"
                 page.locator('#rcRefresh').click()
-                page.wait_for_function("document.querySelector('[data-summary-total=tasks]').textContent==='1'")
+                page.wait_for_function("document.querySelector('[data-summary-total=tasks]').textContent==='2'")
                 page.locator("#rcProviderName").fill("Unsaved input stays intact")
                 page.locator("#languageToggle").click()
                 assert page.locator("#rcProviderName").input_value()=="Unsaved input stays intact"

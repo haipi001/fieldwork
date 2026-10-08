@@ -14,6 +14,7 @@
     let generation=0, busy=false, offset=0, routes=[], routePage={}, failure="";
     let summary=null, summaryError="";
     let evalRuns=null, evalError="";
+    let policyDecisions=null, policyError="";
     const panel = document.createElement("article");
     panel.id="runtimeControl"; panel.className="panel runtime-control";
     panel.innerHTML=`<header><h2>${copy("V5 模型配置与研究策略","V5 model configuration and research policy")}</h2>${button("rcRefresh","刷新配置","Refresh configuration")}</header>
@@ -21,6 +22,7 @@
       <p id="rcMessage" role="status"></p>
       <section aria-labelledby="rcSummaryTitle"><h3 id="rcSummaryTitle">${copy("运行状态快照","Runtime state snapshot")}</h3><div id="rcSummary" aria-live="polite"></div></section>
       <details><summary>${copy("回归评估记录","Regression Eval records")}</summary><p>${copy("状态仅适用于记录的场景。材料完整性由后端在读取时核对。","Status applies to the recorded scenario. The backend checks material integrity on read.")}</p><div id="rcEvals" aria-live="polite"></div></details>
+      <details><summary>${copy("策略判定记录","Policy decision records")}</summary><p>${copy("判定记录不代表操作已执行。","A decision record does not establish execution.")}</p><div id="rcDecisions" aria-live="polite"></div></details>
       <details><summary>${copy("新增 V5 Provider","Add V5 provider")}</summary><form id="rcProviderForm" class="form-stack">
         <div class="form-pair">${label("名称","Name",input("rcProviderName","text","required maxlength=120 autocomplete=off"))}
           ${label("位置","Location",`<select id="rcLocation"><option value="local">Local</option><option value="cloud">Cloud</option></select>`)}</div>
@@ -81,7 +83,7 @@
     const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
     function localize() {
       panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
-      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();
+      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();
     }
     async function send(url, body, method="POST") {
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
@@ -140,6 +142,14 @@
       if(token!==generation)return;
       calls=list(value);renderCalls();
     }
+    function renderDecisions() {
+      const host=$("#rcDecisions");
+      if(policyError){host.textContent=policyError;return}
+      if(policyDecisions===null){host.textContent=t("等待读取判定。","Awaiting decisions.");return}
+      if(!policyDecisions.length){host.textContent=t("没有已记录的判定。","No recorded decisions.");return}
+      const labels={allow:t("允许","Allow"),allow_with_limit:t("受限允许","Allow with limits"),deny:t("拒绝","Deny"),require_approval:t("待批准","Approval required"),quarantine:t("隔离","Quarantine")};
+      host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>${t("任务 / Run","Task / run")}</th><th>${t("动作 / 资源","Action / resource")}</th><th>${t("判定 / 理由","Decision / reasons")}</th></tr></thead><tbody>${policyDecisions.map(row=>`<tr data-policy-decision="${esc(row.decision)}"><td>${esc(row.task_id)}<small class="cell-subline">${esc(row.run_id)}</small></td><td>${esc(row.capability)} / ${esc(row.operation)}<small class="cell-subline">${esc(row.resource)}</small></td><td>${esc(labels[row.decision]||row.decision)}<small class="cell-subline">${(row.reasons||[]).map(esc).join(" · ")}</small></td></tr>`).join("")}</tbody></table></div>`;
+    }
     function renderEvals() {
       const host=$("#rcEvals");
       if(evalError){host.textContent=evalError;return}
@@ -165,10 +175,11 @@
     async function refresh() {
       const token=++generation;failure="";
       try {
-        const [config,ledger,snapshot,evals]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0"),request("/api/v1/v6/runtime-summary").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/eval-runs?limit=50").then(data=>({data}),error=>({error:error.message}))]);
+        const [config,ledger,snapshot,evals,decisions]=await Promise.all([request("/api/v1/runtime/config"),request("/api/v1/runtime/routes?limit=50&offset=0"),request("/api/v1/v6/runtime-summary").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/eval-runs?limit=50").then(data=>({data}),error=>({error:error.message})),request("/api/v1/v6/policy-decisions?limit=50").then(data=>({data}),error=>({error:error.message}))]);
         if(token!==generation)return;
         summary=snapshot.data||null;summaryError=snapshot.error||"";renderSummary();
         evalRuns=evals.data?.runs||[];evalError=evals.error||"";renderEvals();
+        policyDecisions=decisions.data?.decisions||[];policyError=decisions.error||"";renderDecisions();
         providers=list(config.providers);profiles=list(config.profiles);state.remote.runtimeConfig={ok:true,data:config};
         onConfig();
         routes=list(ledger);offset=routes.length;routePage=ledger.page||{};renderProviders();renderRoutes();await loadCalls(token);

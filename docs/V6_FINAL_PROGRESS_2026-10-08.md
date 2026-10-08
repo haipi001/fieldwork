@@ -239,3 +239,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.49 / build 127 / schema 39 adds a read-only Eval table in the runtime page, showing scenario/version, model/profile, scoped status, failure reasons and Artifact integrity. Loading, empty and failed reads have distinct states. A record does not provide a run or approval control; the status applies to its measured scenario.
 - Real Chrome acceptance executes a Policy seed into the isolated database, displays passed, then tampers its Artifact and verifies refresh displays invalid. Existing language/theme/1440/680 layout and runtime configuration checks pass with no page errors or model calls. JS syntax passed. Policies/Incidents/Evidence UI and full Eval suite acceptance remain open; no main-data or installed-app changes were performed.
+
+### P1.8 Policy decision audit UI
+
+- Source 0.68.50 / build 128 / schema 39 adds a paged read-only PolicyDecision endpoint joined to its immutable Intent, and a recent-decision table in the runtime page. It exposes Task/Run/action/resource/decision/reasons without accepting authorization claims or performing the operation. Loading/empty/error states are explicit and labels localize.
+- Policy API regression: 4 passed, including real persisted record correlation and pagination. Chrome acceptance displays a server-recorded denied gateway fixture and passes existing refresh/Eval-tamper/language/theme/narrow-layout checks with no page errors or model calls. JS syntax passed; full repository regression was not rerun. Incident/Evidence UI and complete release gates remain open.

@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 import final_core
 from v6_capabilities import _intent_current, capability_matches
@@ -133,3 +133,18 @@ def list_policy_decisions(intent_id: str):
         value["legacy_guard"] = json.loads(value.pop("legacy_guard_json"))
         decisions.append(value)
     return {"decisions": decisions}
+
+
+@router.get('/policy-decisions')
+def policy_decision_page(limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    with final_core.connect() as db:
+        rows = db.execute('SELECT d.*,a.task_id,a.run_id,a.campaign_id,a.agent_id,a.capability,a.operation,a.resource '
+            'FROM policy_decisions_v6 d JOIN action_intents_v6 a ON a.id=d.intent_id '
+            'ORDER BY d.created_at DESC,d.id LIMIT ? OFFSET ?', (limit + 1, offset)).fetchall()
+    items = []
+    for row in rows[:limit]:
+        item = dict(row)
+        item['reasons'] = json.loads(item.pop('reasons_json'))
+        item['legacy_guard'] = json.loads(item.pop('legacy_guard_json'))
+        items.append(item)
+    return {'decisions': items, 'has_more': len(rows) > limit, 'offset': offset}

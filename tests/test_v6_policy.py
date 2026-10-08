@@ -49,6 +49,10 @@ def test_persisted_decision_is_audited_immutable_and_does_not_execute(client):
     assert decision["decision"] == "allow_with_limit"
     listed = client.get(f"/api/v1/v6/action-intents/{intent['id']}/policy-decisions")
     assert listed.status_code == 200 and listed.json()["decisions"] == [decision]
+    page = client.get('/api/v1/v6/policy-decisions?limit=1').json()
+    assert page['decisions'][0]['id'] == decision['id'] and page['decisions'][0]['task_id'] == task['id']
+    assert page['has_more'] is False
+    assert client.get('/api/v1/v6/policy-decisions?offset=1').json()['decisions'] == []
     with final_core.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM runtime_calls").fetchone()[0] == before_calls
         event = db.execute("SELECT event_type,payload_json FROM v5_events WHERE entity_id=?",

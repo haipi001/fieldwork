@@ -54,6 +54,7 @@ class StrictModel(BaseModel):
 
 class WorkerTaskRequest(StrictModel):
     campaign_id: str = Field(min_length=1, max_length=200)
+    run_id: str | None = Field(default=None, min_length=1, max_length=200)
     role: Literal["critic", "synthesizer"]
     runtime_profile_id: str | None = Field(default=None, min_length=1, max_length=200)
     claim_ids: list[str] = Field(min_length=1, max_length=20)
@@ -237,6 +238,9 @@ def _check_model_authority(provider, task):
         current = _owned_running(db, task["id"], task["lease_owner"])
         _check_lease_attempt(current, task["attempt"])
         _validate_current(db, current)
+        if current["run_id"] and _load(current["context_capsule_json"], {}).get("structured_worker"):
+            if not _continuous_scope_current(db, current):
+                raise HTTPException(409, "structured worker authority changed during model call")
         if _load(current['context_capsule_json'], {}).get('native_discovery'):
             from v5_native_discovery import inputs_current
             inputs_current(db, current)
@@ -506,6 +510,17 @@ def create_worker_task(body: WorkerTaskRequest):
     with _core().connect() as db:
         db.execute("BEGIN IMMEDIATE")
         campaign = _campaign(db, body.campaign_id)
+        if body.run_id:
+            authority = db.execute(
+                "SELECT r.status,r.synthetic,r.scope_snapshot_id,r.policy_id,e.status engagement_status "
+                "FROM analysis_runs r JOIN engagements_v2 e ON e.id=r.engagement_id "
+                "WHERE r.id=? AND e.id=?", (body.run_id, campaign["engagement_id"]),
+            ).fetchone()
+            if (not authority or authority["synthetic"] or authority["status"] not in {"queued", "running"}
+                    or authority["engagement_status"] != "ready"
+                    or authority["scope_snapshot_id"] != campaign["current_scope_snapshot_id"]
+                    or authority["policy_id"] != campaign["current_policy_id"]):
+                raise HTTPException(409, "structured worker Run is not current under confirmed authority")
         source_nodes = {}
         for node_id in body.claim_ids:
             source_nodes[node_id] = _node(db, body.campaign_id, node_id, {"claim"})
@@ -535,13 +550,13 @@ def create_worker_task(body: WorkerTaskRequest):
                    "input_hashes": {node_id: _node_digest(row) for node_id, row in source_nodes.items()}}
         if body.runtime_profile_id:
             capsule["runtime_profile_id"] = body.runtime_profile_id
-        identity = {"campaign_id": body.campaign_id, "role": body.role, "capsule": capsule,
+        identity = {"campaign_id": body.campaign_id, "run_id": body.run_id, "role": body.role, "capsule": capsule,
                     "max_tokens": body.max_tokens, "max_runtime_ms": body.max_runtime_ms, "priority": float(body.priority)}
         key = f"structured:{body.idempotency_key}"
         existing = db.execute("SELECT * FROM agent_tasks WHERE idempotency_key=?", (key,)).fetchone()
         if existing:
             old = _load(existing["context_capsule_json"], {})
-            if (_dump(identity) != _dump({"campaign_id": existing["campaign_id"], "role": existing["role"],
+            if (_dump(identity) != _dump({"campaign_id": existing["campaign_id"], "run_id": existing["run_id"], "role": existing["role"],
                                          "capsule": old, "max_tokens": _load(existing["budget_json"], {}).get("max_tokens"),
                                          "max_runtime_ms": _load(existing["budget_json"], {}).get("max_runtime_ms", 45_000),
                                          "priority": existing["priority"]})):
@@ -550,7 +565,7 @@ def create_worker_task(body: WorkerTaskRequest):
         task_id, now = _uid("atask"), _now()
         db.execute(
             "INSERT INTO agent_tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (task_id, body.campaign_id, None, None, body.role, body.objective,
+            (task_id, body.campaign_id, body.run_id, None, body.role, body.objective,
              _dump(capsule), _dump([f"structured_{body.role}"]), _dump({"labels": {"location": "local"}}),
              _dump({"max_tokens": body.max_tokens, "max_cost_micros": 0, "max_runtime_ms": body.max_runtime_ms}), body.priority,
              "queued", 0, 2, key, None, None, None, None, None, now, now),

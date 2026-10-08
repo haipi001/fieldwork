@@ -92,7 +92,14 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 - Source is now 0.68.25 / build 103 / schema 32. The native discovery model path uses the same reservation, intent, one-use Grant, policy decision and atomic `calling` transition as the research Worker. Its principal and Agent IDs are distinct from the research Worker and are assigned by the built-in code path.
 - Native binding requires the registered built-in Runner, current Run/Scope/Policy and the existing observation/artifact input guard. The Runner registration rejects an occupied ID and marks the built-in identity explicitly. A direct native model gateway test covers reservation, start, one-use consumption and replay denial without requiring a browser installation.
 - Focused gateway/native/research/runtime/policy/Grant tests: 28 passed, 1 skipped. Repository-wide regression: 860 passed, 4 skipped, 1 existing deprecation warning in 225.65 seconds. Python compilation and diff checks passed.
-- The structured local model path and other first-party execution routes still need gateway integration. The full browser execution test depends on the local Playwright/Chrome environment and remains separate from the direct model gateway test.
+- The structured local model path still has no-Run legacy tasks, and other first-party execution routes need gateway integration. The full browser execution test depends on the local Playwright/Chrome environment and remains separate from the direct model gateway test.
+
+### P0.5 Run-bound structured model extension
+
+- Source is now 0.68.26 / build 104 / schema 32. Structured critic and synthesizer task creation accepts an explicit current, confirmed Run. The Run participates in idempotency identity; a missing, synthetic, stale or mismatched Run is rejected. Tasks created without a Run retain their existing legacy behavior until an explicit migration rule exists.
+- The built-in local structured Worker now binds Run-backed model calls to a distinct Worker principal and Agent ID through the same V6 intent, one-use Grant, policy and `calling` transaction. The legacy Scope/input guard and Run status are rechecked before and during model execution. An end-to-end local Worker fixture verifies settled call, gateway start and Grant use; a mismatched idempotency replay is rejected.
+- Historical no-Run structured tasks, complete execution-event lineage and other model execution routes remain open. P0.6 HTTP/browser and later phases are still pending.
+- Focused Worker/gateway/native/research/call/orchestration suite: 46 passed, 1 skipped; Evolution suite: 8 passed. Repository-wide regression: 861 passed, 4 skipped, 1 existing deprecation warning in 227.91 seconds.
 
 ## Next implementation order
 

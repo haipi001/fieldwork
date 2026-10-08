@@ -129,7 +129,8 @@ def reserve_call(decision_id: str, task_id: str, runner_id: str, attempt: int) -
         db.execute('INSERT INTO runtime_calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
             call_id, decision_id, task_id, attempt, runner_id, task['campaign_id'], task['group_id'],
             decision['profile_id'], provider['id'], tokens, cost, runtime_ms, deadline, 'reserved', None, now, now))
-        if capsule.get('team_plan') or capsule.get('native_discovery'):
+        if (capsule.get('team_plan') or capsule.get('native_discovery')
+                or (capsule.get('structured_worker') and task['run_id'])):
             from v6_model_gateway import bind_first_party_call
             bind_first_party_call(db, call_id=call_id, task=task, route=decision, runner_id=runner_id)
         r._emit(db, call_id, 'call.reserved', {'task_id': task_id, 'reserved_tokens': tokens}, task['campaign_id'])
@@ -152,7 +153,8 @@ def start_call(call_id: str) -> None:
         if not provider or r._provider_config_hash(provider) != r._load(decision['request_json'], {}).get('provider_configuration_sha256'):
             raise HTTPException(409, 'model provider changed before dispatch')
         capsule = r._load(task['context_capsule_json'], {})
-        if capsule.get('team_plan') or capsule.get('native_discovery'):
+        if (capsule.get('team_plan') or capsule.get('native_discovery')
+                or (capsule.get('structured_worker') and task['run_id'])):
             from v6_model_gateway import authorize_first_party_start
             allowed, reason = authorize_first_party_start(db, row, task)
             if not allowed:

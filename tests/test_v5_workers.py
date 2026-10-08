@@ -214,6 +214,52 @@ def test_explicit_local_worker_tick_executes_only_structured_tasks(client, monke
     assert status["critic"]["local_executor"] is True and status["critic"]["local_provider_ready"] is True
 
 
+def test_run_bound_structured_model_uses_v6_gateway(client, monkeypatch):
+    engagement, cid = setup_campaign(client)
+    claim = node(client, cid, "claim", "Run-bound critique needs a negative control")
+    with final_core.connect() as db:
+        now = final_core.utcnow()
+        db.execute("INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            "structured-gateway-run", engagement["id"], "traditional",
+            engagement["current_scope_snapshot_id"], engagement["current_policy_id"],
+            "running", "target", 0, None, None, None, None, now,
+        ))
+        db.execute("INSERT INTO runtime_providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            "structured-gateway-model", "llama_cpp", "Gateway fixture", "http://127.0.0.1:9009",
+            "fixture-model", None, 1, '{"location":"local"}', "healthy", now, now, now,
+        ))
+    created = client.post("/api/v1/workers/tasks", json={
+        "campaign_id": cid, "run_id": "structured-gateway-run", "role": "critic",
+        "claim_ids": [claim["id"]], "objective": "Review a run-bound claim",
+        "idempotency_key": "structured-gateway", "max_tokens": 8000,
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    monkeypatch.setattr(v5_workers, "_local_model_output", lambda *_: (
+        {"claim_node_id": claim["id"], "weaknesses": ["Check the negative control"],
+         "counterevidence_ids": [], "conclusion": "inconclusive"}, 10, 12, 25,
+    ))
+    response = client.post("/api/v1/workers/local/tick?limit=1")
+    assert response.status_code == 200, response.text
+    assert response.json()["completed"][0]["status"] == "succeeded"
+    with final_core.connect() as db:
+        binding = db.execute("SELECT b.*,c.state FROM model_gateway_bindings_v6 b "
+            "JOIN runtime_calls c ON c.id=b.call_id WHERE c.task_id=?", (task_id,)).fetchone()
+        assert binding["principal_id"] == "fieldwork:structured-local-worker"
+        assert binding["agent_id"] == "fieldwork:structured-local-agent-v1"
+        assert binding["state"] == "settled"
+        assert db.execute("SELECT COUNT(*) FROM model_gateway_starts_v6 WHERE call_id=?",
+                          (binding["call_id"],)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM capability_uses_v6 WHERE action_id=?",
+                          (binding["call_id"],)).fetchone()[0] == 1
+    mismatch = client.post("/api/v1/workers/tasks", json={
+        "campaign_id": cid, "role": "critic", "claim_ids": [claim["id"]],
+        "objective": "Review a run-bound claim", "idempotency_key": "structured-gateway",
+        "max_tokens": 8000,
+    })
+    assert mismatch.status_code == 409
+
+
 def test_local_worker_invalid_output_retries_without_graph_promotion(client, monkeypatch):
     _, cid = setup_campaign(client)
     claim = node(client, cid, "claim", "A bounded issue needs critique")

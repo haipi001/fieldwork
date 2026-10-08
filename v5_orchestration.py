@@ -806,7 +806,8 @@ def _continuous_scope_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool
                 and row["confirmed_at"] and (not capsule.get("continuous_research") or row["enabled"])
                 and row["current_scope_snapshot_id"] == capsule.get("scope_snapshot_id")
                 and row["current_policy_id"] == capsule.get("policy_id"))
-    if current and (capsule.get("team_plan") or capsule.get('native_discovery')):
+    if current and (capsule.get("team_plan") or capsule.get('native_discovery')
+                    or (capsule.get("structured_worker") and task["run_id"])):
         run = db.execute(
             "SELECT r.status,r.synthetic,r.scope_snapshot_id,r.policy_id "
             "FROM analysis_runs r JOIN research_campaigns c ON c.engagement_id=r.engagement_id "
@@ -816,7 +817,7 @@ def _continuous_scope_current(db: sqlite3.Connection, task: sqlite3.Row) -> bool
                        and run["status"] in {"queued", "running", "paused", "completed"}
                        and run["scope_snapshot_id"] == capsule.get("scope_snapshot_id")
                        and run["policy_id"] == capsule.get("policy_id"))
-        if capsule.get('native_discovery'):
+        if capsule.get('native_discovery') or capsule.get('structured_worker'):
             current = current and run['status'] == 'running'
     if current and capsule.get("continuous_policy_hash"):
         current = hashlib.sha256(_dump(_load(row["continuous_policy_json"], {})).encode()).hexdigest() == capsule["continuous_policy_hash"]

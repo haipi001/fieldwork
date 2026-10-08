@@ -1,4 +1,4 @@
-"""First-party research model gateway over the existing runtime call ledger."""
+"""First-party model gateway over the existing runtime call ledger."""
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +15,8 @@ RESEARCH_PRINCIPAL = "fieldwork:research-worker"
 RESEARCH_AGENT = "fieldwork:research-agent-v1"
 NATIVE_PRINCIPAL = "fieldwork:native-discovery-worker"
 NATIVE_AGENT = "fieldwork:native-discovery-agent-v1"
+STRUCTURED_PRINCIPAL = "fieldwork:structured-local-worker"
+STRUCTURED_AGENT = "fieldwork:structured-local-agent-v1"
 
 
 def _load_object(value: str) -> dict:
@@ -43,6 +45,16 @@ def _identity_and_guard(db: sqlite3.Connection, task: sqlite3.Row, runner_id: st
         except Exception:
             return NATIVE_PRINCIPAL, NATIVE_AGENT, "native-discovery", False
         return NATIVE_PRINCIPAL, NATIVE_AGENT, "native-discovery", True
+    if capsule.get("structured_worker") in {"critic", "synthesizer", "evolver"} and task["run_id"]:
+        from v5_workers import LOCAL_RUNNER_ID, _validate_current
+        if runner_id != LOCAL_RUNNER_ID:
+            return "", "", "", False
+        try:
+            _validate_current(db, task)
+        except Exception:
+            return STRUCTURED_PRINCIPAL, STRUCTURED_AGENT, "local-structured", False
+        return (STRUCTURED_PRINCIPAL, STRUCTURED_AGENT, "local-structured",
+                _continuous_scope_current(db, task))
     return "", "", "", False
 
 
@@ -120,7 +132,8 @@ def authorize_first_party_start(db: sqlite3.Connection, call: sqlite3.Row,
     result = record_policy_decision(
         db, intent_id=binding["intent_id"], grant_id=binding["grant_id"],
         principal_id=principal, legacy_guard_allowed=legacy_allowed,
-        legacy_rule_id="v5.research_model_guard" if principal == RESEARCH_PRINCIPAL else "v5.native_model_guard",
+        legacy_rule_id=("v5.research_model_guard" if principal == RESEARCH_PRINCIPAL else
+                        "v5.native_model_guard" if principal == NATIVE_PRINCIPAL else "v5.structured_model_guard"),
         budget_ok=True,
     )
     if result["decision"] not in {"allow", "allow_with_limit"}:

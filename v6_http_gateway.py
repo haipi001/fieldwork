@@ -24,6 +24,16 @@ RUN_READ_PRINCIPAL = "fieldwork:run-http-worker"
 RUN_READ_AGENT = "fieldwork:run-http-agent-v1"
 
 
+class ReadContained(ValueError):
+    pass
+
+
+def check_read_containment(run_id: str) -> None:
+    with final_core.connect() as db:
+        if db.execute('SELECT 1 FROM run_containment_v6 WHERE run_id=?', (run_id,)).fetchone():
+            raise ReadContained('Run V6 read execution is contained')
+
+
 def _emit(db: sqlite3.Connection, campaign_id: str, action_id: str, kind: str, payload: dict) -> None:
     db.execute("INSERT INTO v5_events(topic,campaign_id,entity_id,event_type,payload_json,created_at) "
                "VALUES(?,?,?,?,?,?)", ("tool", campaign_id, action_id, kind,

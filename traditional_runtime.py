@@ -317,15 +317,19 @@ def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, pare
         action_id = authorize_run_http_read(run_id, run["engagement_id"], spec.url,
                                             headers=spec.headers, source=source)
     try:
+        from v6_http_gateway import check_read_containment, ReadContained
+        if action_id:
+            check_read_containment(run_id)
         result = request_once(spec)
         if action_id:
+            check_read_containment(run_id)
             from v6_http_gateway import finish_http_read
             finish_http_read(action_id, response=result)
     except Exception as error:
         if action_id:
             from v6_http_gateway import finish_http_read
             try:
-                finish_http_read(action_id, error_type=type(error).__name__)
+                finish_http_read(action_id, error_type=type(error).__name__, cancelled=isinstance(error, ReadContained))
             except ValueError:
                 pass
         raise
@@ -736,6 +740,8 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
                 if not consumed:
                     raise HTTPException(409, reason)
                 def check_current():
+                    from v6_http_gateway import check_read_containment
+                    check_read_containment(run_id)
                     if finalize:
                         check_formal_inputs()
                     if job_id and _job_cancel_requested(job_id):
@@ -757,15 +763,17 @@ def _execute_http_replay(run_id: str, body: HttpReplayInput, job_id: str | None 
                         check_current()
                         results[name] = request_once(spec)
                     if action_id:
+                        from v6_http_gateway import check_read_containment
+                        check_read_containment(run_id)
                         from v6_http_gateway import finish_http_read
                         finish_http_read(action_id, response=results[name])
                         read_action_ids.append(action_id)
                 except Exception as error:
                     if action_id:
-                        from v6_http_gateway import finish_http_read
+                        from v6_http_gateway import finish_http_read, ReadContained
                         try:
                             finish_http_read(action_id, error_type=type(error).__name__,
-                                             cancelled=isinstance(error, VerificationCancelled))
+                                             cancelled=isinstance(error, (VerificationCancelled, ReadContained)))
                         except ValueError:
                             pass
                     raise

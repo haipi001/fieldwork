@@ -143,6 +143,25 @@ def test_native_browser_cancellation_before_transport_records_failure_without_ne
         assert db.execute("SELECT COUNT(*) FROM capability_uses_v6").fetchone()[0] == 1
 
 
+def test_containment_between_authorization_and_browser_transport_cancels_receipt(client, object_server, monkeypatch):
+    import v6_http_gateway as gateway
+    origin, calls = object_server
+    engagement = prepare(client, origin, None)
+    run = final_core.get_run('native-discovery-run')
+    original = gateway.authorize_native_browser_read
+    def contain_after_authorization(*args):
+        action = original(*args)
+        assert client.post('/api/v1/v6/runs/native-discovery-run/contain',
+                           json={'reason_code': 'compromised'}).status_code == 200
+        return action
+    monkeypatch.setattr(gateway, 'authorize_native_browser_read', contain_after_authorization)
+    with pytest.raises(gateway.ReadContained):
+        native_agent._pinned_browser_get(run, engagement, origin + '/object', lambda: None)
+    assert calls == []
+    with final_core.connect() as db:
+        assert db.execute('SELECT status FROM http_gateway_receipts_v6').fetchone()[0] == 'cancelled'
+
+
 def test_native_browser_gateway_rejects_stale_run_and_sensitive_resource(client):
     engagement = prepare(client, "https://native-browser.example.test", None)
     with pytest.raises(ValueError, match="embedded credentials"):

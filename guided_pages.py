@@ -70,7 +70,8 @@ def collect(run_id, links, checkpoint, check_cancel, previous_attempts=(), limit
                 try:finish_http_read(action_id,error_type=type(error).__name__)
                 except ValueError:pass
                 raise
-            exchange=http._record_exchange(current,spec,response,None,'guided_page_read',item.get('source_id'))
+            exchange=http._record_exchange(current,spec,response,None,'guided_page_read',item.get('source_id'),
+                                            gateway_action_id=action_id)
             record.update(status='recorded',exchange_id=exchange['id'],response_status=exchange['response_status'])
             checkpoint(reads)
         except (HTTPException,ValueError):

@@ -34,8 +34,12 @@ def test_real_exchange_saved_and_visited_not_repeated(client,monkeypatch):
         gateway=db.execute("SELECT x.action_id,t.context_capsule_json,r.status FROM http_gateway_executions_v6 x "
                            "JOIN agent_tasks t ON t.id=x.task_id JOIN http_gateway_receipts_v6 r ON r.action_id=x.action_id "
                            "WHERE t.role='run-http-reader'").fetchone()
+        lineage=db.execute("SELECT a.id,o.id observation_id FROM runtime_artifact_links_v6 l "
+                           "JOIN artifacts a ON a.id=l.artifact_id JOIN observations o ON o.raw_ref=a.id "
+                           "WHERE l.action_id=? AND a.kind='http.exchange_metadata'",(gateway['action_id'],)).fetchone()
     assert row['source']=='guided_page_read' and row['identity_id'] is None
     assert gateway['status']=='completed' and json.loads(gateway['context_capsule_json'])['source']=='guided_page_read'
+    assert lineage['id'] and lineage['observation_id']
     assert pages.collect(run['id'],[],lambda _:None,lambda:None)==[]
 
 

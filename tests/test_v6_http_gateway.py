@@ -69,10 +69,29 @@ def test_read_artifact_lineage_rejects_cross_run_and_is_immutable(client):
         with pytest.raises(ValueError, match="does not belong"):
             link_completed_reads_to_artifact(db, action_ids=[action_id],
                                              artifact_id="artifact-other", run_id="native-discovery-run")
+        with pytest.raises(ValueError, match="conflicts with its gateway receipt"):
+            link_completed_reads_to_artifact(db, action_ids=[action_id],
+                                             artifact_id="artifact-own", run_id="native-discovery-run",
+                                             response={"status": 404, "body_sha256": "a" * 64, "body_bytes": 1})
         link_completed_reads_to_artifact(db, action_ids=[action_id],
                                          artifact_id="artifact-own", run_id="native-discovery-run")
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             db.execute("DELETE FROM runtime_artifact_links_v6 WHERE action_id=?", (action_id,))
+
+
+def test_exchange_lineage_failure_rolls_back_exchange_and_artifact(client):
+    prepare(client, "https://native-browser.example.test", None)
+    run = final_core.get_run("native-discovery-run")
+    with pytest.raises(ValueError, match="not a completed request"):
+        http._record_exchange(run, http.ReplayRequest(url="https://native-browser.example.test/page"),
+                              {"status": 200, "headers": {}, "body_preview": "fixture",
+                               "body_sha256": "a" * 64, "body_bytes": 1}, None, "manual",
+                              gateway_action_id="missing-action")
+    with final_core.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM http_exchanges").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+    assert not list(http.ARTIFACT_ROOT.glob("artifact-*.json"))
 
 
 def test_native_browser_request_uses_pinned_transport_and_v6_receipt(client, object_server):
@@ -165,6 +184,20 @@ def test_manual_exchange_and_replay_each_receive_read_receipt(client, object_ser
                           "ORDER BY e.started_at,e.action_id").fetchall()
         assert sorted(json.loads(row["context_capsule_json"])["source"] for row in rows) == ["manual", "replay"]
         assert all(row["status"] == "completed" for row in rows)
+        links = db.execute("SELECT a.id,a.uri,a.sha256,o.id observation_id FROM runtime_artifact_links_v6 l "
+                           "JOIN artifacts a ON a.id=l.artifact_id "
+                           "JOIN observations o ON o.raw_ref=a.id "
+                           "WHERE a.kind='http.exchange_metadata'").fetchall()
+        assert len(links) == 2 and len({row['id'] for row in links}) == 2
+        from pathlib import Path
+        for row in links:
+            data = Path(row['uri']).read_bytes()
+            assert hashlib.sha256(data).hexdigest() == row['sha256']
+            assert json.loads(data)['http_status'] == 403
+            assert origin.encode() not in data
+        events = [event for event in list_events(db, limit=500)
+                  if event['event_type'] == 'tool.execution.completed']
+        assert len(events) == 2 and all(len(event['artifact_ids']) == 1 for event in events)
 
 
 def test_gateway_lineage_schema_upgrade_keeps_prior_records(tmp_path):

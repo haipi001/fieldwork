@@ -248,7 +248,8 @@ def finish_http_read(action_id: str, *, response: dict | None = None,
 
 
 def link_completed_reads_to_artifact(db: sqlite3.Connection, *, action_ids: list[str],
-                                     artifact_id: str, run_id: str) -> None:
+                                     artifact_id: str, run_id: str,
+                                     response: dict | None = None) -> None:
     """Bind completed gateway reads to an existing same-Run artifact in the caller's transaction."""
     if not action_ids or len(set(action_ids)) != len(action_ids):
         raise ValueError("read artifact lineage requires distinct actions")
@@ -256,11 +257,16 @@ def link_completed_reads_to_artifact(db: sqlite3.Connection, *, action_ids: list
     if not artifact or artifact["run_id"] != run_id:
         raise ValueError("read artifact does not belong to this Run")
     for action_id in action_ids:
-        execution = db.execute("""SELECT t.run_id,r.status FROM http_gateway_executions_v6 x
+        execution = db.execute("""SELECT t.run_id,r.status,r.http_status,r.body_sha256,r.body_bytes
+            FROM http_gateway_executions_v6 x
             JOIN agent_tasks t ON t.id=x.task_id
             JOIN http_gateway_receipts_v6 r ON r.action_id=x.action_id
             WHERE x.action_id=?""", (action_id,)).fetchone()
         if not execution or execution["run_id"] != run_id or execution["status"] != "completed":
             raise ValueError("read action is not a completed request from this Run")
+        if response is not None and (execution["http_status"] != response["status"]
+                                     or execution["body_sha256"] != response["body_sha256"]
+                                     or execution["body_bytes"] != response["body_bytes"]):
+            raise ValueError("read artifact response conflicts with its gateway receipt")
         db.execute("INSERT INTO runtime_artifact_links_v6 VALUES(?,?,?)",
                    (action_id, artifact_id, datetime.now(timezone.utc).isoformat()))

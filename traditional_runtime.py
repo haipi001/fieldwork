@@ -235,7 +235,9 @@ def _get_exchange(exchange_id: str) -> dict:
     return value
 
 
-def _record_exchange(run: dict, spec: ReplayRequest, result: dict, identity_id: str | None, source: str, parent_exchange_id: str | None = None) -> dict:
+def _record_exchange(run: dict, spec: ReplayRequest, result: dict, identity_id: str | None,
+                     source: str, parent_exchange_id: str | None = None,
+                     gateway_action_id: str | None = None) -> dict:
     import final_core
     if identity_id:
         identity = final_core.get_identity(identity_id)
@@ -244,14 +246,47 @@ def _record_exchange(run: dict, spec: ReplayRequest, result: dict, identity_id: 
         if identity["session_status"] != "ready":
             raise HTTPException(409, "测试身份会话未就绪，请先刷新登录态")
     exchange_id = final_core.uid("http")
-    with final_core.connect() as db:
-        db.execute("INSERT INTO http_exchanges VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-            exchange_id, run["id"], run["engagement_id"], identity_id,
-            spec.method.upper(), spec.url, final_core.dump(_safe_headers(spec.headers)),
-            redact(spec.body) if spec.body else None, int(result["status"]),
-            final_core.dump(result["headers"]), result["body_preview"], result["body_sha256"],
-            int(result["body_bytes"]), source, parent_exchange_id, final_core.utcnow(),
-        ))
+    artifact_path = None
+    artifact_bytes = None
+    artifact_id = None
+    if gateway_action_id:
+        artifact_id = final_core.uid("artifact")
+        artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
+        artifact_bytes = json.dumps({
+            "exchange_id": exchange_id, "http_status": int(result["status"]),
+            "body_sha256": result["body_sha256"], "body_bytes": int(result["body_bytes"]),
+        }, sort_keys=True, separators=(",", ":")).encode()
+    try:
+        if artifact_path is not None:
+            ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_bytes(artifact_bytes)
+        with final_core.connect() as db:
+            db.execute("INSERT INTO http_exchanges VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                exchange_id, run["id"], run["engagement_id"], identity_id,
+                spec.method.upper(), spec.url, final_core.dump(_safe_headers(spec.headers)),
+                redact(spec.body) if spec.body else None, int(result["status"]),
+                final_core.dump(result["headers"]), result["body_preview"], result["body_sha256"],
+                int(result["body_bytes"]), source, parent_exchange_id, final_core.utcnow(),
+            ))
+            if gateway_action_id:
+                db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
+                    artifact_id, run["id"], "http.exchange_metadata", str(artifact_path),
+                    hashlib.sha256(artifact_bytes).hexdigest(), "application/json", 1, final_core.utcnow(),
+                ))
+                observation_id = final_core.uid("obs")
+                db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                    observation_id, run["id"], run["engagement_id"], "traditional",
+                    "http.exchange", "GET HTTP resource",
+                    f"HTTP GET response status {int(result['status'])}; body bytes {int(result['body_bytes'])}",
+                    .5, "v6.run_http_read", artifact_id, final_core.utcnow(),
+                ))
+                from v6_http_gateway import link_completed_reads_to_artifact
+                link_completed_reads_to_artifact(db, action_ids=[gateway_action_id],
+                                                 artifact_id=artifact_id, run_id=run["id"], response=result)
+    except Exception:
+        if artifact_path is not None:
+            artifact_path.unlink(missing_ok=True)
+        raise
     return _get_exchange(exchange_id)
 
 
@@ -294,7 +329,8 @@ def _execute_exchange(run_id: str, body: ExchangeRequestInput, source: str, pare
             except ValueError:
                 pass
         raise
-    exchange = _record_exchange(run, spec, result, body.identity_id, source, parent_exchange_id)
+    exchange = _record_exchange(run, spec, result, body.identity_id, source, parent_exchange_id,
+                                gateway_action_id=action_id)
     if include_transient:
         exchange["_transient_body"] = result.get("_transient_body", "")
     final_core.add_event(run_id, "verification", "http.exchange_recorded", f"{method} {urlparse(body.url).path or '/'} → {result['status']}", {"exchange_id": exchange["id"], "source": source})

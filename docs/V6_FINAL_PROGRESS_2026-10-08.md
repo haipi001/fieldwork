@@ -131,6 +131,13 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 - An isolated schema 33 → 34 backup/upgrade retains historical Intent rows and adds an empty lineage table. Repository-wide regression: 870 passed, 4 skipped, 1 existing deprecation warning in 287.93 seconds; the revised migration case passed separately after the full run.
 - This is partial P0.7 coverage. Workbench and browser reads do not yet produce an Artifact chain; proof polarity and VerificationReceipt binding remain separate work. The main database, installed app and running service have not been upgraded to schema 34.
 
+### P0.7 Run HTTP exchange and guided page metadata lineage
+
+- Source is now 0.68.31 / build 109 / schema 34. Manual and replayed workbench GET, Campaign workflow/recovery GET and guided page GET now write a metadata-only `http.exchange_metadata` Artifact and an `http.exchange` Observation when their existing exchange is persisted. The same transaction links the completed V6 gateway action to the Artifact. The Artifact contains exchange ID, response status, response SHA256 and byte count; it does not copy request URL, headers, body preview or credentials. The link writer verifies the response metadata against the immutable gateway receipt.
+- Existing HTTP replay Artifact lineage remains distinct. Focused real-server and guided fixtures verify completed event → Artifact → Observation, file hashes and absence of the request origin in metadata. No Evidence polarity or finding is inferred from a page fetch or exchange alone.
+- Repository-wide regression after the core changes: 870 passed, 4 skipped, 1 existing deprecation warning in 316.60 seconds. A subsequent file-cleanup guard and rollback test passed with the focused workbench/guided checks (3 passed). The rollback fixture proves that a missing gateway action leaves no exchange, Artifact, Observation or orphan metadata file.
+- Native browser reads, other first-party Artifact producers, and VerificationReceipt binding remain P0.7/P0.8 work. Source changes have not been installed or checked against the running service.
+
 ## Next implementation order
 
 1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.

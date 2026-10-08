@@ -74,6 +74,8 @@ def transition_response(candidate_id: str, body: Transition):
         current = history[-1]['state'] if history else 'DETECTED'
         if current != body.expected_state or STATES.index(body.state) != STATES.index(current) + 1:
             raise HTTPException(409, 'Incident response state changed or transition is invalid')
+        if any(not _response_evidence_intact(db, event) for event in history):
+            raise HTTPException(409, 'Incident response history evidence is missing or changed')
         if body.state == 'CONTAINED' and not is_contained(db, incident['run_id']):
             raise HTTPException(409, 'Run has no effective V6 containment record')
         artifact = db.execute('SELECT uri,sha256 FROM artifacts WHERE id=? AND run_id=?',

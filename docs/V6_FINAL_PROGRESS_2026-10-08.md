@@ -269,3 +269,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.55 / build 133 / schema 39 enables previous/next pages of 50 materials, shows the current range and queried Run, and disables navigation while loading or at page boundaries. Navigation binds to the returned Run rather than unsubmitted form edits; a new submission starts at offset zero. Existing reset/read generation prevents stale async results.
 - Real Chrome isolated-API acceptance includes 52 same-Run materials, verifies 50/2 page counts and first/last button states, changes the Run input before paging to prove navigation stays on the queried Run, then returns to the first page. Existing tamper/missing Run/Incident/configuration/language/theme/narrow-screen checks remain covered. No installed app or main database changes; paged views reflect current data rather than a frozen multi-request snapshot. Full release gates remain open.
+
+### Incident transition history integrity gate
+
+- Source 0.68.56/build134/schema39 requires intact previously recorded response evidence before advancing operator response state. A new intact review cannot bypass a damaged history. Rejected transitions append no event and retain the current state.
+- Incident regression: 1 passed, covering distinct intact replacement review after historical material tamper, exact history count and state retention, followed by restoration and legitimate progression. Full release/containment recovery audit remains open.

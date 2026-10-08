@@ -1,4 +1,5 @@
 import sqlite3
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,18 @@ def test_response_state_requires_current_state_containment_and_intact_evidence(c
     assert changed['state'] == 'INVESTIGATING'
     assert changed['response_evidence_integrity'] == 'missing_or_changed'
     assert all(row['evidence_integrity'] == 'missing_or_changed' for row in changed['history'])
+    replacement = Path(incident['uri']).with_name('response-review.json')
+    replacement.write_text('{"review":"new intact evidence"}')
+    with core.connect() as db:
+        db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)',
+            ('new-review', incident['run_id'], 'incident.review', str(replacement),
+             hashlib.sha256(replacement.read_bytes()).hexdigest(), 'application/json', 1, core.utcnow()))
+    blocked = client.post(route, json=dict(expected_state='INVESTIGATING', state='REMEDIATING', artifact_id='new-review'))
+    assert blocked.status_code == 409
+    assert 'history evidence' in blocked.json()['detail']
+    assert client.get(route).json()['state'] == 'INVESTIGATING'
+    with core.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM incident_response_events_v6').fetchone()[0] == 3
     assert advance('INVESTIGATING', 'REMEDIATING').status_code == 409
     Path(incident['uri']).write_bytes(original)
     assert client.get(route).json()['response_evidence_integrity'] == 'intact'

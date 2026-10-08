@@ -177,6 +177,10 @@ def test_reviewed_live_replay_requires_authorization_and_preserves_unconfirmed_r
         assert len(responses) == 10
         assert all(response['process_execution']['file_read_denied'] for response in responses)
         assert len({response['process_execution']['child_pid'] for response in responses}) == 10
+    lineage = client.get(f'/api/v1/v6/runs/{run_id}/evidence-lineage').json()['items']
+    replay_lineage = next(item for item in lineage if item['kind'] == 'http.replay')
+    assert len(replay_lineage['runtime_event_ids']) == 10 and replay_lineage['observations']
+    assert replay_lineage['evidence'][0]['canonical_polarity'] == 'support'
 
 
 @pytest.mark.parametrize('change', ['shared', 'missing_rule', 'budget', 'stale_evidence', 'expired_identity', 'new_scope'])

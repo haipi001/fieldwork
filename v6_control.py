@@ -128,6 +128,46 @@ def runtime_summary():
                            'uses': db.execute('SELECT COUNT(*) FROM capability_uses_v6').fetchone()[0]}}
 
 
+@router.get('/runs/{run_id}/evidence-lineage')
+def evidence_lineage(run_id: str, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    with final_core.connect() as db:
+        db.execute('BEGIN')
+        if not db.execute('SELECT 1 FROM analysis_runs WHERE id=?', (run_id,)).fetchone():
+            raise HTTPException(404, 'Run not found')
+        rows = db.execute('SELECT * FROM artifacts WHERE run_id=? ORDER BY created_at DESC,id LIMIT ? OFFSET ?',
+                          (run_id, limit + 1, offset)).fetchall()
+        items = []
+        for artifact in rows[:limit]:
+            try:
+                intact = bool(artifact['sha256'] and hashlib.sha256(Path(artifact['uri']).read_bytes()).hexdigest() == artifact['sha256'])
+            except OSError:
+                intact = False
+            actions = [dict(row) for row in db.execute('SELECT x.action_id,x.task_id,x.runner_id,a.agent_id,a.principal_id '
+                'FROM runtime_artifact_links_v6 l JOIN http_gateway_executions_v6 x ON x.action_id=l.action_id '
+                'JOIN action_intents_v6 a ON a.id=x.intent_id JOIN agent_tasks t ON t.id=x.task_id '
+                'WHERE l.artifact_id=? AND t.run_id=? ORDER BY x.started_at,x.action_id', (artifact['id'], run_id))]
+            events = [f"v5:{row['id']}" for row in db.execute('SELECT e.id FROM v5_events e '
+                'JOIN runtime_artifact_links_v6 l ON l.action_id=e.entity_id '
+                'JOIN http_gateway_executions_v6 x ON x.action_id=l.action_id JOIN agent_tasks t ON t.id=x.task_id '
+                "WHERE l.artifact_id=? AND t.run_id=? AND e.event_type='tool.execution.completed' ORDER BY e.id", (artifact['id'], run_id))]
+            observations = [dict(row) for row in db.execute('SELECT id,observation_type,source_capability,created_at '
+                'FROM observations WHERE raw_ref=? AND run_id=? ORDER BY created_at,id', (artifact['id'], run_id))]
+            evidence = []
+            for row in db.execute('SELECT e.id,e.observation_id,e.evidence_type,e.polarity,e.created_at FROM evidence_v2 e '
+                'LEFT JOIN observations o ON o.id=e.observation_id AND o.run_id=e.run_id '
+                'WHERE e.run_id=? AND (e.artifact_id=? OR o.raw_ref=?) ORDER BY e.created_at,e.id',
+                (run_id, artifact['id'], artifact['id'])):
+                value = dict(row)
+                value['canonical_polarity'] = {'supporting':'support','counterevidence':'counter','context':'context',
+                    'support':'support','counter':'counter'}.get(row['polarity'])
+                evidence.append(value)
+            items.append({'artifact_id':artifact['id'],'kind':artifact['kind'],'sha256':artifact['sha256'],
+                'media_type':artifact['media_type'],'redacted':bool(artifact['redacted']),'created_at':artifact['created_at'],
+                'integrity': 'intact' if intact else 'missing_or_changed', 'actions':actions,
+                'runtime_event_ids':events,'observations':observations,'evidence':evidence})
+        return {'run_id':run_id,'items':items,'offset':offset,'has_more':len(rows)>limit}
+
+
 @router.get("/campaigns/{campaign_id}/runtime-events")
 def campaign_runtime_events(campaign_id: str, after_id: int = Query(0, ge=0),
                             limit: int = Query(100, ge=1, le=500)):

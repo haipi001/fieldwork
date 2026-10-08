@@ -261,6 +261,19 @@ def test_manual_exchange_and_replay_each_receive_read_receipt(client, object_ser
         events = [event for event in list_events(db, limit=500)
                   if event['event_type'] == 'tool.execution.completed']
         assert len(events) == 2 and all(len(event['artifact_ids']) == 1 for event in events)
+    lineage = client.get('/api/v1/v6/runs/native-discovery-run/evidence-lineage').json()['items']
+    assert len(lineage) == 2
+    assert all(item['integrity'] == 'intact' and len(item['runtime_event_ids']) == 1
+               and len(item['observations']) == 1 for item in lineage)
+    assert all('uri' not in item for item in lineage)
+    with final_core.connect() as db:
+        db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)', ('indirect-evidence',lineage[0]['observations'][0]['id'],
+            'native-discovery-run','fixture','Context only',None,'context',final_core.utcnow()))
+    indirect = client.get('/api/v1/v6/runs/native-discovery-run/evidence-lineage').json()['items']
+    assert any(e['id']=='indirect-evidence' and e['canonical_polarity']=='context' for item in indirect for e in item['evidence'])
+    Path(links[0]['uri']).write_text('{}')
+    changed = client.get('/api/v1/v6/runs/native-discovery-run/evidence-lineage').json()['items']
+    assert sum(item['integrity'] == 'missing_or_changed' for item in changed) == 1
 
 
 def test_gateway_lineage_schema_upgrade_keeps_prior_records(tmp_path):

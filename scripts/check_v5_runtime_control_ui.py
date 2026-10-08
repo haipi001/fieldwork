@@ -6,6 +6,7 @@ No cloud calls, background workers, or production data are used.
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import hashlib
 import os
 from pathlib import Path
 import secrets
@@ -249,6 +250,25 @@ def run():
                 page.wait_for_function("document.querySelector('#rcMessage').textContent.includes('503')")
                 flags["fail_config"]=False;page.locator("#rcRefresh").click()
                 page.wait_for_function("document.querySelector('#rcPolicyState').textContent.includes('Configuration revision: 2')")
+                from tests.test_v5_runtime_calls import task_route
+                from v5_runtime_calls import reserve_call, start_call, fail_call
+                assert client.put('/api/v1/runners/call-runner',json=dict(id='call-runner',name='Review fixture',kind='worker',
+                    labels={'location':'local'},capabilities=['structured_critic'],max_concurrency=1)).status_code==200
+                review_task,review_route=task_route(client,campaign['id'],saved['profiles'][0]['id'],'ui-review')
+                review_call=reserve_call(review_route['id'],review_task['id'],'call-runner',review_task['attempt'])
+                start_call(review_call['id']);fail_call(review_call['id'])
+                review_path=root/'usage-review.json'
+                review_path.write_text(json.dumps(dict(call_id=review_call['id'],decision_id=review_route['id'],
+                    provider_id=review_call['provider_id'],review_kind='operator_review',input_tokens=10,
+                    output_tokens=5,cost_micros=0,runtime_ms=50)))
+                with final_core.connect() as db:
+                    db.execute("UPDATE agent_tasks SET run_id='ui-eval-run',status='paused' WHERE id=?",(review_task['id'],))
+                    db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)',('ui-usage-review','ui-eval-run',
+                        'runtime.usage_review',str(review_path),hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                        'application/json',1,final_core.utcnow()))
+                reviewed=client.post(f"/api/v1/v6/model-calls/{review_call['id']}/reconcile",
+                    json=dict(artifact_id='ui-usage-review',confirmed=True))
+                assert reviewed.status_code==200,reviewed.text
                 page.reload()
                 page.wait_for_function("document.querySelectorAll('[data-rc-health]').length===1")
                 assert page.locator("#rcKey").input_value()==""
@@ -262,6 +282,17 @@ def run():
                 page.locator('#rcEvidenceRun').fill('ui-eval-run')
                 page.locator('#rcEvidenceRead').click()
                 page.wait_for_selector('[data-evidence-integrity="missing_or_changed"]')
+                page.locator('#rcReconciliations').locator('..').locator('summary').first.click()
+                page.wait_for_selector('[data-reconciliation-integrity="intact"]')
+                assert '10 / 5 tokens' in page.locator('#rcReconciliations').inner_text()
+                assert '50 ms' in page.locator('#rcReconciliations').inner_text()
+                review_path.write_text('{}');page.locator('#rcRefresh').click()
+                page.wait_for_selector('[data-reconciliation-integrity="missing_or_changed"]')
+                flags['fail_reviews']=True;page.locator('#rcRefresh').click()
+                page.wait_for_function("document.querySelector('#rcReconciliations').textContent.includes('503')")
+                assert page.locator('[data-reconciliation-integrity]').count()==0
+                flags['fail_reviews']=False;page.locator('#rcRefresh').click()
+                page.wait_for_selector('[data-reconciliation-integrity="missing_or_changed"]')
                 output=ROOT/"build/acceptance/v5-runtime-ui";output.mkdir(parents=True,exist_ok=True)
                 for language in ("en","zh-CN"):
                     page.set_viewport_size({"width":1440,"height":1000})

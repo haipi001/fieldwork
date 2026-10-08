@@ -172,3 +172,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
 2. P0.6: wire the existing read-only HTTP execution boundaries to these decisions. Preserve the current runtime budget ledger and domain guards.
 4. Continue through evidence, evals, packs, incident handling, and the measured V6.5 scale ladder in the source roadmap. Do not mark V6 complete before its release gates pass.
+
+### P0.9 deterministic regression comparison core
+
+- Source 0.68.37 / build 115 / schema 35 adds a pure comparison core for measured Eval metrics: false Verified, policy bypass, candidate precision, replay success, cost and evidence gain. Missing, negative, non-finite and invalid-rate measurements fail closed. False Verified and bypass always fail; baseline precision loss and cost growth without evidence gain are explicit gates, including zero-cost baselines.
+- Focused comparator tests: 8 passed. This does not execute fixtures or establish a release gate result. EvalScenario/EvalRun persistence, subject/version metadata, real result ingestion, API and seed regression scenarios remain required P0.9/P0.10 work. P0.8 other oracle identities also remain open.

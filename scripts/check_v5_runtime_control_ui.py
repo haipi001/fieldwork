@@ -76,6 +76,7 @@ def run():
                 if path=="/v5":route.fulfill(path=str(ROOT/"templates/v5.html"),content_type="text/html")
                 elif path.startswith("/static/"):route.fulfill(path=str(ROOT/path.lstrip("/")))
                 elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs", "/api/v1/v6/policy-decisions"} or path.startswith("/api/v1/orchestration/")
+                      or path.startswith('/api/v1/v6/runs/') and path.endswith('/evidence-lineage')
                       or path==f"/api/v1/engagements/{project['id']}/campaigns"
                       or path.startswith("/api/v1/continuous-research/")
                       or path.startswith("/api/v1/runtime/") and path!="/api/v1/runtime/readiness"):
@@ -107,9 +108,22 @@ def run():
                 assert 'outside-ui.example.test' in page.locator('#rcDecisions').inner_text()
                 page.locator('#rcEvals').locator('..').locator('summary').click()
                 page.wait_for_selector('[data-eval-status="passed"]')
+                page.locator('#rcEvidence').locator('..').locator('summary').first.click()
+                page.locator('#rcEvidenceRun').fill('ui-eval-run')
+                page.locator('#rcEvidenceRead').click()
+                page.wait_for_selector('[data-evidence-integrity="intact"]')
                 eval_path.write_text('{}')
                 page.locator('#rcRefresh').click()
                 page.wait_for_selector('[data-eval-status="invalid"]')
+                page.locator('#rcEvidenceRead').click()
+                page.wait_for_selector('[data-evidence-integrity="missing_or_changed"]')
+                page.locator('#rcEvidenceRun').fill('missing-run')
+                page.locator('#rcEvidenceRead').click()
+                page.wait_for_function("document.querySelector('#rcEvidence').textContent.includes('404')")
+                assert page.locator('[data-evidence-integrity]').count()==0
+                page.locator('#rcEvidenceRun').fill('ui-eval-run')
+                page.locator('#rcEvidenceRead').click()
+                page.wait_for_selector('[data-evidence-integrity="missing_or_changed"]')
                 flags['fail_summary']=True;page.locator('#rcRefresh').click()
                 page.wait_for_function("document.querySelector('#rcSummary').textContent.includes('503')")
                 assert page.locator('[data-summary-total]').count()==0

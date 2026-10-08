@@ -15,6 +15,7 @@
     let summary=null, summaryError="";
     let evalRuns=null, evalError="";
     let policyDecisions=null, policyError="";
+    let evidencePage=null, evidenceError="", evidenceGeneration=0;
     const panel = document.createElement("article");
     panel.id="runtimeControl"; panel.className="panel runtime-control";
     panel.innerHTML=`<header><h2>${copy("V5 模型配置与研究策略","V5 model configuration and research policy")}</h2>${button("rcRefresh","刷新配置","Refresh configuration")}</header>
@@ -23,6 +24,7 @@
       <section aria-labelledby="rcSummaryTitle"><h3 id="rcSummaryTitle">${copy("运行状态快照","Runtime state snapshot")}</h3><div id="rcSummary" aria-live="polite"></div></section>
       <details><summary>${copy("回归评估记录","Regression Eval records")}</summary><p>${copy("状态仅适用于记录的场景。材料完整性由后端在读取时核对。","Status applies to the recorded scenario. The backend checks material integrity on read.")}</p><div id="rcEvals" aria-live="polite"></div></details>
       <details><summary>${copy("策略判定记录","Policy decision records")}</summary><p>${copy("判定记录不代表操作已执行。","A decision record does not establish execution.")}</p><div id="rcDecisions" aria-live="polite"></div></details>
+      <details><summary>${copy("证据血缘","Evidence lineage")}</summary><form id="rcEvidenceForm" class="form-stack">${label("Run ID","Run ID",input("rcEvidenceRun","text","required maxlength=200 autocomplete=off"))}${button("rcEvidenceRead","读取血缘","Read lineage","submit")}</form><p>${copy("读取时核对材料哈希。确认发现需独立复验。","Material hashes are checked on read. Confirmed findings require independent verification.")}</p><div id="rcEvidence" aria-live="polite"></div></details>
       <details><summary>${copy("新增 V5 Provider","Add V5 provider")}</summary><form id="rcProviderForm" class="form-stack">
         <div class="form-pair">${label("名称","Name",input("rcProviderName","text","required maxlength=120 autocomplete=off"))}
           ${label("位置","Location",`<select id="rcLocation"><option value="local">Local</option><option value="cloud">Cloud</option></select>`)}</div>
@@ -83,7 +85,7 @@
     const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
     function localize() {
       panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
-      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();
+      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();renderEvidence();
     }
     async function send(url, body, method="POST") {
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
@@ -142,6 +144,20 @@
       if(token!==generation)return;
       calls=list(value);renderCalls();
     }
+    function renderEvidence() {
+      const host=$("#rcEvidence");
+      if(evidenceError){host.textContent=evidenceError;return}
+      if(!evidencePage){host.textContent=t("输入 Run ID 后读取材料。","Enter a Run ID to read materials.");return}
+      if(!evidencePage.items.length){host.textContent=t("该 Run 没有已记录的 Artifact。","This Run has no recorded Artifacts.");return}
+      host.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Artifact</th><th>${t("材料完整性","Material integrity")}</th><th>${t("事件 / Observation / Evidence","Events / observations / evidence")}</th></tr></thead><tbody>${evidencePage.items.map(item=>`<tr data-evidence-integrity="${esc(item.integrity)}"><td>${esc(item.kind)}<small class="cell-subline">${esc(item.artifact_id)}</small><small class="cell-subline">SHA256: ${esc(item.sha256||t("未记录","Not recorded"))}</small></td><td>${item.integrity==="intact"?t("完整","Intact"):t("缺失或已变化","Missing or changed")}</td><td>${item.runtime_event_ids.length} / ${item.observations.length} / ${item.evidence.length}<details><summary>${t("关联记录","Linked records")}</summary><pre>${esc(JSON.stringify({events:item.runtime_event_ids,observations:item.observations,evidence:item.evidence},null,2))}</pre></details></td></tr>`).join("")}</tbody></table></div>${evidencePage.has_more?`<p>${t("还有后续材料；当前显示首批 50 条。","More materials exist; showing the first 50 records.")}</p>`:""}`;
+    }
+    $("#rcEvidenceForm").onsubmit=async event=>{
+      event.preventDefault();const token=++evidenceGeneration,runId=$("#rcEvidenceRun").value.trim();
+      evidencePage=null;evidenceError=t("正在读取…","Reading…");renderEvidence();$("#rcEvidenceRead").disabled=true;
+      try{const value=await request(`/api/v1/v6/runs/${encodeURIComponent(runId)}/evidence-lineage?limit=50`);if(token!==evidenceGeneration)return;evidencePage=value;evidenceError=""}
+      catch(error){if(token!==evidenceGeneration)return;evidenceError=error.message}
+      finally{if(token===evidenceGeneration){$("#rcEvidenceRead").disabled=false;renderEvidence()}}
+    };
     function renderDecisions() {
       const host=$("#rcDecisions");
       if(policyError){host.textContent=policyError;return}
@@ -241,6 +257,6 @@
     }
     document.addEventListener("fieldwork:languagechange",localize);
     localize();
-    return {refresh,reset(){generation++;engagementId=campaignId="";policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true}};
+    return {refresh,reset(){generation++;evidenceGeneration++;evidencePage=null;evidenceError="";$("#rcEvidenceRun").value="";$("#rcEvidenceRead").disabled=false;renderEvidence();engagementId=campaignId="";policy=null;$("#rcPolicySave").disabled=$("#rcTick").disabled=true}};
   };
 })();

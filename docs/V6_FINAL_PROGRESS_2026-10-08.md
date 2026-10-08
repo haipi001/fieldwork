@@ -249,3 +249,8 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.51 / build 129 / schema 39 exposes paged same-Run Artifact lineage from existing tables: gateway actions/completed RuntimeEvent IDs, Observations and directly or indirectly associated Evidence. Stored evidence polarity is preserved with support/counter/context normalization where known. Current file hashes produce explicit integrity status; local storage paths and raw content are not returned.
 - Real workbench/replay and runtime-summary targeted tests: 3 passed; after indirect Evidence support and event ownership hardening, two real HTTP lineage tests passed again. Ten formal replay events reach the replay Artifact/Observation/support evidence, and metadata tamper is surfaced. This read contract does not create missing producer links, establish finding validity or finish P0.7 across all domains. UI and broader release acceptance remain open.
+
+### P1.8 Evidence lineage UI
+
+- Source 0.68.52 / build 130 / schema 39 adds a Run-scoped read form and material table in the runtime page. It displays Artifact kind/ID/hash/integrity plus recorded event/Observation/Evidence links, with explicit loading, empty and error states. Reset invalidates pending reads and clears prior Run results. The current UI shows the first 50 records and identifies additional pages.
+- Real Chrome acceptance verifies intact→changed material, missing Run clearing old rows, and Chinese/English dark/light 1440/680-width layout with the evidence table rendered. No page errors or model calls; JS syntax passed. Interactive pagination, Incident controls, complete producer lineage and release gates remain open; no main-data/installed-service changes were performed.

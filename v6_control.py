@@ -5,12 +5,40 @@ import json
 import hashlib
 from pathlib import Path
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
+from pydantic import BaseModel, ConfigDict
+from typing import Literal
 
 import final_core
 from v6_runtime_bridge import list_events, list_model_call_snapshots, list_runners
 
 router = APIRouter(prefix="/api/v1/v6", tags=["V6 Control Plane"])
+
+
+class ContainmentInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    reason_code: Literal['compromised', 'operator_containment']
+
+
+@router.post('/runs/{run_id}/contain')
+def contain_run(run_id: str, body: ContainmentInput):
+    from v6_intents import LOCAL_SESSION_PRINCIPAL
+    with final_core.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if not db.execute('SELECT 1 FROM analysis_runs WHERE id=?', (run_id,)).fetchone():
+            raise HTTPException(404, 'Run not found')
+        now = final_core.utcnow()
+        db.execute('INSERT OR IGNORE INTO run_containment_v6 VALUES(?,?,?,?)',
+                   (run_id, body.reason_code, LOCAL_SESSION_PRINCIPAL, now))
+        db.execute('INSERT OR IGNORE INTO capability_revocations_v6 '
+                   'SELECT id,?,?,? FROM capability_grants_v6 WHERE run_id=?',
+                   (LOCAL_SESSION_PRINCIPAL, now,
+                    'compromised' if body.reason_code == 'compromised' else 'operator_revoked', run_id))
+        return {'containment': dict(db.execute('SELECT * FROM run_containment_v6 WHERE run_id=?',
+                                               (run_id,)).fetchone()),
+                'boundary': 'subsequent_v6_authorized_operations',
+                'revoked_grants': db.execute('SELECT COUNT(*) FROM capability_revocations_v6 r '
+                    'JOIN capability_grants_v6 g ON g.id=r.grant_id WHERE g.run_id=?', (run_id,)).fetchone()[0]}
 
 
 @router.get('/packs')

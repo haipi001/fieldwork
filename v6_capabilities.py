@@ -53,6 +53,8 @@ def _resource_matches(pattern: str, resource: str) -> bool:
 
 
 def _intent_current(db: sqlite3.Connection, intent: sqlite3.Row) -> bool:
+    if db.execute('SELECT 1 FROM run_containment_v6 WHERE run_id=?', (intent['run_id'],)).fetchone():
+        return False
     row = db.execute("""
         SELECT t.status task_status,t.run_id,t.context_capsule_json,c.status campaign_status,
                e.status engagement_status,e.current_scope_snapshot_id,e.current_policy_id,

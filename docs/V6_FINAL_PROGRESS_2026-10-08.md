@@ -197,3 +197,9 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.41 / build 119 / schema 36 adds three versioned, hashed manifests referencing existing SRC, Web3 and Agent Audit adapters/verifiers and actual Artifact kinds. A read-only Pack endpoint exposes capabilities, roles, report/Eval mapping and explicit unsupported paths. All manifests state partial integration; empty domain Eval suites stay empty until real seeds exist. These declarations grant no execution authority.
 - Adapter existence and read-only/mutation-isolation checks with runtime-view regression: 6 passed. Domain convergence, complete capability boundaries, independent verification and Pack quality gates remain unfinished.
+
+### P1.6 V6 Run containment boundary
+
+- Source 0.68.42 / build 120 / schema 37 adds immutable operator containment for a Run and atomically revokes its existing Grants. Current-Intent checks reject subsequent V6-authorized operations after containment, including newly minted Grants. The endpoint reports its explicit boundary; it does not assert that legacy execution paths or already-started external requests were stopped. Repeated containment is idempotent.
+- Gateway/Capability/model regression suite: 21 passed, including real control API revocation and new browser-action denial. Incident state-machine linkage, recovery/unblock, legacy-path parity and in-flight cancellation remain required P1.6 work. No main-data containment or application upgrade was performed.
+- Repository regression: 889 passed, 3 skipped, one existing warning in 272.72 seconds. A subsequent revocation reason-label correction passed the containment case separately. Isolated 36 → 37 backup/upgrade preserved historical Eval scenarios and created an empty containment table.

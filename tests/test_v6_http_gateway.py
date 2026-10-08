@@ -170,6 +170,22 @@ def test_native_browser_gateway_denial_is_audited_without_start_or_grant_use(cli
         assert db.execute("SELECT status FROM agent_tasks").fetchone()[0] == "failed"
 
 
+def test_run_containment_revokes_grants_and_blocks_new_read_gateway(client):
+    engagement = prepare(client, "https://native-browser.example.test", None)
+    action = authorize_native_browser_read('native-discovery-run', engagement['id'],
+                                           'https://native-browser.example.test/')
+    finish_http_read(action, response={'status': 200, 'body_sha256': 'a' * 64, 'body_bytes': 1})
+    response = client.post('/api/v1/v6/runs/native-discovery-run/contain', json={'reason_code': 'compromised'})
+    assert response.status_code == 200 and response.json()['revoked_grants'] == 1
+    assert client.post('/api/v1/v6/runs/native-discovery-run/contain',
+                       json={'reason_code': 'compromised'}).json() == response.json()
+    with pytest.raises(ValueError, match='denied by V6 policy'):
+        authorize_native_browser_read('native-discovery-run', engagement['id'],
+                                      'https://native-browser.example.test/')
+    with final_core.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM http_gateway_executions_v6').fetchone()[0] == 1
+
+
 def test_body_bearing_get_is_rejected_before_budget_or_gateway(client):
     engagement = prepare(client, "https://native-browser.example.test", None)
     with pytest.raises(HTTPException, match="body-bearing GET"):

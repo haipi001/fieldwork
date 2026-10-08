@@ -188,3 +188,7 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 - Source 0.68.39 / build 117 / schema 36 executes twelve local Policy scenarios through the real deterministic evaluator: bounded read, identity/Scope/Grant/budget rejection, unknown and explicit legacy guards, credentials, production signing, control mutation, external writes and classifier quarantine. It stores actual decisions and measured mismatch/bypass counts in a hashed Artifact and immutable EvalRun with evaluator-code hash. A policy-specific gate checks only these measured invariants; it makes no claim about finding precision or false Verified.
 - Fixture writes use a savepoint and clean the Artifact on failure. Focused seed/comparison/storage tests: 10 passed. An injected allow-all evaluator is detected as a failed Eval, while the actual evaluator passes twelve decisions. SRC/Web3/Agent end-to-end seed sets, legitimate-negative coverage across domains and the full false_verified=0 release gate remain open. This source has not been installed or run against main data.
+
+### Eval read integrity
+
+- Source 0.68.40 / build 118 / schema 36 verifies current Artifact bytes/hash and scenario manifest digest when exposing EvalRun records. Missing or changed materials produce status `invalid`; the original measured result stays available for audit. Focused Eval storage/seed/runtime-view tests: 7 passed, including Artifact tamper changing the query status. No release or main-data validation is claimed.

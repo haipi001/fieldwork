@@ -46,6 +46,8 @@ def test_eval_records_bind_fixture_artifact_and_compare_baseline(client, tmp_pat
     assert client.get('/api/v1/v6/eval-scenarios').json()['scenarios'] == [manifest]
     assert client.post('/api/v1/v6/eval-runs', json={}).status_code == 405
     path.write_text('{}')
+    invalid = client.get('/api/v1/v6/eval-runs').json()['runs']
+    assert all(row['status'] == 'invalid' and row['integrity']['artifact'] is False for row in invalid)
     with core.connect() as db, pytest.raises(ValueError, match='changed'):
         record_eval_run(db, scenario_id='local-safety', scenario_version='1', run_id='eval-fixture-run',
                         artifact_id='eval-artifact', subject=subject, metrics=metrics)

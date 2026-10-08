@@ -164,6 +164,11 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 - Real HTTP positive/control/fix and V5 receipt regression suite: 29 passed. Independent verifier identity/context across all producer types remains open; this is not complete P0.8. Main database, installation and service state were not upgraded.
 - Repository-wide regression: 877 passed, 3 skipped, one existing deprecation warning in 274.66 seconds.
 
+### P0.8 V5 HTTP independent verifier identity/context snapshot
+
+- Source 0.68.36 / build 114 / schema 35 binds the existing independent HTTP verifier's receipt digest, actual verifier/Runner IDs, request/task IDs and context digest into success and fixed receipt payloads. Context covers the stored environment, input hashes and replay contract. Stored receipt validation rechecks that snapshot through the existing V5 receipt integrity validator. No verifier identity is invented for paths lacking a V5 independent receipt.
+- Real HTTP positive/control/fix, business-boundary and V5 receipt suite: 44 passed in 123.78 seconds. Other oracle paths and complete P0.8 acceptance remain open; this source has not been installed or validated against the running service.
+
 1. Finish P0.2–P0.5 across the remaining first-party paths: capture intents, bind trusted Worker identity, feed actual guards and budgets into policy, consume Grants, and record immutable execution lineage. Historical tasks with null `run_id` remain on the legacy path until an explicit migration rule exists.
 2. P0.6: wire the existing read-only HTTP execution boundaries to these decisions. Preserve the current runtime budget ledger and domain guards.
 4. Continue through evidence, evals, packs, incident handling, and the measured V6.5 scale ladder in the source roadmap. Do not mark V6 complete before its release gates pass.

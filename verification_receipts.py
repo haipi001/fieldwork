@@ -39,6 +39,17 @@ def _evidence_binding(db, candidate):
     return result
 
 
+def _verifier_binding(db, receipt_id):
+    from v5_verification import _validated_receipt
+    row, payload, binding = _validated_receipt(db, receipt_id)
+    return {'receipt_id': receipt_id, 'receipt_sha256': row['receipt_sha256'],
+            'verifier_id': row['verifier_id'], 'runner_id': row['runner_ref'],
+            'request_id': binding['request_id'], 'task_id': binding['verifier_task_id'],
+            'context_sha256': _digest({'environment': payload['environment'],
+                                      'input_hashes': payload['input_hashes'],
+                                      'replay_contract': payload['replay_contract']})}
+
+
 def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
     """Called only after a registered runtime has executed and persisted its proof."""
     import final_core as core
@@ -92,6 +103,7 @@ def issue_receipt(candidate_id, proof, *, v5_receipt_id=None):
         }
         if v5_receipt_id:
             payload['v5_verification_receipt_id'] = v5_receipt_id
+            payload['independent_verifier'] = _verifier_binding(db, v5_receipt_id)
         db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (
             receipt_id, candidate_id, proof.oracle, 'machine_receipt', proof.attempts,
             core.dump(payload), core.utcnow(), core.utcnow()))
@@ -111,6 +123,9 @@ def validate_stored_binding(db, receipt, run_id):
             or binding['receipt_sha256'] != _digest({'candidate_id': receipt['candidate_id'],
                 'oracle': receipt['oracle'], 'attempts': receipt['attempts'], 'payload': payload})):
         raise HTTPException(409, '复验收据缺少不可变绑定或内容已变化，请重新复验')
+    if payload.get('v5_verification_receipt_id') and payload.get('independent_verifier') != _verifier_binding(
+            db, payload['v5_verification_receipt_id']):
+        raise HTTPException(409, '独立验证者身份或上下文绑定已变化，请重新复验')
     return payload
 
 
@@ -241,6 +256,7 @@ def issue_fixed_receipt(candidate_id, oracle, artifact_id, repair_checks, *, v5_
         }
         if v5_receipt_id:
             payload['v5_verification_receipt_id'] = v5_receipt_id
+            payload['independent_verifier'] = _verifier_binding(db, v5_receipt_id)
         db.execute('INSERT INTO verification_attempts VALUES(?,?,?,?,?,?,?,?)', (
             receipt_id, candidate_id, oracle, 'machine_negative_receipt', len(repair_checks),
             core.dump(payload), timestamp, timestamp,

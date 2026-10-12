@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-V6_SCHEMA_VERSION = 12
+V6_SCHEMA_VERSION = 13
 V6_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS v6_schema_meta(
          key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)""",
@@ -93,6 +93,11 @@ V6_SCHEMA_STATEMENTS = (
          call_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,run_id TEXT NOT NULL,
          artifact_id TEXT NOT NULL,artifact_sha256 TEXT NOT NULL,usage_id INTEGER NOT NULL,
          review_kind TEXT NOT NULL,principal_id TEXT NOT NULL,created_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS capability_approvals_v6(
+         id TEXT PRIMARY KEY,grant_id TEXT NOT NULL UNIQUE,intent_id TEXT NOT NULL,
+         principal_id TEXT NOT NULL,decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+         preview_sha256 TEXT NOT NULL,grant_sha256 TEXT NOT NULL,intent_sha256 TEXT NOT NULL,
+         reason TEXT NOT NULL,created_at TEXT NOT NULL)""",
     *(
         f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation}
              BEFORE {operation.upper()} ON {table}
@@ -103,7 +108,7 @@ V6_SCHEMA_STATEMENTS = (
                       "runtime_artifact_links_v6", "verification_receipt_bindings_v6",
                       "eval_scenarios_v6", "eval_runs_v6", "run_containment_v6",
                       "incident_response_events_v6", "run_containment_events_v6",
-                      "model_usage_reconciliations_v6")
+                      "model_usage_reconciliations_v6", "capability_approvals_v6")
         for operation in ("update", "delete")
     ),
 )

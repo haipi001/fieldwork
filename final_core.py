@@ -23,6 +23,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from storage_paths import data_directory
 from typing import Any, Literal
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -30,14 +31,15 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, StreamingResponse
 from reporting import export_bundle, redact, redact_structure, render, universal_model
+from report_options import ReportOptions, present as present_report
 from capability_registry import inventory as capability_inventory
 from lifecycle import database_integrity, list_backups
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 
 
 ROOT = Path(__file__).resolve().parent
-DB = ROOT / "data" / "src_control.db"
-LOCAL_DATA_ROOT = ROOT / "data"
+LOCAL_DATA_ROOT = data_directory()
+DB = LOCAL_DATA_ROOT / "src_control.db"
 router = APIRouter(prefix="/api/v1", tags=["FINAL v1"])
 CAMPAIGN_SCHEDULER_STATE: dict[str, Any] = {
     "running": False, "last_tick_at": None, "last_processed": 0, "last_error": None,
@@ -2994,13 +2996,15 @@ def build_proof_attachments(finding, evidence, scope_id):
 
 
 @router.post("/findings/{finding_id}/reports/{platform}/preview")
-def preview_report(finding_id: str, platform: str):
+def preview_report(finding_id: str, platform: str, body: ReportOptions | None = None):
+    body = body or ReportOptions()
     finding, evidence, scope_id = finding_report_inputs(finding_id)
     model = universal_model(finding, evidence, scope_id)
     try:
         content, check, config = render(model, platform)
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
+    model, content, check = present_report(model, content, check, body)
     preview_id = uid("preview")
     with connect() as db:
         db.execute("INSERT INTO report_previews VALUES(?,?,?,?,?,?,?)", (preview_id, finding_id, platform, "1.0.0", dump(check), content, utcnow()))
@@ -3008,15 +3012,18 @@ def preview_report(finding_id: str, platform: str):
 
 
 @router.post("/findings/{finding_id}/reports/{platform}/export", status_code=202)
-def export_report(finding_id: str, platform: str):
+def export_report(finding_id: str, platform: str, body: ReportOptions | None = None):
+    body = body or ReportOptions()
     finding, evidence, scope_id = finding_report_inputs(finding_id)
     model = universal_model(finding, evidence, scope_id)
     try:
         content, check, _ = render(model, platform)
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
+    model, content, check = present_report(model, content, check, body)
     package_id = uid("submission")
-    attachments = build_proof_attachments(finding, evidence, scope_id)
+    attachments = build_proof_attachments(finding, evidence, scope_id) if body.redaction == "standard" else {}
+    attachments["report-options.json"] = body.model_dump()
     path, manifest = export_bundle(package_id, model, platform, content, check, attachments)
     with connect() as db:
         db.execute("INSERT INTO submission_packages_v2 VALUES(?,?,?,?,?,?,?,?)", (

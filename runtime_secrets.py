@@ -10,6 +10,7 @@ import re
 import stat
 import uuid
 from pathlib import Path
+from storage_paths import data_directory
 
 
 REFERENCE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
@@ -17,7 +18,7 @@ MAX_SECRET_BYTES = 16_384
 
 
 def secret_root() -> Path:
-    return Path(__file__).resolve().parent / "data" / "runtime-secrets"
+    return data_directory() / "runtime-secrets"
 
 
 def _path(reference: str) -> Path:

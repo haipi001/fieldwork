@@ -363,13 +363,13 @@ class LeaseRequest(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     runner_id: str = Field(min_length=1, max_length=200)
-    lease_attempt: int | None = Field(default=None, ge=1)
+    lease_attempt: int | None = Field(default=None, ge=1, strict=True)
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
 class CheckpointRequest(BaseModel):
     runner_id: str = Field(min_length=1, max_length=200)
-    lease_attempt: int | None = Field(default=None, ge=1)
+    lease_attempt: int | None = Field(default=None, ge=1, strict=True)
     checkpoint: dict[str, Any]
 
 
@@ -382,7 +382,7 @@ class Usage(BaseModel):
 
 class CompletionRequest(BaseModel):
     runner_id: str = Field(min_length=1, max_length=200)
-    lease_attempt: int | None = Field(default=None, ge=1)
+    lease_attempt: int | None = Field(default=None, ge=1, strict=True)
     outcome: Literal["succeeded", "failed"]
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None

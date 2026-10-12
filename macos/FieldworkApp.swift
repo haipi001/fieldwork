@@ -2,12 +2,35 @@ import Cocoa
 import Security
 import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
-    private enum ServerProbe: Equatable { case ready, absent, foreign }
+// STARTUP_RECOVERY_POLICY_BEGIN
+struct StartupRecovery {
+    enum Probe { case ready, absent, foreign }
+    enum Action { case load, rejectForeign, start, poll, wait, stopped }
+    private(set) var generation = 0
+    mutating func begin() -> Int { generation += 1; return generation }
+    mutating func cancel() { generation += 1 }
+    func accepts(_ value: Int) -> Bool { generation == value }
+    func action(probe: Probe, attempt: Int, ownedProcessAlive: Bool?) -> Action {
+        switch probe {
+        case .ready: return .load
+        case .foreign: return .rejectForeign
+        case .absent:
+            guard let alive = ownedProcessAlive else { return attempt == 0 ? .start : .stopped }
+            guard alive else { return .stopped }
+            return attempt < 60 ? .poll : .wait
+        }
+    }
+}
+// STARTUP_RECOVERY_POLICY_END
+
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+    private typealias ServerProbe = StartupRecovery.Probe
+    private var startupRecovery = StartupRecovery()
     private var window: NSWindow!
     private var webView: WKWebView!
     private var serverProcess: Process?
     private var serverLifetime: Pipe?
+    private var startupRetryAllowed = false
     private let projectRoot = Bundle.main.object(forInfoDictionaryKey: "FieldworkProjectRoot") as? String ?? ""
     private let python = Bundle.main.object(forInfoDictionaryKey: "FieldworkPythonExecutable") as? String ?? ""
     private let serverPort = (Bundle.main.object(forInfoDictionaryKey: "FieldworkPort") as? NSNumber)?.intValue ?? 8000
@@ -58,9 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             showError("构建包的本地启动配置无效，请重新构建 Fieldwork。")
             return
         }
-        installSessionCookie {
-            self.ensureServerThenLoad(attempt: 0)
-        }
+        beginStartup()
     }
 
     private func installMainMenu() {
@@ -92,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func showStartingPage() {
+        startupRetryAllowed = false
         let html = """
         <html><body style="margin:0;background:#f3f1e7;color:#171815;font-family:-apple-system;display:grid;place-items:center;height:100vh">
         <div style="text-align:center"><div style="font-size:58px">⌕</div><h2>Fieldwork 正在启动</h2><p style="color:#74746d">正在连接本地安全研究服务…</p></div>
@@ -138,9 +160,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = ["-m", "desktop_server", "--port", String(serverPort)]
-        process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
+        process.arguments = ["-P", "-m", "desktop_server", "--port", String(serverPort)]
+        // Resolve modules explicitly; Python must not probe a Documents cwd at startup.
+        process.currentDirectoryURL = URL(fileURLWithPath: "/")
         var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONPATH"] = projectRoot
         environment["FIELDWORK_SESSION_TOKEN"] = sessionToken
         environment["FIELDWORK_DESKTOP_INSTANCE"] = desktopInstance
         environment["FIELDWORK_PORT"] = String(serverPort)
@@ -156,37 +180,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             serverLifetime = lifetime
             lifetime.fileHandleForReading.closeFile()
         } catch {
-            showError("无法启动本地服务：\(error.localizedDescription)")
+            showError("无法启动本地服务：\(error.localizedDescription)", retryable: true)
         }
     }
 
-    private func ensureServerThenLoad(attempt: Int) {
+    private func beginStartup() {
+        let generation = startupRecovery.begin()
+        installSessionCookie { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, self.startupRecovery.accepts(generation) else { return }
+                self.ensureServerThenLoad(attempt: 0, generation: generation)
+            }
+        }
+    }
+
+    private func ensureServerThenLoad(attempt: Int, generation: Int) {
+        guard startupRecovery.accepts(generation) else { return }
         serverIsReady { [weak self] probe in
             guard let self else { return }
             DispatchQueue.main.async {
-                if probe == .ready {
+                guard self.startupRecovery.accepts(generation) else { return }
+                let action = self.startupRecovery.action(probe: probe, attempt: attempt,
+                                                       ownedProcessAlive: self.serverProcess?.isRunning)
+                switch action {
+                case .load:
+                    self.startupRecovery.cancel()
+                    self.startupRetryAllowed = false
                     self.webView.load(URLRequest(url: self.appURL))
                     return
-                }
-                if probe == .foreign {
-                    self.showError("端口 \(self.serverPort) 已被其他或旧版服务占用。为保护本机会话，Fieldwork 不会连接该服务。")
+                case .rejectForeign:
+                    self.startupRecovery.cancel()
+                    self.showError("端口 \(self.serverPort) 已被其他或旧版服务占用。为保护本机会话，Fieldwork 不会连接该服务。", retryable: true)
                     return
-                }
-                if attempt == 0 { self.startServer() }
-                guard attempt < 60 else {
-                    self.showError("本地服务启动超时，请查看 logs/fieldwork-app.log")
+                case .stopped:
+                    self.startupRecovery.cancel()
+                    self.showError("本地服务已停止，请查看 logs/fieldwork-app.log 后重试连接。", retryable: true)
                     return
+                case .start:
+                    self.startServer()
+                    guard self.serverProcess != nil else { return }
+                case .wait:
+                    if attempt == 60 { self.showWaitingPage() }
+                case .poll: break
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.ensureServerThenLoad(attempt: attempt + 1)
+                let delay = action == .wait ? 5.0 : 0.5
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    self.ensureServerThenLoad(attempt: attempt + 1, generation: generation)
                 }
             }
         }
     }
 
-    private func showError(_ message: String) {
+    private func showWaitingPage() {
+        startupRetryAllowed = true
+        webView.loadHTMLString("<body style='font-family:-apple-system;padding:48px;background:#f3f1e7'><h2>Fieldwork 仍在启动</h2><p>后台进程仍在运行，正在等待本地服务就绪。就绪后会自动打开工作台；可查看 logs/fieldwork-app.log。</p><p><a href='fieldwork-startup://retry'>立即检查连接</a></p></body>", baseURL: nil)
+    }
+
+    private func showError(_ message: String, retryable: Bool = false) {
+        startupRetryAllowed = retryable
         let safe = message.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
-        webView.loadHTMLString("<body style='font-family:-apple-system;padding:48px;background:#f3f1e7'><h2>Fieldwork 启动失败</h2><p>\(safe)</p></body>", baseURL: nil)
+        let retry = retryable ? "<p><a href='fieldwork-startup://retry' style='display:inline-block;padding:12px 20px;background:#171815;color:white;border-radius:6px;text-decoration:none'>重试连接</a></p>" : ""
+        webView.loadHTMLString("<body style='font-family:-apple-system;padding:48px;background:#f3f1e7'><h2>Fieldwork 启动失败</h2><p>\(safe)</p>\(retry)</body>", baseURL: nil)
+    }
+
+    private func retryStartup() {
+        guard startupRetryAllowed else { return }
+        showStartingPage()
+        // Keep the live owned process. A timeout does not prove it has stopped.
+        if let process = serverProcess, !process.isRunning {
+            serverLifetime?.fileHandleForWriting.closeFile()
+            serverLifetime = nil
+            serverProcess = nil
+        }
+        beginStartup()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -197,6 +263,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             decisionHandler(.cancel)
             return
         }
+        let localSource = navigationAction.sourceFrame.request.url.map {
+            $0.scheme == "http" && $0.host == "127.0.0.1" && $0.port == serverPort
+        } ?? false
+        if navigationAction.shouldPerformDownload && localSource &&
+            (url.scheme == "blob" || (url.scheme == "http" && url.host == "127.0.0.1" && url.port == serverPort)) {
+            decisionHandler(.download)
+            return
+        }
+        if url.scheme == "fieldwork-startup" {
+            decisionHandler(.cancel)
+            if url.host == "retry", navigationAction.navigationType == .linkActivated,
+               navigationAction.sourceFrame.isMainFrame,
+               navigationAction.sourceFrame.request.url?.scheme == "about",
+               navigationAction.targetFrame?.isMainFrame == true, startupRetryAllowed {
+                retryStartup()
+            }
+            return
+        }
         if url.scheme == "about" || (url.scheme == "http" && url.host == "127.0.0.1" && url.port == serverPort) {
             decisionHandler(.allow)
             return
@@ -205,6 +289,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             NSWorkspace.shared.open(url)
         }
         decisionHandler(.cancel)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if let response = navigationResponse.response as? HTTPURLResponse,
+           response.url?.host == "127.0.0.1", response.url?.port == serverPort,
+           response.value(forHTTPHeaderField: "Content-Disposition")?.lowercased().hasPrefix("attachment") == true {
+            decisionHandler(.download)
+        } else {
+            decisionHandler(.allow)
+        }
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
+                  suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = (suggestedFilename as NSString).lastPathComponent
+        panel.beginSheetModal(for: window) { result in
+            completionHandler(result == .OK ? panel.url : nil)
+        }
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
@@ -246,6 +358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        startupRecovery.cancel()
         serverLifetime?.fileHandleForWriting.closeFile()
         if let process = serverProcess, process.isRunning {
             process.terminate()

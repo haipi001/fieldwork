@@ -1,12 +1,13 @@
 """Explicit, bounded team analysis of recorded graph inputs; outputs remain research drafts."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta, timezone
 import ipaddress
 import threading
 import time
 import uuid
+from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException
@@ -23,6 +24,48 @@ RUNNER_ID = f'builtin-research-{uuid.uuid4().hex[:12]}'
 _jobs: dict[str, threading.Thread] = {}
 _lock = threading.Lock()
 _stopping = threading.Event()
+
+
+ADMISSION_KEY = 'research_executor_admission'
+
+
+def _admission(db):
+    row = db.execute('SELECT value,updated_at FROM app_metadata WHERE key=?', (ADMISSION_KEY,)).fetchone()
+    value = w._load(row['value'], {}) if row else {}
+    state = value.get('state', 'accepting' if row is None else 'draining')
+    return {'state': 'accepting' if state == 'accepting' else 'draining',
+            'updated_at': row['updated_at'] if row else ''}
+
+
+class AdmissionInput(w.StrictModel):
+    state: Literal['accepting', 'draining']
+    expected_updated_at: str = Field(max_length=100)
+
+
+@router.get('/admission')
+def research_admission():
+    with _lock:
+        groups = sum(job.is_alive() for job in _jobs.values())
+    with w._core().connect() as db:
+        value = _admission(db)
+        active = db.execute("SELECT COUNT(*) FROM agent_tasks WHERE lease_owner=? AND status IN ('leased','running')", (RUNNER_ID,)).fetchone()[0]
+    return {**value, 'runner_id': RUNNER_ID, 'active_groups': groups, 'active_tasks': active,
+            'process_stopping': _stopping.is_set(), 'scope': 'builtin_research_worker',
+            'automatic_start_on_resume': False}
+
+
+@router.patch('/admission')
+def set_research_admission(body: AdmissionInput):
+    with w._core().connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = _admission(db)
+        if body.expected_updated_at != current['updated_at']:
+            raise HTTPException(409, 'Research executor state changed; refresh first')
+        now = w._now()
+        db.execute('INSERT INTO app_metadata VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at',
+                   (ADMISSION_KEY, w._dump({'state':body.state}), now))
+        r._emit(db, RUNNER_ID, 'research_executor.admission_changed', {'state':body.state})
+    return research_admission()
 
 
 class Hypothesis(w.StrictModel):
@@ -98,6 +141,8 @@ def _claim(group_id):
         return None
     with w._core().connect() as db:
         db.execute('BEGIN IMMEDIATE')
+        if _admission(db)['state'] != 'accepting':
+            return None
         group = db.execute("SELECT * FROM research_groups WHERE id=? AND status='active'", (group_id,)).fetchone()
         if not group:
             return None
@@ -259,16 +304,25 @@ def _run_group(group_id, concurrency):
     marker = f'research-execution:{group_id}'
     error_type = None
     try:
-        def consume():
+        # Claims use the persistent concurrency gate. Poll while work is in flight so
+        # a changed limit or newly added member takes effect without restarting.
+        pending = set()
+        with ThreadPoolExecutor(max_workers=32) as executor:
             while True:
-                if _stopping.is_set():
-                    return
-                task = _claim(group_id)
-                if not task:
-                    return
-                _execute(task)
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            list(executor.map(lambda _: consume(), range(concurrency)))
+                if not _stopping.is_set():
+                    with w._core().connect() as db:
+                        row = db.execute('SELECT budget_json,status FROM research_groups WHERE id=?', (group_id,)).fetchone()
+                    limit = min(32, max(1, w._load(row['budget_json'], {}).get('max_concurrency', concurrency))) if row and row['status']=='active' else 0
+                    while len(pending) < limit:
+                        task = _claim(group_id)
+                        if not task:
+                            break
+                        pending.add(executor.submit(_execute, task))
+                if not pending:
+                    break
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()
     except Exception as error:
         error_type = type(error).__name__
     finally:
@@ -293,6 +347,8 @@ def start_group_research(group_id: str):
             return {'status': 'already_running', 'group_id': group_id}
         with w._core().connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            if _admission(db)['state'] != 'accepting':
+                raise HTTPException(409, 'Research executor is not accepting new work')
             recover_calls(db)
             group = db.execute('SELECT * FROM research_groups WHERE id=?', (group_id,)).fetchone()
             if not group or group['status'] != 'active' or group['strategy'] != 'bounded_research':

@@ -90,6 +90,6 @@
       if(Object.hasOwn(data,'execution_job')){job=data.execution_job;jobError='';schedulePoll();}
     }catch(_){if(token===epoch)error=true;}finally{clearTimeout(timer);if(token===epoch){busy=false;render();}}
   }
-  window.FieldworkCandidateWorkflow={update(next){runs=next||[];if(selected&&!runs.some(r=>r.id===selected)){epoch++;selected='';items=[];cursor=null;loaded=false;error=false;busy=false;}render();}};
+  window.FieldworkCandidateWorkflow={reviewCandidate:review,update(next){runs=next||[];if(selected&&!runs.some(r=>r.id===selected)){epoch++;selected='';items=[];cursor=null;loaded=false;error=false;busy=false;}render();}};
   document.addEventListener('fieldwork:languagechange',()=>{render();if(dialog.open)renderDialog();});render();
 })();

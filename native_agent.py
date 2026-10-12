@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from storage_paths import data_directory
 from typing import Any
 from urllib.parse import urljoin
 
@@ -12,7 +13,7 @@ from reporting import redact
 
 
 ROOT = Path(__file__).resolve().parent
-WORKSPACE_ROOT = ROOT / "data" / "agent_workspaces"
+WORKSPACE_ROOT = data_directory() / "agent_workspaces"
 CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 MAX_PAGE_TEXT = 12_000
 

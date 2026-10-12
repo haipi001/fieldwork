@@ -110,3 +110,43 @@ def test_desktop_backend_rejects_missing_parent_binding():
                             input='', capture_output=True, text=True, env=environment, timeout=5)
     assert result.returncode != 0
     assert 'requires its parent lifetime pipe' in result.stderr
+
+
+def test_safe_path_owned_launcher_uses_explicit_source_and_storage(tmp_path):
+    """Exercise the native launch arguments from /, with no cwd import search."""
+    root=Path(__file__).resolve().parents[1]
+    directory=tmp_path.resolve()/'data';directory.mkdir(mode=0o700)
+    with socket.socket() as reservation:
+        reservation.bind(('127.0.0.1',0));port=reservation.getsockname()[1]
+    token,instance=secrets.token_urlsafe(48),secrets.token_urlsafe(24)
+    environment=dict(os.environ,PYTHONPATH=str(root),FIELDWORK_DATA_DIRECTORY=str(directory),
+                     FIELDWORK_DESKTOP_PARENT_PID=str(os.getpid()),FIELDWORK_PORT=str(port),
+                     FIELDWORK_SESSION_TOKEN=token,FIELDWORK_DESKTOP_INSTANCE=instance,
+                     FIELDWORK_DISABLE_AGENT_MONITOR='1',FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER='1')
+    environment.pop('PYTEST_CURRENT_TEST',None)
+    environment.pop('SRC_ENABLE_SYNTHETIC_DEMO',None)
+    process=subprocess.Popen([sys.executable,'-P','-m','desktop_server','--port',str(port)],cwd='/',
+                             env=environment,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        base=f'http://127.0.0.1:{port}';deadline=time.monotonic()+15
+        while True:
+            assert process.poll() is None,'Owned backend exited before ready'
+            try:
+                status,headers,_=request(base,'/health')
+                if status==200:break
+            except OSError:pass
+            assert time.monotonic()<deadline,'Owned backend startup timed out'
+            time.sleep(.05)
+        assert headers['X-Fieldwork-Instance']==instance
+        assert headers['X-Fieldwork-Version']==__import__('version').APP_VERSION
+        assert request(base,'/api/v1/workspace/maintenance')[0]==401
+        status,_,payload=request(base,'/api/v1/workspace/maintenance',token)
+        assert status==200 and json.loads(payload)['data_directory']==str(directory)
+        assert request(base,'/health',extra={'Host':'external.example.test'})[0]==403
+        process.stdin.close()
+        assert process.wait(timeout=10)==0
+    finally:
+        if process.poll() is None:
+            process.stdin.close() if not process.stdin.closed else None
+            try:process.wait(timeout=10)
+            except subprocess.TimeoutExpired:process.kill();process.wait(timeout=5)

@@ -116,7 +116,9 @@ def test_desktop_contract_keeps_session_out_of_url_javascript_and_argv():
     assert '.name: "fieldwork_session"' in source
     assert '.init(rawValue: "HttpOnly"): "TRUE"' in source
     assert 'X-Fieldwork-Instance' in source and 'X-Fieldwork-Version' in source
-    assert 'process.arguments = ["-m", "desktop_server"' in source
+    assert 'process.arguments = ["-P", "-m", "desktop_server"' in source
+    assert 'environment["PYTHONPATH"] = projectRoot' in source
+    assert 'process.currentDirectoryURL = URL(fileURLWithPath: "/")' in source
     assert 'process.standardInput = lifetime' in source
     assert 'environment["FIELDWORK_DESKTOP_PARENT_PID"]' in source
     arguments = source.split('process.arguments = ', 1)[1].split('\n', 1)[0]

@@ -8,6 +8,7 @@ import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
+from storage_paths import data_directory
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,7 +21,7 @@ from capability_registry import execute
 
 
 router = APIRouter(prefix="/api/v1/web3", tags=["Web3 analysis"])
-ARTIFACT_ROOT = Path(__file__).resolve().parent / "data" / "artifacts"
+ARTIFACT_ROOT = data_directory() / "artifacts"
 CONTRACT_RE = re.compile(r"\b(?:abstract\s+)?contract\s+(\w+)(?:\s+is\s+([^\{]+))?")
 FUNCTION_RE = re.compile(
     r"\bfunction\s+(\w+)\s*\(([^)]*)\)\s*([^\{;]*)(?:\{|;)", re.MULTILINE,

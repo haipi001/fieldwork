@@ -33,6 +33,7 @@ class PolicyFacts:
     risk_hint: float | None = None
     classifier_risk: float | None = None
     bounded: bool = True
+    human_approved: bool = False
 
 
 def evaluate_policy(facts: PolicyFacts) -> tuple[str, list[str]]:
@@ -59,9 +60,9 @@ def evaluate_policy(facts: PolicyFacts) -> tuple[str, list[str]]:
     risk = max(scores, default=0)
     if risk >= 80:
         return "quarantine", ["risk.quarantine"]
-    if facts.side_effect and facts.external:
+    if facts.side_effect and facts.external and not facts.human_approved:
         return "require_approval", ["external.state_change"]
-    if risk >= 50:
+    if risk >= 50 and not facts.human_approved:
         return "require_approval", ["risk.approval"]
     return ("allow_with_limit", ["bounded.allow"]) if facts.bounded else ("allow", ["safe.allow"])
 
@@ -88,6 +89,13 @@ def record_policy_decision(db: sqlite3.Connection, *, intent_id: str, grant_id: 
     eligible = False
     if grant_id:
         eligible, _ = capability_matches(db, intent_id, grant_id, principal_id=principal_id)
+    approved=False
+    if eligible and grant_id:
+        from v6_approvals import approval
+        grant=db.execute('SELECT * FROM capability_grants_v6 WHERE id=?',(grant_id,)).fetchone()
+        review=approval(db,grant,intent)
+        from v6_intents import LOCAL_SESSION_PRINCIPAL
+        approved=bool(review and review['decision']=='approve' and review['principal_id']==LOCAL_SESSION_PRINCIPAL)
     facts = PolicyFacts(
         identity_valid=principal_id == intent["principal_id"],
         scope_current=_intent_current(db, intent),
@@ -98,11 +106,15 @@ def record_policy_decision(db: sqlite3.Connection, *, intent_id: str, grant_id: 
         resource_class=resource_class, environment=environment,
         capability=intent["capability"], risk_hint=intent["risk_hint"],
         classifier_risk=classifier_risk,
+        human_approved=approved,
     )
     decision, reasons = evaluate_policy(facts)
+    if approved and decision in {'allow','allow_with_limit'}:
+        reasons.append('approval.operator')
     decision_id = f"policy-{uuid.uuid4().hex}"
     created_at = datetime.now(timezone.utc).isoformat()
     legacy_guard = {"allowed": legacy_guard_allowed, "rule_id": legacy_rule_id}
+    if approved:legacy_guard['approval_id']=review['id']
     db.execute("INSERT INTO policy_decisions_v6 VALUES(?,?,?,?,?,?,?,?,?,?)", (
         decision_id, intent_id, grant_id, principal_id, decision,
         json.dumps(reasons, separators=(",", ":")),

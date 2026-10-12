@@ -2,6 +2,8 @@
 import copy
 import hashlib
 import json
+import ast
+from pathlib import Path
 
 
 PACKS = {
@@ -35,3 +37,26 @@ def list_packs():
         value['integration_status'] = 'partial'
         result.append(value)
     return result
+
+
+def preflight(pack_id, manifest_sha256):
+    manifest=next((p for p in list_packs() if p['id']==pack_id),None)
+    if manifest is None:raise KeyError(pack_id)
+    if manifest['manifest_sha256']!=manifest_sha256:
+        raise ValueError('Manifest changed; refresh before checking')
+    checks=[]
+    for category in ('tool_adapters','verifiers'):
+        for reference in manifest[category]:
+            module,symbol=reference.split(':',1)
+            source=Path(__file__).resolve().parent/(module+'.py')
+            try:
+                contents=source.read_bytes()
+                tree=ast.parse(contents)
+                present=any(isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name==symbol for node in tree.body)
+                digest=hashlib.sha256(contents).hexdigest()
+            except (OSError,SyntaxError,ValueError):
+                present=False;digest=None
+            checks.append({'category':category,'reference':reference,'implementation_present':present,'source_sha256':digest})
+    return {'pack':manifest,'checks':checks,'implementations_present':all(c['implementation_present'] for c in checks),
+            'execution_authorized':False,'installed_external_code':False,
+            'scope':'static_source_presence_only','unsupported':manifest['unsupported']}

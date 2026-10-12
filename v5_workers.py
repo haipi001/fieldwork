@@ -85,7 +85,7 @@ class SynthesisOutput(StrictModel):
 
 class WorkerResult(StrictModel):
     runner_id: str = Field(min_length=1, max_length=200)
-    lease_attempt: int | None = Field(default=None, ge=1)
+    lease_attempt: int | None = Field(default=None, ge=1, strict=True)
     output: dict[str, Any]
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)

@@ -12,6 +12,7 @@ import urllib.parse
 from datetime import datetime
 from dataclasses import asdict
 from pathlib import Path
+from storage_paths import data_directory
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -23,12 +24,12 @@ from reporting import redact
 
 
 router = APIRouter(prefix="/api/v1/traditional", tags=["Traditional toolchain"])
-ARTIFACT_ROOT = Path(__file__).resolve().parent / "data" / "artifacts"
+ARTIFACT_ROOT = data_directory() / "artifacts"
 NETWORK_CAPABILITIES = ("subfinder", "httpx", "katana", "nuclei")
 CODE_CAPABILITIES = ("semgrep", "gitleaks", "trivy")
 AGENT_CAPABILITIES = ("strix", "shannon")
 TRADITIONAL_CAPABILITIES = (*NETWORK_CAPABILITIES, *CODE_CAPABILITIES, *AGENT_CAPABILITIES)
-REPOSITORY_ROOT = Path(__file__).resolve().parent / "data" / "repositories"
+REPOSITORY_ROOT = data_directory() / "repositories"
 
 
 class TraditionalToolInput(BaseModel):

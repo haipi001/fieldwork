@@ -12,10 +12,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from storage_paths import data_directory
+
 from lifecycle import backup_database, list_backups, sha256  # noqa: E402
 
-DATABASE = ROOT / "data" / "src_control.db"
-BACKUPS = ROOT / "data" / "backups"
+DATABASE = data_directory() / "src_control.db"
+BACKUPS = data_directory() / "backups"
 
 
 def active_runs() -> int:

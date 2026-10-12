@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import difflib
 from pathlib import Path
+from storage_paths import data_directory
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
@@ -21,7 +22,7 @@ from reporting import redact, redact_structure
 
 
 router = APIRouter(prefix="/api/v1/traditional", tags=["Traditional SRC runtime"])
-ARTIFACT_ROOT = Path(__file__).resolve().parent / "data" / "artifacts"
+ARTIFACT_ROOT = data_directory() / "artifacts"
 
 
 class VerificationCancelled(Exception):

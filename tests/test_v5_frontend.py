@@ -25,9 +25,14 @@ def test_v5_workspace_serves_real_control_plane_shell():
     script = client.get("/static/v5.js").text
     assert '$("#content").inert=true;$("#sidebar").inert=true' in script
     assert '$("#content").inert=false;$("#sidebar").inert=false' in script
-    for settings_group in ("GENERAL", "APPEARANCE", "WORKSPACE", "PRIVACY &amp; DATA", "SECURITY", "SECRETS", "MCP / API", "STORAGE", "BACKUP", "UPDATES"):
+    for settings_group in ("GENERAL", "APPEARANCE", "WORKSPACE", "SECURITY", "SECRETS"):
         assert f"<small>{settings_group}</small>" in response.text
-    assert '<details class="panel settings-advanced">' in response.text
+    assert '/static/v5-workspace.js' in response.text
+    workspace = client.get('/static/v5-workspace.js').text
+    for surface in ('Automatic retention policy', 'Export redacted record index', 'Move data directory', 'Release source',
+                    'Create database backup', 'Test restore copy'):
+        assert surface in workspace
+    assert '尚无可验证的 V5 备份状态与恢复接口' not in response.text
     assert 'id="findingsPager"' in response.text
 
 
@@ -190,7 +195,8 @@ def test_v5_capability_readiness_is_not_equated_with_installed_executable():
     assert "已安装、可执行、已配置、沙箱就绪与可安全执行是不同状态" in script
     assert 'function renderExtensions()' in script
     assert '"/api/v1/extensions"' not in script
-    assert "安装、更新、权限、信任与 drift 不可管理" in script
+    assert "本地包状态以上方读取为准；执行、权限与信任未接通" in script
+    assert "第三方运行、签名信任、自动更新与 Capability Drift 尚未接通" in script
 
 
 def test_v5_typography_keeps_dense_workspace_readable():
@@ -358,3 +364,29 @@ def test_v5_command_palette_has_listbox_semantics_and_chinese_aliases():
     assert 'role="option" data-command=' in script
     assert 'const commandAliases=' in script
     assert 'aria-activedescendant' in script
+
+
+def test_v5_asset_addresses_follow_current_bytes(tmp_path, monkeypatch):
+    import hashlib
+    import re
+    from pathlib import Path
+    template=(Path(application.ROOT)/'templates/v5.html').read_text()
+    names=set(re.findall(r"asset_url\('([^']+)'\)",template))
+    assert 'v5-workspace.js' in names
+    static=tmp_path/'static';static.mkdir()
+    for name in names:
+        (static/name).write_text('first version')
+    monkeypatch.setattr(application,'ROOT',tmp_path)
+    client=TestClient(application.app,base_url='http://127.0.0.1:8000')
+    before=client.get('/v5')
+    assert before.status_code==200 and before.headers['cache-control']=='no-store'
+    digest=hashlib.sha256(b'first version').hexdigest()[:16]
+    assert '/static/v5-workspace.js?v='+digest in before.text
+    # Same byte count, different contents: the URL must change independently of release version.
+    (static/'v5-workspace.js').write_text('other version')
+    after=client.get('/v5')
+    changed=hashlib.sha256(b'other version').hexdigest()[:16]
+    assert '/static/v5-workspace.js?v='+changed in after.text
+    assert '/static/v5-workspace.js?v='+digest not in after.text
+    assert '/static/v5.css?v='+digest in after.text
+    assert client.get('/').headers['cache-control']=='no-store'

@@ -181,8 +181,10 @@ def capability_matches(db: sqlite3.Connection, intent_id: str, grant_id: str,
         return False, "stale_context"
     if not _domain_guard_eligible(db, intent):
         return False, "scope_or_domain_guard"
-    if grant["approval_state"] != "active":
-        return False, "approval_required"
+    from v6_approvals import approval
+    review=approval(db,grant,intent)
+    if review and review['decision'] in {'reject','invalid'}:
+        return False, 'approval_rejected' if review['decision']=='reject' else 'approval_invalid'
     now = at or datetime.now(timezone.utc)
     if now.tzinfo is None or now.astimezone(timezone.utc) >= _utc(grant["expires_at"]):
         return False, "expired"
@@ -200,6 +202,8 @@ def capability_matches(db: sqlite3.Connection, intent_id: str, grant_id: str,
     used = db.execute("SELECT COUNT(*) FROM capability_uses_v6 WHERE grant_id=?", (grant_id,)).fetchone()[0]
     if used >= grant["max_uses"]:
         return False, "usage_exhausted"
+    if grant["approval_state"] != "active" and not (review and review['decision']=='approve'):
+        return False, "approval_required"
     return True, "eligible_only"
 
 

@@ -80,6 +80,8 @@
           <header><div><small class="mono">${esc(item.id)}</small><h3>${esc(item.objective)}</h3></div><span class="state ${esc(item.status)}">${esc(stateName(item.status))}</span></header>
           <p>${t("任务","Tasks")}: ${count ?? t("待读取","Loading")} · ${t("同时领取上限","Concurrent lease limit")}: ${esc(item.budget?.max_concurrency ?? "–")} · ${t("成本预算","Cost budget")}: ${esc(item.budget?.max_cost_micros ?? "–")} µ</p>
           <p>${t("模型 Profile","Model profile")}: ${esc(item.runtime_profile_id || t("未指定","Not selected"))} · Run ${esc(item.run_id || "–")}</p>
+          ${item.status !== "cancelled" ? `<form data-team-limit="${esc(item.id)}" class="workspace-toolbar"><label>${t("调整组内并发","Change team concurrency")}<input name="concurrency" type="number" min="1" max="32" required value="${item.budget?.max_concurrency||1}"></label><button type="submit">${t("保存并发上限","Save concurrency limit")}</button><span role="status"></span></form>` : ""}
+          ${item.strategy === "bounded_research" && item.status !== "cancelled" ? `<details><summary>${t("调整成员数量","Adjust team size")}</summary><p>${t("可在执行期间调整尚未开始的成员。已执行成员及其预算保持不变；总费用预算不增加，缩减保留取消记录。","Adjust unstarted members while the team runs. Preserves started members, their allowances and the total cost budget; removed tasks retain cancellation records.")}</p><button type="button" data-team-size-load="${esc(item.id)}">${t("读取当前规模","Load current size")}</button><div data-team-size-editor="${esc(item.id)}" role="region"></div></details>` : ""}
           <div class="team-group-actions">${item.status === "active" && item.strategy === "bounded_research" ? `<button type="button" data-team-start="${esc(item.id)}" ${busy||!canStart?"disabled":""}>${t("分析已有图谱","Analyze recorded graph")}</button>` : ""}<button type="button" data-team-select="${esc(item.id)}">${t("查看任务","View tasks")}</button>
             ${action ? `<button type="button" data-team-action="${action}" data-team-id="${esc(item.id)}">${action === "pause" ? t("暂停","Pause") : t("恢复","Resume")}</button>` : ""}
             ${item.status !== "cancelled" ? `<button type="button" data-team-action="cancel" data-team-id="${esc(item.id)}">${t("取消组","Cancel team")}</button>` : ""}
@@ -112,6 +114,31 @@
       $("#teamCreate").onclick = openDialog;
       $("#teamAllTasks") && ($("#teamAllTasks").onclick = () => { groupId = ""; render(); });
       $("#teamMoreTasks") && ($("#teamMoreTasks").onclick = loadMore);
+      host.querySelectorAll("[data-team-limit]").forEach(form=>form.onsubmit=async event=>{event.preventDefault();const group=groups.find(item=>item.id===form.dataset.teamLimit),button=form.querySelector('button'),status=form.querySelector('[role=status]');button.disabled=true;try{const response=await fetch(`/api/v1/workspace/groups/${encodeURIComponent(group.id)}/concurrency`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_concurrency:Number(form.elements.concurrency.value),expected_updated_at:group.updated_at})});const data=await response.json();if(!response.ok)throw new Error(data.detail||response.status);await refreshCampaign();toast(t("并发上限已更新","Concurrency limit updated"))}catch(error){status.textContent=error.message}finally{button.disabled=false}});
+      host.querySelectorAll("[data-team-size-load]").forEach(button => button.onclick = async () => {
+        const id = button.dataset.teamSizeLoad;
+        const region = [...host.querySelectorAll('[data-team-size-editor]')].find(el => el.dataset.teamSizeEditor === id);
+        button.disabled = true;
+        try {
+          const response = await fetch(`/api/v1/workspace/groups/${encodeURIComponent(id)}/size`);
+          const size = await response.json();
+          if (!response.ok) throw new Error(size.detail || response.status);
+          region.innerHTML = `<form class="workspace-toolbar">${['researcher','explorer','specialist'].map(role => `<label>${esc(role)}<input name="${role}" type="number" min="${Number(size.minimum_roles[role] || 0)}" max="100" required value="${Number(size.roles[role] || 0)}" ${size.editable?'':'disabled'}></label>`).join('')}<button ${size.editable?'':'disabled'}>${t("保存成员数量","Save team size")}</button><span role="status">${size.editable?'':t("当前队伍不可调整成员。","This team cannot be resized.")}</span></form>`;
+          const form = region.querySelector('form');
+          form.onsubmit = async event => {
+            event.preventDefault(); const submit = form.querySelector('button'); submit.disabled = true;
+            try {
+              const body = {expected_updated_at:size.updated_at};
+              for (const role of ['researcher','explorer','specialist']) body[role] = Number(form.elements[role].value);
+              const result = await fetch(`/api/v1/workspace/groups/${encodeURIComponent(id)}/size`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+              const data = await result.json(); if (!result.ok) throw new Error(data.detail || result.status);
+              await refreshCampaign(); toast(t("队伍规模已更新，费用总预算保持不变","Team resized; total cost budget preserved"));
+            } catch(error) { form.querySelector('[role=status]').textContent = error.message; }
+            finally { submit.disabled = false; }
+          };
+        } catch(error) { region.textContent = error.message; }
+        finally { button.disabled = false; }
+      });
       host.querySelectorAll("[data-team-select]").forEach(button => button.onclick = () => { groupId = button.dataset.teamSelect; render(); });
       host.querySelectorAll("[data-team-start]").forEach(button => button.onclick = () => startResearch(button.dataset.teamStart));
       host.querySelectorAll("[data-team-action]").forEach(button => button.onclick = () => act(button.dataset.teamId, button.dataset.teamAction));

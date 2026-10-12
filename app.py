@@ -12,6 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from storage_paths import data_directory
 from typing import Any
 from urllib.parse import urlparse
 
@@ -53,7 +54,7 @@ from v5_research_worker import router as v5_research_worker_router
 from v5_evolution import router as v5_evolution_router
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
+DATA = data_directory()
 DB = DATA / "src_control.db"
 
 
@@ -253,9 +254,13 @@ app.include_router(v5_orchestration_router)
 app.include_router(v5_runner_router)
 app.include_router(v5_verification_router)
 app.include_router(v5_runtime_router)
+from v5_workspace_ui import router as workspace_ui_router
+app.include_router(workspace_ui_router)
 app.include_router(v6_control_router)
 app.include_router(v6_intents_router)
 app.include_router(v6_capabilities_router)
+from v6_approvals import router as v6_approvals_router
+app.include_router(v6_approvals_router)
 app.include_router(v6_policy_router)
 app.include_router(v6_incidents_router)
 app.include_router(v5_continuous_router)
@@ -746,15 +751,24 @@ async def adapter_run(run_id: str, engagement_id: str, manifest: dict[str, Any],
     emit(run_id, "complete" if terminal_status == "completed" else "adapter", f"{adapter} 运行结束：{terminal_status}")
 
 
+def _v5_page(request: Request):
+    def asset_url(name: str):
+        # Names come from this template, never from request input.
+        digest = hashlib.sha256((ROOT / 'static' / name).read_bytes()).hexdigest()[:16]
+        return f'/static/{name}?v={digest}'
+    response = templates.TemplateResponse(request, 'v5.html', {'asset_url':asset_url})
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    return templates.TemplateResponse(request, "v5.html")
+    return _v5_page(request)
 
 
 @app.get("/v5", response_class=HTMLResponse)
 def v5_workspace(request: Request):
     """Serve the V5 control-plane frontend without replacing the stable workspace."""
-    return templates.TemplateResponse(request, "v5.html")
+    return _v5_page(request)
 
 
 @app.get("/new", response_class=HTMLResponse)

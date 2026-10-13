@@ -121,4 +121,3 @@ Expert drawer:
 4. Default Findings query is verified-only; candidate count remains visible.
 5. Web3 mode initially may show capability-degraded state, but never fake analysis results.
 6. Remove the eight-item sidebar only after every current capability has a mapped drawer/tab and an acceptance test.
-

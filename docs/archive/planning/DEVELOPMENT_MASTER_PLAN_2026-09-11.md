@@ -2,7 +2,7 @@
 
 计划版本：1.0 · 2026-09-11  
 产品基线：运行时 0.32.1 build 32；个人安全研究桌面工作台  
-依据：[综合评估](APPLICATION_ASSESSMENT_2026-09-11.md)、现有代码及 [产品补全历史](PRODUCT_COMPLETION_STATUS.md)  
+依据：[综合评估](../reviews/APPLICATION_ASSESSMENT_2026-09-11.md)、现有代码及 [产品补全历史](../reviews/PRODUCT_COMPLETION_STATUS.md)
 状态：待执行。本文件是开发和验收计划，不是完成声明；不自动启动定时任务、外部扫描、发布或付费服务。
 
 ## 1. 产品目标与完成定义

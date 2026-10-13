@@ -107,4 +107,3 @@ Before adding any external security tool:
 4. define capability, input/output normalization, timeout/resource/network policy;
 5. add health/degraded behavior and fixture/golden tests;
 6. avoid vendoring whole repositories.
-

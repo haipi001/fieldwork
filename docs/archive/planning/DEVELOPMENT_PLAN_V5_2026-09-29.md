@@ -2,7 +2,7 @@
 
 更新时间：2026-09-29
 
-2026-10-04 当前进度与实施顺序以 [阶段总计划](docs/DEVELOPMENT_STATUS_2026-10-04.md) 为准。源码 0.68.3 增加 V5 草稿业务规则审阅冻结、分诊后的单候选计划/授权执行/取消/持久状态；独立确认的整体验收仍未完成。规划来源为用户指定的 `fieldwork_v5_1_master_bundle`；本轮 V5-FE-01 切片和下一 V5-ORCH-02 见 [验收记录](docs/acceptance/2026-10-04-v5-fe-01-http-workflow.md)。
+2026-10-04 当前进度与实施顺序以 [阶段总计划](../progress/DEVELOPMENT_STATUS_2026-10-04.md) 为准。源码 0.68.3 增加 V5 草稿业务规则审阅冻结、分诊后的单候选计划/授权执行/取消/持久状态；独立确认的整体验收仍未完成。规划来源为用户指定的 `fieldwork_v5_1_master_bundle`；本轮 V5-FE-01 切片和下一 V5-ORCH-02 见 [验收记录](../../acceptance/2026-10/2026-10-04-v5-fe-01-http-workflow.md)。
 
 ## 产品目标
 
@@ -116,18 +116,18 @@ Fieldwork V5 是 Evidence-first Autonomous Research & Verification OS。它在�
 
 ## 下一任务顺序
 
-1. `V5-SEC-01`：已完成 Backend Overlay 集成前的安全基线核对，并修复 Host/Origin middleware 未挂载与最小 health 缺失；详见 `docs/acceptance/2026-09-30-v5-sec-01-baseline.md`。
-2. `V5-SEC-02`：已完成启动级 API session 与桌面身份绑定的首轮实现：每次桌面启动随机凭据、HttpOnly Cookie、CLI Header、实例 ID/版本握手、旧凭据拒绝、外部导航隔离；真实安装版更新与端口预占整机验收仍待发布阶段执行。详见 `docs/acceptance/2026-09-30-v5-sec-02-session-binding.md`。
-3. `V5-BE-01`：已完成增量 V5 Schema、Schema 19→20 备份/回滚副本演练和零自动晋升验证；详见 `docs/acceptance/2026-09-30-v5-be-01-additive-schema.md`。
-4. `V5-BE-02`：已完成 Research Graph Node/Edge CRUD、分页、显式幂等 provenance bridge 与 Canonical Receipt guard；详见 `docs/acceptance/2026-09-30-v5-be-02-research-graph.md`。
-5. `V5-BE-03`：已完成 AgentTask、ResearchGroup、Runner、原子 Lease/Heartbeat、Checkpoint、恢复、幂等和预算控制；详见 `docs/acceptance/2026-09-30-v5-be-03-orchestration.md`。
-6. `V5-BE-05`：已完成不可变 Verification Receipt、独立 verifier task/Runner 绑定、输入快照 hash、Replay 和 Canonical promotion guard；详见 `docs/acceptance/2026-09-30-v5-be-05-verification-receipts.md`。
-7. `V5-BE-04`：已完成 local/cloud/hybrid/offline Runtime Router、敏感任务本地约束、健康感知 fallback、Provider Secret 引用与不可变 Usage Ledger；详见 `docs/acceptance/2026-09-30-v5-be-04-runtime-router.md`。
+1. `V5-SEC-01`：已完成 Backend Overlay 集成前的安全基线核对，并修复 Host/Origin middleware 未挂载与最小 health 缺失；详见 `docs/acceptance/2026-09/2026-09-30-v5-sec-01-baseline.md`。
+2. `V5-SEC-02`：已完成启动级 API session 与桌面身份绑定的首轮实现：每次桌面启动随机凭据、HttpOnly Cookie、CLI Header、实例 ID/版本握手、旧凭据拒绝、外部导航隔离；真实安装版更新与端口预占整机验收仍待发布阶段执行。详见 `docs/acceptance/2026-09/2026-09-30-v5-sec-02-session-binding.md`。
+3. `V5-BE-01`：已完成增量 V5 Schema、Schema 19→20 备份/回滚副本演练和零自动晋升验证；详见 `docs/acceptance/2026-09/2026-09-30-v5-be-01-additive-schema.md`。
+4. `V5-BE-02`：已完成 Research Graph Node/Edge CRUD、分页、显式幂等 provenance bridge 与 Canonical Receipt guard；详见 `docs/acceptance/2026-09/2026-09-30-v5-be-02-research-graph.md`。
+5. `V5-BE-03`：已完成 AgentTask、ResearchGroup、Runner、原子 Lease/Heartbeat、Checkpoint、恢复、幂等和预算控制；详见 `docs/acceptance/2026-09/2026-09-30-v5-be-03-orchestration.md`。
+6. `V5-BE-05`：已完成不可变 Verification Receipt、独立 verifier task/Runner 绑定、输入快照 hash、Replay 和 Canonical promotion guard；详见 `docs/acceptance/2026-09/2026-09-30-v5-be-05-verification-receipts.md`。
+7. `V5-BE-04`：已完成 local/cloud/hybrid/offline Runtime Router、敏感任务本地约束、健康感知 fallback、Provider Secret 引用与不可变 Usage Ledger；详见 `docs/acceptance/2026-09/2026-09-30-v5-be-04-runtime-router.md`。
 8. `V5-FE-01C`：把 Graph、Orchestrator、Intelligence 和 Receipt 页面切换到真实 Overlay 数据。
-9. `V5-ORCH-02`：固定本地 HTTP/包适用性 Oracle 已使用 macOS 沙箱与负向能力探针；通用/远端可信 Verifier、完整跨平台隔离仍未完成。见 `docs/acceptance/2026-10-01-v5-orch-02-macos-verifier-sandbox.md`。
-10. `V5-ORCH-03`：跨组精简胶囊、确定性群体评估、rank/select、谱系、mutation/combine Worker 与 Evolution 控制面已接入。六轮跨进程演化、崩溃租约恢复、组预算截止、重试结果隔离及 32 候选容量边界已验证；真实 Provider 长时运行和更长代际压力验收仍待补。见 `docs/acceptance/2026-10-01-v5-orch-03-cross-pollination-evolution.md`、`docs/acceptance/2026-10-01-v5-orch-03-evolver-worker.md`、`docs/acceptance/2026-10-01-v5-orch-03-evolution-control-plane.md` 与 `docs/acceptance/2026-10-02-v5-orch-03-durable-evolution.md`。
+9. `V5-ORCH-02`：固定本地 HTTP/包适用性 Oracle 已使用 macOS 沙箱与负向能力探针；通用/远端可信 Verifier、完整跨平台隔离仍未完成。见 `docs/acceptance/2026-10/2026-10-01-v5-orch-02-macos-verifier-sandbox.md`。
+10. `V5-ORCH-03`：跨组精简胶囊、确定性群体评估、rank/select、谱系、mutation/combine Worker 与 Evolution 控制面已接入。六轮跨进程演化、崩溃租约恢复、组预算截止、重试结果隔离及 32 候选容量边界已验证；真实 Provider 长时运行和更长代际压力验收仍待补。见 `docs/acceptance/2026-10/2026-10-01-v5-orch-03-cross-pollination-evolution.md`、`docs/acceptance/2026-10/2026-10-01-v5-orch-03-evolver-worker.md`、`docs/acceptance/2026-10/2026-10-01-v5-orch-03-evolution-control-plane.md` 与 `docs/acceptance/2026-10/2026-10-02-v5-orch-03-durable-evolution.md`。
 
-11. `V5-SCALE-01`：修复 1100 代谱系递归溢出与重复祖先查询；本地/通用队列可越过 1000 条过期 Scope 任务找到有效任务，保留并发门禁。任务 API 与 Evolution 页面已可游标分页读取 1001 条任务，未读完时禁止汇集。首页/研究图谱可分页读完 1001 节点与 1201 关系，跨页反证边不再丢失。全负载、预算指标、Evolution Claim/历史及其他队列页面上限仍待补。见 `docs/acceptance/2026-10-02-v5-scale-01-history-and-queue.md`、`docs/acceptance/2026-10-02-v5-scale-01-task-pagination.md`、`docs/acceptance/2026-10-02-v5-scale-01-graph-pagination.md`。
+11. `V5-SCALE-01`：修复 1100 代谱系递归溢出与重复祖先查询；本地/通用队列可越过 1000 条过期 Scope 任务找到有效任务，保留并发门禁。任务 API 与 Evolution 页面已可游标分页读取 1001 条任务，未读完时禁止汇集。首页/研究图谱可分页读完 1001 节点与 1201 关系，跨页反证边不再丢失。全负载、预算指标、Evolution Claim/历史及其他队列页面上限仍待补。见 `docs/acceptance/2026-10/2026-10-02-v5-scale-01-history-and-queue.md`、`docs/acceptance/2026-10/2026-10-02-v5-scale-01-task-pagination.md`、`docs/acceptance/2026-10/2026-10-02-v5-scale-01-graph-pagination.md`。
 
 ## 回滚
 

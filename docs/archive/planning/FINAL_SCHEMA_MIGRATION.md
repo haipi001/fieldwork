@@ -118,4 +118,3 @@ Implements FINAL package schema and points to generated directory/file artifacts
 5. Dual-read comparison and golden fixtures.
 6. Switch writes to canonical tables; keep legacy read-only for one release.
 7. Rollback switches readers back; never delete source tables in the same release.
-

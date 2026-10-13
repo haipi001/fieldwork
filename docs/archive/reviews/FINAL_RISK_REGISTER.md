@@ -32,4 +32,3 @@ Scale: likelihood/impact `Low`, `Medium`, `High`, `Critical`.
 2. Establish a recoverable version-control baseline for the current prototype and FINAL package references.
 3. Decide whether canonical backend remains a staged modular FastAPI refactor (recommended) or is split into services; FINAL currently favors keeping the stable backend.
 4. Select a local traditional fixture and local Web3 fixture for future acceptance without external active testing.
-

@@ -5,7 +5,7 @@
 - 后台统一读取进程固定的 FIELDWORK_DATA_DIRECTORY；未设置保留原默认值，显式无效配置拒绝启动。
 - 配置绝对、已存在、当前用户所有、私有POSIX权限目录；逐级NOFOLLOW拒绝路径及父目录链接。
 - app、final_core、传统/Web3证据、传统仓库、报告、Agent工作区、Web3练习、本地凭据、回滚命令均使用统一解析器。依赖core路径的备份、扩展包与监控保持同根。
-- 不热切换，不复制旧目录，不重写历史文件URI。正式迁移、原生持久设置、完整复制/切换/回滚仍未完成。详见 docs/STORAGE_LOCATION_CONFIGURATION.md。
+- 不热切换，不复制旧目录，不重写历史文件URI。正式迁移、原生持久设置、完整复制/切换/回滚仍未完成。详见 docs/guides/STORAGE_LOCATION_CONFIGURATION.md。
 
 ## 证据
 

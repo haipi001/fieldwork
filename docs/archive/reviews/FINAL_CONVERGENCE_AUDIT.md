@@ -134,4 +134,3 @@ No external tool license is currently introduced because none is installed or ve
 - Pause/resume/checkpoint: absent; restart marks active runs interrupted.
 
 Conclusion: retain the safety and evidence work, but converge around canonical data first. Do not cosmetically rename the current eight screens and call the FINAL product complete.
-

@@ -340,4 +340,4 @@ V6 is in development. P0.2–P0.5 are in progress; P0.6 through P2.5 and all rel
 
 ### Local desktop installation 0.68.65/build143
 
-- User-requested installation of pushed revision 959071c succeeded at `/Applications/Fieldwork.app`. Prior App and database are preserved under ignored `build/macos/install-backup-06815-to06865-lkh9fkcs/`. Native window loaded V5, health200, business API without session401, code signature verified, DB schema40/integrity ok and six evidence/finding collections unchanged by row digest. See `docs/acceptance/2026-10-08-native-install-06865.md`. The app remains source linked; this does not close V6 release gates.
+- User-requested installation of pushed revision 959071c succeeded at `/Applications/Fieldwork.app`. Prior App and database are preserved under ignored `build/macos/install-backup-06815-to06865-lkh9fkcs/`. Native window loaded V5, health200, business API without session401, code signature verified, DB schema40/integrity ok and six evidence/finding collections unchanged by row digest. See `docs/acceptance/2026-10/2026-10-08-native-install-06865.md`. The app remains source linked; this does not close V6 release gates.

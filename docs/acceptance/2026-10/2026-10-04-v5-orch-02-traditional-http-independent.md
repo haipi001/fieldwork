@@ -4,7 +4,7 @@
 
 ## 变更文件
 
-http_independent_confirmation.py、traditional_runtime.py、verification_receipts.py、tests/test_http_business_boundary.py、tests/test_final.py、version.py、docs/DEVELOPMENT_STATUS_2026-10-04.md、docs/MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04.md及本验收文档。
+http_independent_confirmation.py、traditional_runtime.py、verification_receipts.py、tests/test_http_business_boundary.py、tests/test_final.py、version.py、docs/archive/progress/DEVELOPMENT_STATUS_2026-10-04.md、docs/MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04.md及本验收文档。
 
 ## 实现
 

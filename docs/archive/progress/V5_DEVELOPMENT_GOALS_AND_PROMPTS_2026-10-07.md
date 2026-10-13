@@ -45,9 +45,9 @@
 
 ```text
 在 /Users/lizekai/Documents/ChatGPT/SRC漏洞 持续完成 Fieldwork V5。
-先读 AGENTS.md、docs/V5_DEVELOPMENT_GOALS_AND_PROMPTS_2026-10-07.md、
-docs/V5_UI_AND_CORE_DELIVERY_PLAN_2026-10-04.md、
-docs/MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04.md 和
+先读 AGENTS.md、docs/archive/progress/V5_DEVELOPMENT_GOALS_AND_PROMPTS_2026-10-07.md、
+docs/roadmap/V5_UI_AND_CORE_DELIVERY_PLAN_2026-10-04.md、
+docs/roadmap/MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04.md 和
 docs/acceptance/RELIABLE_AUTONOMOUS_VULNERABILITY_GATE.md。
 核对当前工作区、源码、数据库、安装版和最近验收，保留现有开发成果。
 按 UI-00 复核、UI-01/UI-02 收口、UI-03 实际发现闭环、UI-04、UI-05、UI-06、QA-07 推进。

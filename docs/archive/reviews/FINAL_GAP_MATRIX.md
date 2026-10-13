@@ -77,4 +77,3 @@ Status legend: `PROVEN`, `PARTIAL`, `MISSING`, `CONTRADICTED`.
 ## Release truth
 
 The current app may be called a local traditional-SRC control-layer prototype. It must not be called FINAL, dual-mode, autonomous, submission-ready across platforms, or Web3-capable until the corresponding acceptance evidence exists.
-

@@ -70,4 +70,4 @@ python3 FINAL/SRC_AI_Security_Research_OS_FINAL_2026-08-27/scripts/static_contra
 - Native Agent 任务隔离目录：`data/agent_workspaces/<run_id>/`（目录权限 `700`，文件权限 `600`）
 - v1 Run 在进程异常退出后进入 `paused`，保留 checkpoint；用户点击恢复后从首个缺失阶段继续。
 
-操作与故障恢复详见 [OPERATIONS.md](../OPERATIONS.md)。
+操作与故障恢复详见 [OPERATIONS.md](../guides/OPERATIONS.md)。

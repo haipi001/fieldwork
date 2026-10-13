@@ -13,7 +13,7 @@ Seatbelt不接受数字IP的remote-ip规则，但实际macOS实验确认：deny 
 - `guided_research.py`：计划不再按“仅loopback”阻断。原Scope/Policy、认证域名、业务规则、两份会话、预算、当前材料、macOS沙箱可用性等门继续执行。
 - `v5_http_receipts.py`：新传输证明要求single_connected_socket及实际network_connect_denied；保留历史loopback精确端口观察兼容，历史材料本身仍须符合V5原始输入/回执守卫。
 - `tests/test_v5_http_transport.py`：真实服务使用连接、URL主机不可解析时仍使用已核验数字连接、TLS无效证书拒绝、禁止新建连接、取消释放descriptor等。
-- `docs/MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04.md`：保留全部15个Task的每条done要求、8类Known Gaps、现有入口和缺失证据，防止以本地切片代替完整目标。
+- `docs/roadmap/MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04.md`：保留全部15个Task的每条done要求、8类Known Gaps、现有入口和缺失证据，防止以本地切片代替完整目标。
 - `version.py` / 当前进度文档 / 本文：版本与验收。
 
 ## 测试、基准与迁移

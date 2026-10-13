@@ -8,7 +8,7 @@ from storage_migration import preflight
 def directories(tmp_path):
     root=tmp_path.resolve()
     source=root/'source';target=root/'target'
-    source.mkdir();target.mkdir()
+    source.mkdir();target.mkdir(mode=0o700)
     (source/'nested').mkdir();(source/'nested'/'file').write_bytes(b'fixture')
     return source,target
 
@@ -62,3 +62,56 @@ def test_entry_limit_fails_without_partial_success(tmp_path):
     source,target=directories(tmp_path)
     with patch('storage_migration.MAX_ENTRIES',1),pytest.raises(ValueError,match='directory_entry_limit'):
         preflight(source,str(target))
+
+
+@pytest.mark.parametrize('mode', ['relative', 'symlink', 'linked_parent'])
+def test_unsafe_source_rejected(tmp_path, mode):
+    source, target = directories(tmp_path)
+    if mode == 'relative':
+        candidate = Path('source')
+    elif mode == 'symlink':
+        candidate = source.parent / 'source-link'
+        candidate.symlink_to(source, target_is_directory=True)
+    else:
+        link = source.parent / 'parent-link'
+        link.symlink_to(source, target_is_directory=True)
+        candidate = link / 'nested'
+    with pytest.raises(ValueError):
+        preflight(candidate, target)
+    assert not list(target.iterdir())
+
+
+def test_same_size_rewrite_with_restored_mtime_blocks_preflight(tmp_path):
+    source, target = directories(tmp_path)
+    original_stat = os.stat
+    original = original_stat(source / 'nested' / 'file')
+    reads = 0
+    def changed_stat(path, *args, **kwargs):
+        nonlocal reads
+        value = original_stat(path, *args, **kwargs)
+        if path == 'file' and kwargs.get('dir_fd') is not None:
+            reads += 1
+            if reads == 2:
+                # Metadata race: same inode, size and restored mtime, newer ctime.
+                class Changed:
+                    def __getattr__(self, name):
+                        return getattr(value, name)
+                    st_ctime_ns = original.st_ctime_ns + 1
+                return Changed()
+        return value
+    with patch('storage_migration.os.stat', side_effect=changed_stat):
+        result = preflight(source, target)
+    assert result['inventory']['changed_entries'] == 1
+    assert not result['filesystem_prerequisites_ok']
+    assert not list(target.iterdir())
+
+
+def test_public_destination_blocks_without_changing_permissions(tmp_path):
+    source, target = directories(tmp_path)
+    target.chmod(0o755)
+    result = preflight(source, target)
+    assert not result['destination_owner_private']
+    assert 'destination_not_owner_private' in result['blockers']
+    assert not result['filesystem_prerequisites_ok']
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert not list(target.iterdir())

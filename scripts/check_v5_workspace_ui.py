@@ -11,7 +11,7 @@ import app,final_core
 from tests.test_v5_team_plan import _setup,_body
 
 with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,ExitStack() as stack:
-    root=Path(directory)
+    root=Path(directory).resolve()
     for module,name,value in ((app,'DB',root/'ui.db'),(app,'DATA',root),(final_core,'DB',root/'ui.db'),(final_core,'LOCAL_DATA_ROOT',root)):
         stack.enter_context(patch.object(module,name,value))
     token=secrets.token_urlsafe(48);stack.enter_context(patch.dict(os.environ,{'FIELDWORK_SESSION_TOKEN':token,'FIELDWORK_DISABLE_AGENT_MONITOR':'1','FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER':'1'}))
@@ -230,8 +230,15 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
         migration.locator('[name="destination"]').fill(str(migration_target))
         migration.locator('button').click()
         page.wait_for_function("document.querySelector('#workspace-settings [data-w-message]')?.textContent.includes('目录检查已完成')")
+        assert '目录条件通过' in page.locator('[data-w-migration-result]').inner_text()
+        page.locator('[data-w-migration-result] summary').click()
         assert 'required_bytes' in page.locator('[data-w-migration-result]').inner_text()
         assert 'migration_available' in page.locator('[data-w-migration-result]').inner_text()
+        migration_target.chmod(0o755)
+        migration.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-migration-result]').textContent.includes('目录条件未通过')")
+        assert '权限 700' in page.locator('[data-w-migration-result]').inner_text()
+        migration_target.chmod(0o700)
         assert list(migration_target.iterdir())==[]
         migration.locator('[name="destination"]').fill('relative-directory')
         migration.locator('button').click()

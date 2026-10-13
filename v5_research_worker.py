@@ -381,7 +381,8 @@ def start_group_research(group_id: str):
             value = {'state': 'running', 'runner_id': RUNNER_ID}
             db.execute('INSERT INTO app_metadata VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at', (marker, w._dump(value), w._now()))
             r._emit(db, group_id, 'team_research.start_requested', {'concurrency': concurrency}, group['campaign_id'])
-        job = threading.Thread(target=_run_group, args=(group_id, concurrency), daemon=True, name=f'fieldwork-team-{group_id}')
+        from storage_access import storage_call
+        job = threading.Thread(target=storage_call, args=(w._core().LOCAL_DATA_ROOT.resolve(), _run_group, group_id, concurrency), daemon=True, name=f'fieldwork-team-{group_id}')
         _jobs[group_id] = job
         job.start()
         return {'status': 'started', 'group_id': group_id, 'max_concurrency': concurrency, 'execution': 'profile_recorded_graph_research'}

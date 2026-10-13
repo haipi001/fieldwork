@@ -102,19 +102,21 @@ def run(stop, step=None, interval=2, service_id=None):
     if step is None:
         from agent_audit import scan_active_monitors
         step = scan_active_monitors
-    with process_lock('service.lock', blocking=False):
-        ready()
-        while not stop.is_set():
-            if service_id:
-                from monitor_process_control import should_stop
-                if should_stop(service_id):break
-            try:
-                ready()  # A live upgrade must never keep an old worker on a new schema.
-                step()
-                heartbeat(service_id=service_id)
-            except Exception as error:
-                heartbeat(type(error).__name__,service_id=service_id)
-            stop.wait(interval)
+    from storage_access import storage_access
+    with storage_access(core.LOCAL_DATA_ROOT.resolve()):
+        with process_lock('service.lock', blocking=False):
+            ready()
+            while not stop.is_set():
+                if service_id:
+                    from monitor_process_control import should_stop
+                    if should_stop(service_id):break
+                try:
+                    ready()  # A live upgrade must never keep an old worker on a new schema.
+                    step()
+                    heartbeat(service_id=service_id)
+                except Exception as error:
+                    heartbeat(type(error).__name__,service_id=service_id)
+                stop.wait(interval)
 
 
 def main():

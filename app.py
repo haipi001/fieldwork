@@ -191,52 +191,55 @@ def init_db() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    prepare_database_upgrade(DB, DATA / "backups", ROOT)
-    init_db()
-    init_final_db()
-    init_agent_audit_db()
-    init_guided_db()
-    apply_v5_schema(DB)
-    apply_v6_schema(DB)
-    recover_expired_leases(DB)
-    finalize_database_version(DB)
-    scheduler_task = None
-    agent_monitor_task = None
-    if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_AGENT_MONITOR") != "1":
-        agent_monitor_task = asyncio.create_task(monitor_worker())
-    if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER") != "1":
-        async def scheduler_loop():
-            mark_campaign_scheduler(running=True, last_error=None)
-            while True:
+    from storage_access import storage_access, storage_call
+    DATA.mkdir(parents=True, exist_ok=True)
+    with storage_access(DATA.resolve()):
+        prepare_database_upgrade(DB, DATA / "backups", ROOT)
+        init_db()
+        init_final_db()
+        init_agent_audit_db()
+        init_guided_db()
+        apply_v5_schema(DB)
+        apply_v6_schema(DB)
+        recover_expired_leases(DB)
+        finalize_database_version(DB)
+        scheduler_task = None
+        agent_monitor_task = None
+        if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_AGENT_MONITOR") != "1":
+            agent_monitor_task = asyncio.create_task(monitor_worker())
+        if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_CAMPAIGN_SCHEDULER") != "1":
+            async def scheduler_loop():
+                mark_campaign_scheduler(running=True, last_error=None)
+                while True:
+                    try:
+                        processed = await asyncio.to_thread(storage_call, DATA.resolve(), run_due_campaign_schedules)
+                        await asyncio.to_thread(storage_call, DATA.resolve(), run_due_continuous_research)
+                        mark_campaign_scheduler(last_tick_at=now(), last_processed=len(processed), last_error=None)
+                    except Exception as error:
+                        # Individual schedule failures are persisted by the scheduler.
+                        # A database/startup race must not permanently kill the loop.
+                        mark_campaign_scheduler(last_tick_at=now(), last_processed=0, last_error=type(error).__name__)
+                    await asyncio.sleep(30)
+            scheduler_task = asyncio.create_task(scheduler_loop())
+        try:
+            yield
+        finally:
+            if agent_monitor_task:
+                agent_monitor_task.cancel()
                 try:
-                    processed = await asyncio.to_thread(run_due_campaign_schedules)
-                    await asyncio.to_thread(run_due_continuous_research)
-                    mark_campaign_scheduler(last_tick_at=now(), last_processed=len(processed), last_error=None)
-                except Exception as error:
-                    # Individual schedule failures are persisted by the scheduler.
-                    # A database/startup race must not permanently kill the loop.
-                    mark_campaign_scheduler(last_tick_at=now(), last_processed=0, last_error=type(error).__name__)
-                await asyncio.sleep(30)
-        scheduler_task = asyncio.create_task(scheduler_loop())
-    try:
-        yield
-    finally:
-        if agent_monitor_task:
-            agent_monitor_task.cancel()
-            try:
-                await agent_monitor_task
-            except asyncio.CancelledError:
-                pass
-        if scheduler_task:
-            scheduler_task.cancel()
-            try:
-                await scheduler_task
-            except asyncio.CancelledError:
-                pass
-            mark_campaign_scheduler(running=False)
-        from v5_research_worker import stop_workers
-        await asyncio.to_thread(stop_workers)
-        shutdown_labs()
+                    await agent_monitor_task
+                except asyncio.CancelledError:
+                    pass
+            if scheduler_task:
+                scheduler_task.cancel()
+                try:
+                    await scheduler_task
+                except asyncio.CancelledError:
+                    pass
+                mark_campaign_scheduler(running=False)
+            from v5_research_worker import stop_workers
+            await asyncio.to_thread(stop_workers)
+            shutdown_labs()
 
 
 app = FastAPI(title="Security Research OS", version=APP_VERSION, lifespan=lifespan)

@@ -34,7 +34,7 @@ def _open_directory(path):
 
 
 def preflight(source, destination):
-    source = _plain_directory(Path(source).resolve())
+    source = _plain_directory(source)
     destination = _plain_directory(destination)
     if source == destination or source.is_relative_to(destination) or destination.is_relative_to(source):
         raise ValueError('overlapping_data_directories')
@@ -81,7 +81,7 @@ def preflight(source, destination):
                 else:
                     totals['unsupported_entries'] += 1
                 after = os.stat(name, dir_fd=directory, follow_symlinks=False)
-                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                     totals['changed_entries'] += 1
             except OSError:
                 totals['unreadable_entries'] += 1
@@ -93,6 +93,8 @@ def preflight(source, destination):
         os.close(descriptor)
     target = _open_directory(destination)
     try:
+        target_info = os.fstat(target)
+        owner_private = target_info.st_uid == os.getuid() and not (stat.S_IMODE(target_info.st_mode) & 0o077)
         empty = not os.listdir(target)
         capacity = os.fstatvfs(target)
         free = capacity.f_bavail * capacity.f_frsize
@@ -102,12 +104,13 @@ def preflight(source, destination):
     required = totals['logical_bytes'] * 2 + 64 * 1024 * 1024
     blockers = []
     if not empty: blockers.append('destination_not_empty')
+    if not owner_private: blockers.append('destination_not_owner_private')
     if not os.access(destination, os.W_OK | os.X_OK): blockers.append('destination_not_writable')
     if free < required: blockers.append('insufficient_destination_space')
     for key in ('unsupported_entries', 'unreadable_entries', 'changed_entries'):
         if totals[key]: blockers.append(key)
     return {'source_directory': str(source), 'destination_directory': str(destination),
-            'inventory': totals, 'destination_empty': empty, 'available_bytes': free,
+            'inventory': totals, 'destination_empty': empty, 'destination_owner_private': owner_private, 'available_bytes': free,
             'required_bytes': required, 'filesystem_prerequisites_ok': not blockers,
             'blockers': blockers, 'offline_required': True, 'snapshot_consistent': False,
             'migration_available': False, 'data_copied': False, 'configuration_changed': False,

@@ -23,7 +23,7 @@ Fieldwork 的能力建立在下列库、工具及公开设计参考之上。Pyth
 
 ### 按能力选用的外部工具
 
-工具登记与探测入口见 [`capability_registry.py`](https://github.com/haipi001/fieldwork/blob/codex/v6-final-control-plane/capability_registry.py)。登记、检测到命令、实际执行及独立复验是不同状态，具体能力需要相应安装、配置和授权。
+工具登记与探测入口见 [`capability_registry.py`](https://github.com/haipi001/fieldwork/blob/codex/v6-final-control-plane/backend/capability_registry.py)。登记、检测到命令、实际执行及独立复验是不同状态，具体能力需要相应安装、配置和授权。
 
 | 项目 | Fieldwork 中的用途 |
 | --- | --- |

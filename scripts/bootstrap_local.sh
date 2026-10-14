@@ -30,7 +30,7 @@ fi
 if (( WITH_DEV )); then
   "$VENV_PATH/bin/python" -m pip install --disable-pip-version-check -r "$PROJECT_ROOT/requirements-dev.txt"
 fi
-PYTHONPATH="$PROJECT_ROOT" "$VENV_PATH/bin/python" - <<'PY'
+PYTHONPATH="$PROJECT_ROOT/backend:$PROJECT_ROOT" "$VENV_PATH/bin/python" - <<'PY'
 import app
 import cryptography
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
@@ -41,4 +41,4 @@ print("bootstrap smoke: PASS")
 PY
 
 print "Environment ready: $VENV_PATH"
-print "Start Fieldwork: $VENV_PATH/bin/uvicorn app:app --host 127.0.0.1 --port 8000"
+print "Start Fieldwork: $VENV_PATH/bin/uvicorn app:app --app-dir $PROJECT_ROOT/backend --host 127.0.0.1 --port 8000"

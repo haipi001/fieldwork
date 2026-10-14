@@ -164,7 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // Resolve modules explicitly; Python must not probe a Documents cwd at startup.
         process.currentDirectoryURL = URL(fileURLWithPath: "/")
         var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONPATH"] = projectRoot
+        environment["PYTHONPATH"] = projectRoot + "/backend:" + projectRoot
         environment["FIELDWORK_SESSION_TOKEN"] = sessionToken
         environment["FIELDWORK_DESKTOP_INSTANCE"] = desktopInstance
         environment["FIELDWORK_PORT"] = String(serverPort)

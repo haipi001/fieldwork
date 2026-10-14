@@ -42,6 +42,7 @@ App 关联本地源码与 Python 环境，并为后台服务建立会话。目�
 
 ```text
 .github/      贡献与安全报告指南
+backend/      Python API、业务与研究控制平面
 docs/         使用指南、架构、路线图和历史记录
 macos/        macOS 原生应用外壳
 collectors/   行为采集器
@@ -52,7 +53,7 @@ tests/        自动化测试与验证夹具
 website/      产品网站
 ```
 
-Python 服务入口和业务模块目前位于仓库根目录。模块职责见 [架构说明](docs/architecture/README.md)；历史计划集中在 [文档归档](docs/archive/README.md)，验证记录集中在 [验收索引](docs/acceptance/README.md)。
+Python 业务模块位于 `backend/`；根目录仅保留启动兼容入口。模块职责见 [架构说明](docs/architecture/README.md)；历史计划集中在 [文档归档](docs/archive/README.md)，验证记录集中在 [验收索引](docs/acceptance/README.md)。
 
 ## 开发与贡献
 

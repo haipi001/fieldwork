@@ -489,7 +489,7 @@ def run_capability(run_id: str, capability: str, source_path: str | None, timeou
     consumed, reason = final_core.consume_run_budget(run_id, "tool_call", 1)
     if not consumed:
         raise HTTPException(409, reason)
-    cwd = Path(__file__).resolve().parent if capability == "strix" else (source or Path(__file__).resolve().parent)
+    cwd = Path(__file__).resolve().parents[1] if capability == "strix" else (source or Path(__file__).resolve().parents[1])
     snapshot_context = tempfile.TemporaryDirectory(prefix="strix-source-") if capability == "strix" and source else None
     try:
         if snapshot_context:

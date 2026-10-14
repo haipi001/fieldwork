@@ -2366,7 +2366,7 @@ def test_web3_chain_real_run_requires_source_and_https_fork(client):
     assert insecure.status_code == 422 and "HTTPS" in insecure.json()["detail"]
 
 
-def test_web3_deployment_alignment_binds_bytecode_block_chain_and_program_snapshot(client, monkeypatch):
+def test_web3_deployment_alignment_binds_bytecode_block_chain_and_program_snapshot(client, monkeypatch, compiled_vault_fixture):
     address = "0x3333333333333333333333333333333333333333"
     engagement = create_ready(client, "web3", address)
     fixture = app.ROOT / "fixtures" / "web3-vault"
@@ -2418,7 +2418,7 @@ def test_web3_deployment_alignment_binds_bytecode_block_chain_and_program_snapsh
     assert "deployment_alignment" not in {item["id"] for item in plan.json()["blockers"]}
 
 
-def test_web3_deployment_alignment_blocks_bytecode_or_chain_mismatch(client, monkeypatch):
+def test_web3_deployment_alignment_blocks_bytecode_or_chain_mismatch(client, monkeypatch, compiled_vault_fixture):
     address = "0x4444444444444444444444444444444444444444"
     engagement = create_ready(client, "web3", address)
     fixture = app.ROOT / "fixtures" / "web3-vault"

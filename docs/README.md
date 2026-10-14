@@ -18,6 +18,8 @@
 - [native-ai-collector](guides/native-ai-collector.md)
 - [AI_AGENT_AUDIT](architecture/AI_AGENT_AUDIT.md)
 
+- [历史代码与生成物清理审查](maintenance/cleanup-audit-2026-10-14.md)
+
 ## 历史资料
 
 - [验收记录](acceptance/README.md)：按月份查阅验证范围、结果与限制。

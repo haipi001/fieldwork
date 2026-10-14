@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 FINAL = ROOT / "FINAL" / "SRC_AI_Security_Research_OS_FINAL_2026-08-27"
-ADAPTERS = FINAL / "reports" / "adapters"
+ADAPTERS = Path(__file__).resolve().parent / "report_adapters"
 EXPORTS = ROOT / "data" / "exports"
 SECRET_RE = re.compile(
     r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+|cookie\s*:\s*|api[-_ ]?key\s*[=:]\s*|password\s*[=:]\s*|private[-_ ]?key\s*[=:]\s*)([^\s,;]+)"

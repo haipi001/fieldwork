@@ -11,7 +11,7 @@ from urllib.parse import urljoin
 from reporting import redact
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT / "data" / "agent_workspaces"
 CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 MAX_PAGE_TEXT = 12_000

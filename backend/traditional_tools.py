@@ -23,12 +23,12 @@ from reporting import redact
 
 
 router = APIRouter(prefix="/api/v1/traditional", tags=["Traditional toolchain"])
-ARTIFACT_ROOT = Path(__file__).resolve().parent / "data" / "artifacts"
+ARTIFACT_ROOT = Path(__file__).resolve().parents[1] / "data" / "artifacts"
 NETWORK_CAPABILITIES = ("subfinder", "httpx", "katana", "nuclei")
 CODE_CAPABILITIES = ("semgrep", "gitleaks", "trivy")
 AGENT_CAPABILITIES = ("strix", "shannon")
 TRADITIONAL_CAPABILITIES = (*NETWORK_CAPABILITIES, *CODE_CAPABILITIES, *AGENT_CAPABILITIES)
-REPOSITORY_ROOT = Path(__file__).resolve().parent / "data" / "repositories"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1] / "data" / "repositories"
 
 
 class TraditionalToolInput(BaseModel):
@@ -485,7 +485,7 @@ def run_capability(run_id: str, capability: str, source_path: str | None, timeou
     consumed, reason = final_core.consume_run_budget(run_id, "tool_call", 1)
     if not consumed:
         raise HTTPException(409, reason)
-    cwd = Path(__file__).resolve().parent if capability == "strix" else (source or Path(__file__).resolve().parent)
+    cwd = Path(__file__).resolve().parents[1] if capability == "strix" else (source or Path(__file__).resolve().parents[1])
     snapshot_context = tempfile.TemporaryDirectory(prefix="strix-source-") if capability == "strix" and source else None
     try:
         if snapshot_context:

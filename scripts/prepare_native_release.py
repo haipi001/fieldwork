@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT))
+sys.path[:0] = [str(ROOT / 'backend'), str(ROOT)]
 from native_ai_launcher import verify_signature
 from version import APP_VERSION
 
@@ -57,7 +57,7 @@ def prepare(output,*,team_id=None,sign_identity=None):
                 with zipfile.ZipFile(target,'w',compression=zipfile.ZIP_DEFLATED) as archive:
                     archive.write(binary,binary.name)
                     archive.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
-                    archive.write(ROOT/'docs/native-ai-collector.md','native-ai-collector.md')
+                    archive.write(ROOT/'docs/guides/native-ai-collector.md','native-ai-collector.md')
         except Exception:
             # Only remove this build's partially written package, never an existing file.
             if created and output.exists():output.unlink()

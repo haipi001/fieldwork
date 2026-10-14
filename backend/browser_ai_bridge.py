@@ -23,7 +23,7 @@ HOSTS = {'chatgpt.com': 'ChatGPT', 'claude.ai': 'Claude',
          'www.perplexity.ai': 'Perplexity', 'grok.com': 'Grok',
          'chat.deepseek.com': 'DeepSeek', 'www.doubao.com': 'Doubao',
          'yuanbao.tencent.com': 'Yuanbao'}
-EXTENSION = Path(__file__).parent / 'collectors/browser-ai'
+EXTENSION = Path(__file__).resolve().parents[1] / 'collectors/browser-ai'
 
 
 def init_db(db):

@@ -4,7 +4,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / 'backend'), str(Path(__file__).resolve().parents[1])]
 import app
 import agent_audit as engine
 import final_core as core

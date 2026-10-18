@@ -24,7 +24,7 @@ def _spec():
     from storage_migration import _plain_directory
     root=_plain_directory(core.LOCAL_DATA_ROOT)
     if core.DB.parent!=root:raise ValueError('Database outside data root')
-    entry=core.ROOT/'monitor_login_worker.py'
+    entry=core.ROOT/'backend'/'monitor_login_worker.py'
     from proof_materials import read_proof_file
     read_proof_file(entry,256000)
     label,_=_location()

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from web3_lab import binary
 
 router = APIRouter(prefix='/api/v1/web3/practice', tags=['Web3 local practice'])
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / 'fixtures' / 'web3-practice'
 RESULTS = data_directory() / 'web3-practice'
 LOCK = threading.Lock()

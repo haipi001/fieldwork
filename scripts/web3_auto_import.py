@@ -5,7 +5,8 @@ import json
 import os
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / 'backend'), str(ROOT)]
 from web3_contract_import import import_contract, ImportFailure
 from storage_paths import data_directory
 from storage_access import storage_access

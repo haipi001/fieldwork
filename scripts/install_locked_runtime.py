@@ -44,7 +44,7 @@ def install(wheelhouse):
     base.mkdir(parents=True,exist_ok=True,mode=0o700)
     if base.is_symlink() or base.stat().st_uid!=os.getuid():raise ValueError('Runtime root must be owner controlled')
     base.chmod(0o700)
-    sys.path.insert(0,str(ROOT))
+    sys.path[:0] = [str(ROOT / 'backend'), str(ROOT)]
     from storage_paths import validate_directory
     validate_directory(str(base))
     destination=Path(tempfile.mkdtemp(prefix='py313-'+digest[:12]+'-',dir=base))

@@ -17,7 +17,7 @@ MAX_PACKAGES=1024
 
 
 def inventory(requirements=None,distributions=None):
-    path=Path(requirements or Path(__file__).resolve().parent/'requirements.txt')
+    path=Path(requirements or Path(__file__).resolve().parents[1]/'requirements.txt')
     content=path.read_bytes()
     if len(content)>65536:raise ValueError('requirements_size_limit')
     roots=[]

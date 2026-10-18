@@ -593,7 +593,7 @@ def run_capability(run_id: str, capability: str, source_path: str | None, timeou
     # URL tools need no application source. Snapshot only their private, empty
     # workspace; copying the app would include user data and build caches.
     network_workspace = tempfile.TemporaryDirectory(prefix='fieldwork-network-') if capability in NETWORK_CAPABILITIES else None
-    cwd = Path(network_workspace.name) if network_workspace else (Path(__file__).resolve().parent if capability == "strix" else (source or Path(__file__).resolve().parent))
+    cwd = Path(network_workspace.name) if network_workspace else (Path(__file__).resolve().parents[1] if capability == "strix" else (source or Path(__file__).resolve().parents[1]))
     snapshot_context = tempfile.TemporaryDirectory(prefix="strix-source-") if capability == "strix" and source else None
     transport_evidence = None
     classifier_sha256 = None

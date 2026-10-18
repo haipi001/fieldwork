@@ -4,7 +4,7 @@ import stat
 from functools import lru_cache
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENVIRONMENT_KEY = 'FIELDWORK_DATA_DIRECTORY'
 
 

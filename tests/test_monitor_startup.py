@@ -76,7 +76,7 @@ def test_login_entry_real_process_stops_normally_without_enabling_collection(cli
     import subprocess,sys
     from tests.test_monitor_process_control import wait_state
     before=core.DB.read_bytes()
-    child=subprocess.Popen([sys.executable,'-E','-s',str(core.ROOT/'monitor_login_worker.py'),
+    child=subprocess.Popen([sys.executable,'-E','-s',str(core.ROOT/'backend'/'monitor_login_worker.py'),
         '--database',str(core.DB),'--data-root',str(core.LOCAL_DATA_ROOT),'--expected-version',startup.APP_VERSION],
         cwd=core.ROOT,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:

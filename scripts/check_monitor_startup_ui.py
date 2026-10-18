@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
 import json,os,secrets,sys,tempfile
-ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
+ROOT=Path(__file__).resolve().parents[1];sys.path[:0] = [str(ROOT / 'backend'), str(ROOT)]
 from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 import app,final_core,monitor_startup

@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / 'backend'), str(Path(__file__).resolve().parents[1])]
 from reporting import replay_bundle, verify_bundle
 
 parser = argparse.ArgumentParser(description=__doc__)

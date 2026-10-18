@@ -107,7 +107,7 @@ def _keychain_command(operation, identity_id, headers=None):
     payload = {"operation": operation, "account": identity_id}
     if headers is not None:
         payload['headers'] = headers
-    helper = Path(__file__).resolve().parent / "build/macos/Fieldwork.app/Contents/MacOS/FieldworkKeychain"
+    helper = Path(__file__).resolve().parents[1] / "build/macos/Fieldwork.app/Contents/MacOS/FieldworkKeychain"
     if not helper.is_file():
         helper = Path("/Applications/Fieldwork.app/Contents/MacOS/FieldworkKeychain")
     if not helper.is_file():

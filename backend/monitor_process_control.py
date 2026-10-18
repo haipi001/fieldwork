@@ -1,6 +1,7 @@
 """Manage the fixed monitor-only executable; never create or enable a monitor."""
 import json
 import os
+from pathlib import Path
 import subprocess
 import stat
 import sys
@@ -76,8 +77,9 @@ def start():
                                     '--database',str(core.DB.resolve()),'--data-root',str(core.LOCAL_DATA_ROOT.resolve())],
                                    cwd=str(core.ROOT),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True,
-                                   env={key:value for key,value in os.environ.items() if key not in {
-                                       'FIELDWORK_SESSION_TOKEN','FIELDWORK_DESKTOP_INSTANCE','FIELDWORK_PORT','FIELDWORK_DESKTOP_PARENT_PID'}})
+                                   env={**{key:value for key,value in os.environ.items() if key not in {
+                                       'FIELDWORK_SESSION_TOKEN','FIELDWORK_DESKTOP_INSTANCE','FIELDWORK_PORT','FIELDWORK_DESKTOP_PARENT_PID'}},
+                                        'PYTHONPATH':str(Path(__file__).resolve().parent)})
             _children[service_id]=child
             return {'service_id':service_id,'state':'starting','pid':child.pid,'enabled_monitors_only':True}
         except Exception:

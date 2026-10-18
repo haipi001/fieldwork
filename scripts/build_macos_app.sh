@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, sys.argv[1])
+sys.path[:0] = [str(Path(sys.argv[1]) / 'backend'), sys.argv[1]]
 from version import APP_VERSION, BUILD_NUMBER
 
 path = Path(sys.argv[2])

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / 'backend'), str(Path(__file__).resolve().parents[1])]
 from storage_staging import stage, verify_stage
 
 if __name__ == '__main__':

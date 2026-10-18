@@ -23,6 +23,8 @@
 - [MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04](roadmap/MASTER_BUNDLE_PROGRESS_AUDIT_2026-10-04.md)
 - [V5_UI_AND_CORE_DELIVERY_PLAN_2026-10-04](roadmap/V5_UI_AND_CORE_DELIVERY_PLAN_2026-10-04.md)
 
+- [历史代码与生成物清理审查](maintenance/cleanup-audit-2026-10-14.md)
+
 ## 历史资料
 
 - [验收记录](acceptance/README.md)：按月份查阅验证范围、结果与限制。

@@ -37,7 +37,7 @@ from lifecycle import database_integrity, list_backups
 from version import APP_VERSION, BUILD_NUMBER, SCHEMA_VERSION
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 LOCAL_DATA_ROOT = data_directory()
 DB = LOCAL_DATA_ROOT / "src_control.db"
 router = APIRouter(prefix="/api/v1", tags=["FINAL v1"])

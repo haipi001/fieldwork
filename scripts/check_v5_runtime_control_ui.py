@@ -17,7 +17,7 @@ from unittest.mock import patch
 from urllib.parse import urlparse
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT))
+sys.path[:0] = [str(ROOT / 'backend'), str(ROOT)]
 from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 import app

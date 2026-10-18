@@ -964,3 +964,97 @@ def evidence_restore_plan(backup_id: str):
         return restore_plan(f.DB,backup_root(),backup_id)
     except (OSError,ValueError,KeyError,TypeError,sqlite3.Error,zipfile.BadZipFile):
         raise HTTPException(409,'Restore prerequisites could not be verified') from None
+
+
+class MonitorStartupInput(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    enabled: StrictBool
+    confirmed_enabled_monitors_only: StrictBool
+    preview_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+@router.get('/monitor-startup')
+def monitor_startup_plan():
+    import monitor_startup
+    try:return monitor_startup.plan()
+    except (OSError,ValueError,RuntimeError,sqlite3.Error):raise HTTPException(409,'Login startup state cannot be verified') from None
+
+
+@router.post('/monitor-startup')
+def configure_monitor_startup(body: MonitorStartupInput):
+    if not body.confirmed_enabled_monitors_only:raise HTTPException(422,'Confirm enabled-monitor-only login processing first')
+    import monitor_startup
+    try:return monitor_startup.apply(body.enabled,body.preview_hash)
+    except (OSError,ValueError,RuntimeError,sqlite3.Error):raise HTTPException(409,'Login startup change failed; refresh and review process, configuration and database state') from None
+
+
+class MonitorAlertConfiguration(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: StrictBool
+    expected_revision: int | None = Field(default=None, ge=1)
+    confirmed_local_only: StrictBool
+
+
+class MonitorAlertAcknowledgement(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    review_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+@router.get('/monitor-alerts/configuration')
+def monitor_alert_configuration():
+    import monitor_alerts
+    return monitor_alerts.configuration()
+
+
+@router.post('/monitor-alerts/configuration')
+def configure_monitor_alerts(body: MonitorAlertConfiguration):
+    import monitor_alerts
+    if not body.confirmed_local_only:
+        raise HTTPException(422, 'Confirm local inbox delivery only')
+    return monitor_alerts.configure(body.enabled, body.expected_revision)
+
+
+@router.get('/monitor-alerts')
+def monitor_alert_inbox(offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=50)):
+    import monitor_alerts
+    return monitor_alerts.inbox(offset, limit)
+
+
+@router.post('/monitor-alerts/{window_id}/acknowledge')
+def acknowledge_monitor_alert(window_id: str, body: MonitorAlertAcknowledgement):
+    import monitor_alerts
+    return monitor_alerts.acknowledge(window_id, body.review_hash)
+
+
+@router.get('/monitor-alerts/{window_id}/source')
+def monitor_alert_source(window_id: str):
+    import monitor_alerts
+    return monitor_alerts.source(window_id)
+
+
+class MonitorWindowReplay(MonitorAlertAcknowledgement):
+    confirmed_policy_only: StrictBool
+
+
+@router.get('/monitor-alerts/{window_id}/reconstruction')
+def monitor_window_reconstruction_receipt(window_id: str):
+    import monitor_window_replay
+    try:return monitor_window_replay.receipt(window_id)
+    except (OSError,ValueError,TypeError,KeyError,RuntimeError,sqlite3.Error):raise HTTPException(409,'Reconstruction receipt cannot be verified') from None
+
+
+@router.post('/monitor-alerts/{window_id}/reconstruction')
+def reconstruct_monitor_window(window_id: str, body: MonitorWindowReplay):
+    import monitor_window_replay
+    if not body.confirmed_policy_only:
+        raise HTTPException(422, 'Confirm policy reconstruction only; no behavior verification')
+    try:return monitor_window_replay.replay(window_id, body.review_hash)
+    except (OSError,ValueError,TypeError,KeyError,RuntimeError,sqlite3.Error):raise HTTPException(409,'Reconstruction storage or implementation unavailable; refresh') from None
+
+
+@router.get('/monitor-alert-native-delivery')
+def monitor_native_delivery(after: int | None = Query(None, ge=0, le=9223372036854775807)):
+    import monitor_alerts
+    try:return monitor_alerts.native_delivery(after)
+    except (OSError,ValueError,TypeError,KeyError,sqlite3.Error):
+        raise HTTPException(409,'Native notification source cannot be verified') from None

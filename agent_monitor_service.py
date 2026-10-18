@@ -55,13 +55,14 @@ def ready():
             raise RuntimeError('Monitor schema is missing')
 
 
-def heartbeat(error=None, service_id=None):
+def heartbeat(error=None, service_id=None, *, failures=0, retry_after=None):
     target = lock_path('status.json')
     temporary = lock_path('heartbeat-'+uuid.uuid4().hex+'.tmp')
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(descriptor, 'w') as handle:
-            json.dump({'pid': os.getpid(), 'version': APP_VERSION, 'last_tick': time.time(), 'error': error, 'service_id':service_id}, handle)
+            json.dump({'pid': os.getpid(), 'version': APP_VERSION, 'last_tick': time.time(), 'error': error, 'service_id':service_id,
+                       'failures': failures, 'retry_after': retry_after}, handle)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -91,14 +92,31 @@ def status():
             error=data.get('error')
             if error is not None and (not isinstance(error,str) or len(error)>200):
                 raise ValueError('Invalid heartbeat error')
+            failures = data.get('failures', 0)
+            retry_after = data.get('retry_after')
+            if type(failures) is not int or not 0 <= failures <= 1_000_000:
+                raise ValueError('Invalid failure count')
+            if retry_after is not None and (type(retry_after) not in (int, float) or not math.isfinite(retry_after)
+                    or not 0 <= retry_after <= data['last_tick'] + 60):
+                raise ValueError('Invalid retry time')
+            if (failures and (not error or retry_after is None)) or (retry_after is not None and (not error or not failures)):
+                raise ValueError('Inconsistent retry state')
             age = time.time() - float(data['last_tick'])
+            fresh = 0 <= age <= 15 and data['version'] == APP_VERSION
+            state = 'backoff' if fresh and error and retry_after is not None and retry_after > time.time() else 'current' if fresh and not error else 'degraded'
             return {key:data.get(key) for key in ('pid','version','last_tick','error','service_id')} | {
-                'running':True,'state':'current' if 0<=age<=15 and not error and data['version']==APP_VERSION else 'degraded'}
+                'running':True,'state':state,'failures':failures,'retry_after':retry_after}
         except (OSError, ValueError, KeyError, OverflowError, TypeError):
             return {'running': True, 'state': 'starting'}
 
 
+def retry_delay(failures, interval=2):
+    return min(60, interval * 2 ** min(max(failures - 1, 0), 5)) if failures else interval
+
+
 def run(stop, step=None, interval=2, service_id=None):
+    if not math.isfinite(interval) or not 0 <= interval <= 60:
+        raise ValueError('Invalid monitor interval')
     if step is None:
         from agent_audit import scan_active_monitors
         step = scan_active_monitors
@@ -106,6 +124,7 @@ def run(stop, step=None, interval=2, service_id=None):
     with storage_access(core.LOCAL_DATA_ROOT.resolve()):
         with process_lock('service.lock', blocking=False):
             ready()
+            failures = 0
             while not stop.is_set():
                 if service_id:
                     from monitor_process_control import should_stop
@@ -113,10 +132,24 @@ def run(stop, step=None, interval=2, service_id=None):
                 try:
                     ready()  # A live upgrade must never keep an old worker on a new schema.
                     step()
-                    heartbeat(service_id=service_id)
+                    failures, error_name = 0, None
                 except Exception as error:
-                    heartbeat(type(error).__name__,service_id=service_id)
-                stop.wait(interval)
+                    failures = min(failures + 1, 1_000_000)
+                    error_name = type(error).__name__
+                delay = retry_delay(failures, interval)
+                retry_after = time.time() + delay if error_name else None
+                heartbeat(error_name, service_id=service_id, failures=failures, retry_after=retry_after)
+                deadline = time.monotonic() + delay
+                while not stop.is_set():
+                    if service_id:
+                        from monitor_process_control import should_stop
+                        if should_stop(service_id):
+                            return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or stop.wait(min(2, remaining)):
+                        break
+                    if error_name:
+                        heartbeat(error_name, service_id=service_id, failures=failures, retry_after=retry_after)
 
 
 def main():

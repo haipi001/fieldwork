@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from final_core import init_final_db, mark_campaign_scheduler, router as final_router, run_due_campaign_schedules
 from web3_lab import router as web3_router, shutdown_labs
 from web3_analysis import router as web3_analysis_router
+from web3_import_api import router as web3_import_router
 from web3_practice import router as web3_practice_router
 from traditional_runtime import router as traditional_router
 from traditional_tools import router as traditional_tools_router
@@ -191,6 +192,10 @@ def init_db() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global research_mutation_lock, research_mutations_active, research_purge_active
+    research_mutation_lock = asyncio.Lock()
+    research_mutations_active = 0
+    research_purge_active = False
     from storage_access import storage_access, storage_call
     DATA.mkdir(parents=True, exist_ok=True)
     with storage_access(DATA.resolve()):
@@ -224,6 +229,8 @@ async def lifespan(_: FastAPI):
         try:
             yield
         finally:
+            from web3_import_api import shutdown as shutdown_imports
+            await shutdown_imports()
             if agent_monitor_task:
                 agent_monitor_task.cancel()
                 try:
@@ -243,11 +250,42 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Security Research OS", version=APP_VERSION, lifespan=lifespan)
+# Ordinary mutations stay concurrent so cancellation/configuration changes can
+# interrupt transport. Only history deletion requires an exclusive API gate.
+research_mutation_lock = asyncio.Lock()
+research_mutations_active = 0
+research_purge_active = False
+@app.middleware("http")
+async def serialize_research_mutations(request, call_next):
+    global research_mutations_active, research_purge_active
+    if not (request.url.path.startswith('/api/') and request.method in {'POST','PUT','PATCH','DELETE'}):
+        return await call_next(request)
+    from fastapi.responses import JSONResponse
+    purge = request.method=='DELETE' and request.url.path=='/api/v1/maintenance/all-research'
+    async with research_mutation_lock:
+        if research_purge_active or (purge and research_mutations_active):
+            return JSONResponse({'detail':'记录清除与其他操作不能同时进行，请等待当前操作结束后重试'},status_code=409)
+        if purge:
+            research_purge_active=True
+        else:
+            research_mutations_active+=1
+    try:
+        return await call_next(request)
+    finally:
+        async with research_mutation_lock:
+            if purge:
+                research_purge_active=False
+            else:
+                research_mutations_active-=1
+
+from research_history import router as research_history_router
+app.include_router(research_history_router)
 app.include_router(final_router)
 app.include_router(agent_audit_router)
 app.include_router(browser_ai_router)
 app.include_router(web3_router)
 app.include_router(web3_analysis_router)
+app.include_router(web3_import_router)
 app.include_router(web3_practice_router)
 app.include_router(traditional_router)
 app.include_router(traditional_tools_router)

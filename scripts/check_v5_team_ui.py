@@ -9,6 +9,7 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 import tempfile
@@ -38,6 +39,7 @@ def run():
         app.init_db()
         final_core.init_final_db()
         app.apply_v5_schema(root / "ui.db")
+        app.apply_v6_schema(root / "ui.db")
         app.finalize_database_version(root / "ui.db")
         client = TestClient(app.app, base_url="http://127.0.0.1:8000",
                             headers={"X-Fieldwork-Session": os.environ["FIELDWORK_SESSION_TOKEN"]})
@@ -63,7 +65,7 @@ def run():
             path = parsed.path
             assert parsed.hostname == "127.0.0.1", "unexpected target request"
             if path == "/v5":
-                route.fulfill(path=str(ROOT / "templates/v5.html"), content_type="text/html")
+                route.fulfill(body=re.sub(r"\{\{ asset_url\('([^']+)'\) \}\}", r"/static/\1", (ROOT / "templates/v5.html").read_text()), content_type="text/html")
             elif path.startswith("/static/"):
                 route.fulfill(path=str(ROOT / path.lstrip("/")))
             elif (path in {"/api/v1/engagements", "/api/v1/runs", "/api/v1/runtime/config"}
@@ -103,9 +105,9 @@ def run():
             assert "尚无研究组" in page.locator("#agentsContent").inner_text()
             for count in (1, 2, 8):
                 page.locator("#teamCreate").click()
+                page.locator("#teamAdvanced summary").click()
                 page.locator("#teamResearchers").fill(str(count))
                 page.locator("#teamConcurrency").fill(str(min(count, 2)))
-                page.locator("#teamPreview").click()
                 page.wait_for_function("!document.querySelector('#teamCommit').disabled")
                 assert f"{count} 个逻辑任务" in page.locator("#teamPreviewResult").inner_text()
                 page.locator("#teamAccepted").check()
@@ -116,10 +118,10 @@ def run():
             assert len(client.get(f"/api/v1/orchestration/tasks?campaign_id={campaign['id']}").json()["items"]) == 11
 
             # A response from an older edited plan must never re-enable commit.
-            page.locator("#teamCreate").click()
             flags["hold_preview"] = True
-            page.locator("#teamPreview").click()
+            page.locator("#teamCreate").click()
             page.wait_for_function("document.querySelector('#teamPreview').disabled")
+            page.locator("#teamAdvanced summary").click()
             page.locator("#teamResearchers").fill("2")
             assert delayed
             route, response = delayed.pop()
@@ -187,13 +189,58 @@ def run():
             research._jobs[live_group].join(timeout=5)
             assert not research._jobs[live_group].is_alive()
             page.locator('#teamRefresh').click()
+            fixture_tasks = client.get(f"/api/v1/orchestration/tasks?campaign_id={campaign['id']}").json()['items']
             page.wait_for_function("document.querySelector('#agentsContent').innerText.includes('known usage settled')")
-            assert len(model_hits)==live_count
+            # The default Profile permits one model call at a time; a second task
+            # may be budget-blocked before sending any protocol request.
+            executed = [item for item in fixture_tasks if item['group_id']==live_group]
+            settled = [item for item in executed if item.get('error',{}).get('code')=='model_output_invalid_usage_settled']
+            blocked = [item for item in executed if item.get('error',{}).get('code')=='model_budget_blocked']
+            assert len(executed)==live_count and len(settled)+len(blocked)==live_count
+            assert all(item['status']=='paused' for item in executed)
+            assert len(model_hits)==len(settled) and settled
+            assert all(item['error']['model_output_reason']=='invalid_json' for item in settled)
+            assert 'Output is not complete valid JSON' in page.locator('#agentsContent').inner_text()
+            assert 'No automatic retry.' in page.locator('#agentsContent').inner_text()
+            protocol_count=len(model_hits)
             assert '17 / 12' in page.locator('#agentsContent').inner_text()
             assert 'fixture-private-output' not in page.locator('#agentsContent').inner_text()
             page.reload()
             page.wait_for_function("document.querySelector('#agentsContent').innerText.includes('known usage settled')")
-            assert len(model_hits)==live_count
+            assert len(model_hits)==protocol_count
+            # Explicit saved-history fixture for the read-only review UI; no model success is inferred.
+            from v5_graph import _bridge_node
+            import v5_workers
+            draft_task=executed[0]['id']
+            with final_core.connect() as db:
+                row=db.execute('SELECT * FROM agent_tasks WHERE id=?',(draft_task,)).fetchone()
+                source,_=_bridge_node(db,campaign['id'],source_type='ui_fixture',source_ref='review-input',node_type='evidence',title='Recorded review input',body='Bounded recorded observation',status='recorded',run_id=row['run_id'],attributes={})
+                source_row=db.execute('SELECT * FROM research_nodes WHERE id=?',(source,)).fetchone()
+                claim,_=_bridge_node(db,campaign['id'],source_type='team_research',source_ref=f'{draft_task}:claim:0',node_type='claim',title='Saved draft requires independent verification',body='A review hypothesis, not a finding',status='draft',run_id=row['run_id'],attributes={'task_id':draft_task,'evidence_ids':[source],'counterevidence_ids':[]})
+                capsule=json.loads(row['context_capsule_json']);capsule['research_input_hashes']={source:v5_workers._node_digest(source_row)}
+                db.execute('UPDATE agent_tasks SET context_capsule_json=?,result_json=? WHERE id=?',(json.dumps(capsule),json.dumps({'status':'research_draft','summary':'Saved historical draft fixture','claim_ids':[claim],'open_question_ids':[]}),draft_task))
+            page.locator('#teamRefresh').click()
+            page.locator(f'[data-team-draft="{draft_task}"]').click()
+            page.wait_for_function("document.querySelector('#teamDraftReview')?.textContent.includes('Source material currently matches')")
+            assert 'Not independently verified' in page.locator('#teamDraftReview').inner_text()
+            assert 'Recorded review input' in page.locator('#teamDraftReview').inner_text()
+            with final_core.connect() as db:db.execute("UPDATE research_nodes SET body='changed' WHERE id=?",(source,))
+            page.locator(f'[data-team-draft="{draft_task}"]').click()
+            page.wait_for_function("document.querySelector('#teamDraftReview')?.textContent.includes('Source material is missing or changed')")
+            assert len(model_hits)==protocol_count
+            for reason,caption in [('output_truncated','Generation reached its output limit; response truncated'),('schema_mismatch','JSON fields or types do not match the task contract')]:
+                with final_core.connect() as db:
+                    target=settled[0]['id'];row=db.execute('SELECT error_json FROM agent_tasks WHERE id=?',(target,)).fetchone()
+                    problem=json.loads(row['error_json']);problem['model_output_reason']=reason
+                    db.execute('UPDATE agent_tasks SET error_json=? WHERE id=?',(json.dumps(problem),target))
+                page.locator('#teamRefresh').click()
+                page.get_by_text(caption,exact=True).wait_for()
+                assert len(model_hits)==protocol_count
+            with final_core.connect() as db:
+                problem['model_output_reason']='invalid_json'
+                db.execute('UPDATE agent_tasks SET error_json=? WHERE id=?',(json.dumps(problem),target))
+            page.locator('#teamRefresh').click()
+            page.get_by_text('Output is not complete valid JSON',exact=True).first.wait_for()
             output = ROOT / "build/acceptance/v5-team-ui"
             output.mkdir(parents=True, exist_ok=True)
             for language in ("en", "zh-CN"):

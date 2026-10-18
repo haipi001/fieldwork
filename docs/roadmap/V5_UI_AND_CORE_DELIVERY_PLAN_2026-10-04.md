@@ -240,3 +240,282 @@ UI-00 状态矩阵贯穿所有包；完成一项就更新入口、后端、证�
 验收：34存储暂存/锁/预检测试通过；真实CLI隔离复制256行SQLite数据库及2MiB二进制证据，目标数据库integrity_check=ok、摘要一致、源数据库不变。证据build/storage-staging-tests.log、build/storage-staging-cli.json。未访问主数据库，未重启App，未修改UI或接入误导性迁移按钮。
 剩余：独立外部写入者停止确认、完整数据库一致性与路径URI重映射、配置原子切换、启动/回滚验收未完成。文件暂存不能直接用作已完成迁移；ACL/xattr不复制，后续激活必须重新验证。完整15 Task/8 Gaps目标继续。
 同步状态：当前可见请求、动作及结果同步八个入口，无秘密或实际目标信息。
+
+
+## 2026-10-16 快速暂停恢复的Run执行互斥
+
+用户目标：继续完成完整开发规划，UI不缺失页面功能。回到Master Bundle与UI分包计划，优先处理P0执行幂等/恢复边界。
+复现：新增真实线程阻塞工具测试，先暂停再恢复并启动第二执行器，原代码在首工具仍未返回时重复调用；build/run-overlap-before.log明确1失败。
+实现：新增run_execution，数据目录内私有.run-execution目录、Run ID摘要命名锁文件，NOFOLLOW/owner/权限/普通文件/链接数及inode检查，flock跨进程互斥。工具链、远程仓库流水线、合约流水线三个后台入口串行同Run，嵌套调用复用仍存活的所有权，不同Run并行。线程提交前保留执行引用，执行线程结束才释放；shield executor future防止取消排队线程后引用泄漏，Fork启动也接入。任务取消时仍活线程保留Run互斥与存储共享锁，等待者取消不释放现有执行器锁。锁文件不得在服务运行时删除/替换。
+验证：首轮57相关专项通过（18.13秒）；新增跨进程/取消/独立并发/不安全锁与进程死亡后接管，最终8通过（3.93秒），build/run-execution-final-tests.log。较大组合首轮193通过/1Forge断言失败/6临时目录准备错误，build/run-execution-regression-tests.log；当时磁盘低余量，未据此断言所有错误具体原因，独立真实Forge重跑恢复预期1反例。同一完整组合顺序重跑200全部通过/1既有Starlette警告（70.33秒），build/run-execution-regression-retry.log。git diff --check通过。
+安装：确认无活跃Run/租用AgentTask/模型调用，CUA正常退出确认8000停止监听，再重启源码关联0.68.75/build153，health ready。队列/证据/报告/智能体四页实际打开无加载失败，留在智能体清单。九类业务表计数/摘要不变、quick_check ok，build/run-execution-native-before.json与-after.json；上一轮证明包有界读取也随此次重启加载。未创建真实研究，未重打独立发行包或Git提交推送。
+回滚：无需schema迁移；仅在停止相关执行且确认无存活线程后，人工审查回退本轮入口装饰与线程封装及run_execution模块，保留其它未提交成果；不删除在用锁文件，不直接恢复旧数据库。
+边界：仅上述三个后台入口及其封装线程，独立单工具API、V5 AgentTask租约及其它执行类型不能据此统称全局at-most-once；没有证明断电后工具副作用/所有进程树/真实模型质量。真实本机模型服务仍未提供可用地址，完整15 Task/8 Gaps、三域质量、持续监控、迁移激活回滚与发布门继续。
+同步状态：目标、复现、实现、测试/安装证据及边界同步八个入口，无秘密或真实目标信息。
+
+
+## 2026-10-16 单工具HTTP入口共享Run执行权
+
+用户目标：继续完整开发规划并保留UI页面功能。沿P0执行一致性核对单工具入口。
+实现：单工具HTTP入口改为async，并经独立serialized helper与后台工具链共用跨进程Run锁；交互等待上限1秒，占用返回409明确重试提示，不调用工具或扣预算。检查等待后的状态，若期间转暂停/停止/失败/超时/预算耗尽则要求重新确认；保留用户在原已暂停状态明确发起单工具的能力。工具执行与覆盖记录写入整体留在受锁线程中，取消等待不提前释放执行权或漏掉线程完成后的覆盖记录。公共入口reuse_parent=False，不能借继承上下文冒用内部执行权；后台嵌套工具链仍可复用内部父执行权。
+验证：初轮18单工具/互斥/模板专项通过（12.96秒）。实际扫描与工具链/恢复选择回归26通过（136未选、1既有警告，57.69秒），build/single-tool-real-scanner-regression.log，包含本机真实HTTP/TLS工具及Nuclei标准/Deep正反例，非模型质量证明。新增占用等待测试最初发现TestClient继承调用方执行上下文可绕过公共入口；随后显式拒绝父执行权复用，最终24单工具/互斥/模板/线程取消组合通过（13.98秒、1既有警告），build/single-tool-control-final-tests.log。覆盖背景工具不重叠、等待后暂停/停止409、原已暂停主动调用保留、取消后先完成覆盖才交权、占用不扣预算/不留Artifact/不漏锁。git diff --check通过。
+安装：无活跃研究/租用任务/模型调用时CUA正常退出，确认8000停止监听后重启源码关联安装App，health ready。工具能力/运行队列/智能体三页实际点击正常；九类业务表摘要和计数不变、quick_check ok，build/single-tool-native-before.json及-after.json。安装元数据0.68.75/build153，未重打独立发行包或Git提交推送。
+回滚：无schema迁移；停止执行并确认线程结束后，人工审查回退本轮公共入口/helper及等待参数增量，保留其它互斥修复与未提交成果，不删除在用锁文件，不恢复旧数据库。
+边界：覆盖单工具HTTP入口和此前三种后台入口，不宣称任意直接Python调用或其它执行类型全局串行；不强杀已开始的工具，不代表副作用exactly-once或全部真实模型质量验收。本机模型具体服务信息仍待用户回复，其余完整15 Task/8 Gaps及UI-00到QA-07继续。
+同步状态：目标、实现、测试/安装结果与边界同步八个记忆入口，无秘密或真实研究目标信息。
+
+
+## 2026-10-16 监控调度错误退避与可见重试状态
+
+用户目标：继续完整开发规划，保留UI页面功能，推进UI-05持续运行边界。
+发现/实现：独立监控服务与App内监控调度原在调度层错误后固定2秒重试。新增共享retry_delay，连续错误2/4/8秒递增，最长60秒，成功重置；独立服务退避期间每最多2秒更新错误心跳并检查托管停止请求，停止不等到长退避结束。心跳增加failures/retry_after且严格验证类型/有限值/范围/一致性，旧心跳兼容；新backoff只在新鲜心跳/版本匹配/错误/未来重试时显示，重试时间到期未成功仍degraded，不误显示current。存储/心跳写入失败仍明确终止，不承诺自动重启。
+UI：原后台生命周期区域保留，新增中英等待重试、连续失败和下次重试显示；其余页面/按钮不删除。状态表示调度错误，不把进程在线当完整采集或漏洞确认。
+验证：初79监控控制/Agent Audit组合通过，最终82通过/1既有警告（15.94秒），build/monitor-backoff-final-tests.log。退避时间测试用受控时钟/故障step验证2/4/8、成功重置及16秒退避中第2秒响应停止；心跳状态测试读写真实本机私有文件，App调度取消及错误计数保持。script/check_v5_workspace_ui.py通过18导航/5 Agent tabs/8 surfaces/144显示组合及实际隔离API交互，新增backoff夹具断言等待重试/连续失败/下次重试/错误可见，零模型调用，build/monitor-backoff-workspace-ui.log。浏览器测试使用独立临时库和未启用采集的监控进程控制；不是实际连续采集故障或长期运行质量验收。git diff --check通过。
+安装：无运行研究/租用任务/模型调用/启用监控，独立服务stopped，CUA正常退出确认8000停止监听后重启源码关联0.68.75/build153，health ready。实际打开监控/设置/智能体，监控标题首次观察尚未出现后已完整复核本机安全监控页；后台进程显示未运行，手动刷新当前监控显示既有已暂停及历史分析窗口，未启用采集。十二类业务/监控表计数/摘要全一致、quick_check ok，build/monitor-backoff-native-before.json与-after.json。App最终留在监控页，未独立重打发行包或Git提交推送。
+回滚：无schema迁移，新增心跳字段旧代码可忽略；停止相应监控服务后人工审查回退本轮循环/状态/UI增量，保留其它未提交成果，不恢复旧业务库。
+边界：仅调度层错误退避，不是登录启动、进程崩溃自动重启、自动独立复验/告警或真实模型研究闭环。具体采集器已降级/暂停的恢复策略仍独立，原15 Task/8 Gaps完整范围继续；本机模型服务详情仍待回复。
+同步状态：当前目标、实现、自动与原生验收、回滚边界同步八个记忆入口，无秘密或真实研究目标信息。
+
+
+## 2026-10-16 真实 DeepSeek 研究调用验收
+
+新增显式环境开关 FIELDWORK_LIVE_DEEPSEEK=1 的独立验收 tests/test_live_deepseek_research.py，默认跳过，避免普通回归收费。隔离数据库、隔离凭据存储、仅发送合成公开图材料，经过真实组队预览/提交/启动、路由、预算预留、独立传输子进程、模型响应解析、用量结算及草稿落图。未替换网络或模型输出。
+
+首次启动因费率为零被已有门拒绝，无推理；保留失败日志 build/live-deepseek-research.log。配置仅用于隔离测试的保守上界 10 USD/百万词元后真实运行：1 passed，6.98s；输入251/输出888，1个settled调用、0正式Finding，模型认为空正文材料不足，只生成5个问题，无假设。费用11390µ为保守费率估算，不是账单。证据 build/live-deepseek-research.json 与 build/live-deepseek-research-retry.log。普通边界回归9 passed/1 skipped（live默认跳过），build/live-research-boundary-regression.log；diff检查通过。主库runtime_calls/runtime_usage均0，没有向云端发送主库研究上下文。
+
+官方价格页 https://api-docs.deepseek.com/quick_start/pricing/ 当前说明旧ID仍接受但由新版服务；本轮保持用户保存的模型ID。不得将模型别名视为冻结权重版本。主库零费率Provider虽然健康，但不能启动云研究，费率编辑及UI提示需继续完善；不声明主库可运行或整体完成。本次不是漏洞自动发现、独立复验、三域闭环、组队收益或三次冷启动验收。
+
+
+## 2026-10-16 Provider 费用上界编辑
+
+新增 ProviderUpdate.cost_micros_per_million_tokens（严格整数0..10^10）。SQL json_set仅更新费率，保留其余metadata、密钥、地址、模型及健康记录；现有配置哈希使旧Profile路由阻断，新不可变版本绑定当前配置。UI新增每Provider费用上界输入/保存、零费率云研究阻断提示、变更影响确认与创建新Profile交接，中英文保留原操作。
+
+隔离后端15 passed，build/runtime-cost-edit-final-tests.log。首轮测试错误假定Profile视图有current字段，改为检查哈希差异及实际旧Profile路由拒绝。真实API浏览器验收通过：1Provider、1Profile、2策略版本、1健康请求、0模型请求、0pageerrors，build/runtime-cost-edit-ui-retry.log。首轮浏览器因新增交接替换按钮而旧测试仍找原按钮超时；重排交互同时覆盖两条原/新交接后通过。JS/diff检查通过。
+
+按已授权DeepSeek接入，将主库现有Provider设置1200000µ/百万词元统一保守预算上界（不是账单价），创建DeepSeek · 研究组 · 费用上界版本；旧Profile保留，不自动改绑旧研究组或重启任务。依据当前官方页面https://api-docs.deepseek.com/quick_start/pricing/ Flash最高输出1.2USD/百万，统一输入/输出上界会高估输入费用；价格变化需复核。主库0活动Run、0执行任务、0调用、0活动监控后正常重启来源链接App，原生实际显示输入1200000、保存按钮、新Profile及HEALTHY。未运行主库研究，未Git提交/推送，完整规划仍未完成。
+
+
+## 2026-10-16 Profile 当前性与过期 UI
+
+Profile API 新增动态 provider_configuration_current/status 与 changed_provider_ids，比较冻结Provider哈希和当前注册表；配置内容与immutable_hash不变，Provider缺失也标stale。config列表复用同次Provider查询。模型注册表显示过期与创建新版本提示；路由选择器保留历史并标过期；组队选择器保留历史但禁选过期项，默认不选过期activeProfile。路由执行守卫保持不变。
+
+20相关测试通过（build/runtime-profile-freshness-final-tests.log），覆盖费率更新保留凭据/健康/其他metadata、旧版本内容不变与实际路由阻断、新版本current、Provider删除stale。原整对象相等测试更新为不可变字段相等加动态状态断言。真实API浏览器含编辑费率后过期注册表/选择器提示，中英文/主题/窄屏及原配置策略流程通过，0页面错误/0模型请求（build/runtime-profile-freshness-ui-verified.log）。先前浏览器测试的语言错误与刷新竞态失败日志保留；改为当前English断言并等待选择器具体状态后通过。JS/diff检查通过。
+
+空闲主库0运行Run/执行任务/模型调用/活动监控后正常重启来源链接App，原生页面确认旧DeepSeek Profile提示Provider已变化，新费用上界版本保留且Provider HEALTHY。未自动改绑组或启动主库任务。组队禁选代码已交付，未额外声称原生组队对话框点击验收。整体规划仍未完成。
+
+
+## 2026-10-16 研究草稿及材料审阅
+
+新增只读GET /api/v1/workers/research/tasks/{task_id}/draft：单读事务核对结果引用结构/上限/去重，节点campaign/Run/type/team_research来源/精确task索引及task属性；错误谱系409。返回最多5假设/10问题与20个冻结输入的当前状态（current/changed/missing），不调用模型，不新建验证任务，不声明canonical资格。历史输入变化仍可审阅并明确变化；缺失材料不伪造原文。
+
+智能体任务新增审阅草稿与原始材料按钮；集中显示摘要、Run、假设/问题、原始证据与反证及引用，明确尚未独立复验。页面更新/项目切换/重新选择时丢弃过时异步结果，文本HTML转义。原始JSON检查入口、页面及原控制保留。
+
+相关15 passed（build/research-draft-review-tests.log），覆盖真实worker持久化后的读取、证据/反证、材料修改/删除、来源错误/Run错配/重复/过多引用拒绝、读取不增调用/正式发现。模型输出在单元测试中是显式替身，不是模型质量证明。真实API浏览器原1/2/8组队/预算/暂停/错误输出结算/刷新不重放/8显示组合保留通过，新增显式历史草稿fixture审阅及材料变更提示通过，0页面错误，仅原有1协议模型请求（build/research-draft-review-ui.log）；此UIfixture不是新模型执行成功。JS/diff通过。
+
+主库无活动Run/执行任务/模型调用/活动监控后正常重启来源链接App加载。主库无已完成草稿，原生不注入样例、未声称点击真实草稿验收。独立复验参数/回执与完整三域自动闭环继续未完成。完整15Task/8Gaps保留进行中。
+
+
+## 2026-10-17 研究组产出与独立复验的生产者绑定
+
+检查发现team_research草稿仅task_id，复验入口依赖producer_task_id，存在同组独立性检查缺口。新草稿增加producer_task_id/producer_runner_ref；复验对新旧team_research都从真实任务结果claim_ids/精确source_ref/项目/Run与runtime_calls任务调用账本解析生产者，拒绝不一致属性。历史缺少producer字段但真实谱系完整可兼容，不伪造历史runner身份。请求记录保存真实producer，已有同组和同runner拒绝门因此生效。
+
+进入复验需冻结20以内输入仍存在、未改、未归档，全部草稿支持证据及冻结输入中的反证必须携带；修改草稿counterevidence_ids不能丢弃冻结反证。拒绝时不新增复验任务/请求。一般非team claim行为保留。未自动构造可执行复验契约、未执行目标请求、未产生正式发现。
+
+29 passed、1既有warning，build/team-verifier-boundary-final-tests.log；包含新/历史同组拒绝、独立请求保存生产者、遗漏反证/改草稿反证列表/变化或删除材料/伪造任务或runner来源拒绝，既有草稿与复验/研究worker回归。首轮使用不同模块的节点哈希导致有效材料误判，修正为实际research输入摘要算法后通过，失败日志保留。diff检查通过。无schema迁移/UI页面删除或凭据变更。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常退出、确认端口关闭、启动来源链接App加载修复。未向主库新增研究或复验任务。完整UI-00到QA-07及15Task/8Gaps继续未完成；下步可执行复验契约的用户交接及真实自动发现/三域闭环仍需推进。
+
+
+## 2026-10-17 当前工作区全量回归
+
+命令 `.venv/bin/python -m pytest -q` 正常完成：1353 passed、4 skipped、2 warnings，523.69秒。日志 build/full-current-regression-20261017.log。本次覆盖截至研究组生产者与独立复验修复的当前工作区，不沿用1176通过的旧快照。记录330个Python/JS/HTML/CSS/lock源码文件SHA及Git/Python环境，build/regression-source-manifest-20261017.json；测试期间快照到完成核对0文件变化，aggregate SHA256 2785e5fa91dc83da37287f05d53798ffdbbf79013caae1fb41d39d0c3eefa1da。工作区未提交，不是Git HEAD已包含这些修改的证明。
+
+定向核对跳过原因（2 passed、4 skipped，0.92秒；build/full-regression-skips-20261017.log）：可见Chrome隔离流程2项需FIELDWORK_TEST_BROWSER；原生Keychain1项需FIELDWORK_TEST_KEYCHAIN；真实付费DeepSeek1项需FIELDWORK_LIVE_DEEPSEEK。均保持默认未开启，没有偷偷运行付费/可见浏览器/钥匙串操作。警告：Starlette依赖弃用；故意构造重复entry.py ZIP的拒绝测试警告。无失败、未为转绿禁用测试。git diff --check通过。本轮无应用源码修改/DB配置改动/Git提交或推送。
+
+全量工程回归并非完整产品验收。当前独立Verifier实际支持三类明确契约：http_object_read_v1、package_applicability_v1、loopback_http_status_v1；普通研究假设不自动获得可执行复验契约。完整真实工具+模型自动发现→独立复验→Receipt→报告三域闭环、正/修复/合法反例与3次清洁启动、8/16/32组队收益、全部源治理/迁移激活回滚/独立发行仍未完成，原全部15Task/8Gaps保持进行中。下一步应在有实际结构化输入的类型推进契约派生与复验衔接，不为任意模型文本生成伪验证入口。
+
+
+## 2026-10-17 软件包适用性复验计划与页面操作
+
+新增GET intelligence/matches/{id}/verification-plan及POST verification-request：从实际持久化Trivy产物、精确artifact包指纹、当前情报/Scope/Policy及图引用派生固定package_applicability_v1契约。预览不写表、不发请求；预览摘要绑定match整行、证据节点摘要、产物SHA与当前授权。提交重算摘要，原子创建确定性Claim/derived_from边/复验请求，随后复用已有独立Verifier材料守卫，失败整事务回滚；重复提交幂等。执行不自动发生，保留单请求离线执行门。该域仅包适用性，不能当成可利用漏洞或正式Finding。
+
+保留全部原UI，在研究假设页有选中Campaign时增加软件包适用性复验区：分页匹配、准备、明确确认创建、执行指定request_id、回执页交接、中英文。项目/代际变化后异步结果不写回新上下文，网络/材料/空态明确显示。新增static/v5-package-review.js并接入模板和原页面，不删除页面或原控件。
+
+26相关测试通过，build/package-verification-plan-final-tests.log：预览无写入、提交幂等、实际Seatbelt独立子进程回执、版本不符不确认、过期预览/变化产物/变化来源/合成产物阻断、后置契约失败无半成品。Trivy输出为明确持久化协议fixture，本轮不是实际Trivy扫描/真实模型发现。真实API浏览器模块操作通过，1实际独立回执/0正式Finding、0页面错误、无扫描/模型调用，build/package-verification-ui-retry.log；首次默认Playwright浏览器未安装，使用已有Chrome后通过。原研究页候选衔接/结果/跨项目/删除确认回归通过，build/package-verification-research-page-ui.log。JS/diff检查通过。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常退出确认端口关闭，再启动来源链接App加载；原生研究假设页可用，当前选中项目无Campaign，未为演示写主库数据或声称真实匹配点击通过。全量1353通过基线先于此增量，本次未重跑全仓；以上专项为当前证据。完整15Task/8Gaps和真实工具+模型自动发现/三域确认/报告验收继续未完成。
+
+
+## 2026-10-17 实际Trivy产物到包适用性独立回执
+
+本机Trivy0.74.0、初始无漏洞库，使用CLI默认官方OCI源mirror.gcr.io/aquasec/trivy-db:2下载128.03MiB压缩库（展开约1.5GiB），正例命令90s内完成；关闭遥测/依赖识别API，未装待测包。固定本地requirements三样本：requests2.31.0、requests2.32.5、idna3.10。固定/无关样本用已缓存DB、skip-db-update及45s时限。三个实际CLI都exit0，原始JSON未伪造。OSV API实际获取GHSA-9wx4-h78v-vm56（151精确受影响版本），原始SHA07a0249f7b5b44ffde672d5a117b004317a1664a81099ad5827f08d4a4154354。官方Requests公告https://github.com/psf/requests/security/advisories/GHSA-9wx4-h78v-vm56说明此问题修复于2.32.0；本轮只针对这份公告。
+
+实际发现适配缺口：只保存Vulnerabilities，遗漏Trivy Packages。新增code.dependency_inventory，保存实际Name/Version/PURL；普通清单不进入安全Candidate。缺字段/错误结构/每结果超过200项显式inventory_incomplete，独立Verifier拒绝，不信任静默截断清单。Oracle接受原漏洞条目及包清单并保持PURL/版本一致性守卫。
+
+三个隔离数据库从实际CLI输出经过正常parse/_persist_result、实际公开OSV导入、由实际包清单派生fingerprint、自动契约计划、请求、Seatbelt独立Verifier：正例选定CVE-2024-35195命中1，包适用性verified；定向修复样本该CVE命中0，回执inconclusive；无关包该公告match0，无回执。三个样本均0正式Finding/0模型调用。固定和无关样本各存在其他2026CVE，不能称其整体无漏洞。本轮是工具CLI产物经验收harness导入链，不是App完整工具启动、模型自动发现或3次冷启动全链验收。fixed的inconclusive也不是修复确认。无新增用户真实研究目标。
+
+63相关通过、1既有warning，14.20s，build/trivy-inventory-verified-tests.log。包含3实际产物样本、清单普通观测/不入Candidate、错误或过长清单显式标记、后置验证器拒绝不完整清单且请求事务回滚，及包计划/情报/本地Verifier/仓库执行回归。实际产物验收需FIELDWORK_REAL_TRIVY=1，普通测试默认跳过，避免依赖本机build样本。
+
+证据目录build/actual-trivy-package-20261017：三原始stdout/log/requirements、公开advisory.json、三个落库产物和acceptance.json回执、manifest.json。记录二进制/漏洞库/文件SHA及DB时间；DB SHAbf1f1b29d76cae9ff085d418cb4bfdb3906b6069f837abdef06558b8102dd1db。来源使用条款尚未完整核实，局部导入明确标source terms not verified/local acceptance，不宣称情报源治理完成。没有分发这些原始数据库。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常重启来源链接App加载适配，healthready，未注入主库样本。UI无页面/功能删除。全量1353基线早于此改动；本轮专项不代替全量或真实三域自动发现/独立确认/正式报告。全部规划保持进行中。
+
+
+## 2026-10-17 包复验证据文件读取边界
+
+_read_trivy_artifact复用read_proof_file：在绝对产物根目录内按路径组件拒绝符号链接，非阻塞打开普通单链接文件，限256000字节，读取前后与当前目录项核对设备/inode/mode/nlink/size/mtime/ctime及字节数，再核对DB SHA并解析对象JSON。拒绝硬链接、FIFO、超限、读取中追加或同字节替换；过深/损坏JSON及错误路径作为不可用材料，不抛500。保留原大小上限/产物SHA/独立验证门，不降低检查或改变契约。
+
+47相关测试通过（build/package-material-reading-tests.log，10.18s），覆盖普通材料、错SHA/根外路径、链接/父链接/硬链接/FIFO、超限/深JSON/损坏JSON，以及读取后同字节替换与追加。真实Trivy三样本复验重放3通过（build/package-material-actual-replay.log，1.63s），未重扫/下载/调用模型；原始文件及落库产物manifest核对0变化。正例仍仅包适用性、定向修复仍inconclusive、无关包无match。git diff --check通过。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常退出、端口关闭，再启动来源链接App加载修复；未改主库研究配置/创建任务。无UI页面/功能删除，无schema迁移、提交或推送。全量1353基线早于本次增量，本轮47+3不能替代当前全仓、实际App三域闭环或完整目标验收。全部15Task/8Gaps继续。
+
+
+## 2026-10-17 本次包复验结论与精确回执读取
+
+请求GET增加latest_receipt_id，只查询该request的绑定回执；不存在时null，不执行验证。包复验页执行后读取本次request与具体receipt，核对request/campaign/claim及applicability_only域，再显示任务状态、回执ID、结论、当前材料/独立执行与局限。仅完整/当前/独立/可确认的verified显示包适用性确认，过期或不满足门显示当前不能确认；不把executortask succeeded等同漏洞确认。failed_attempt/stopped/idle无回执不再展示泛化成功提示。已完成请求禁用执行按钮，独立的刷新本次结果只读，不重放。
+
+刷新前清除旧结论，错配回执或读取失败不保留旧确认；代际变化后不写回新Campaign。已存在回执的idle执行只读已有结果，不错误称新执行成功。原回执页入口保留，明确仍未证明部署/可达性/可利用性。
+
+24后端相关通过，build/package-result-api-final-tests.log：最新回执从null到精确ID及taskstatus，既有计划/本地Verifier/回执逻辑保留。真实API浏览器build/package-result-ui-complete.log通过：创建请求、显式模拟failed_attempt不显示成功、不自动重试；用户测试第二次点击进行实际独立Verifier并产生1回执；显示精确当前结论、执行按钮禁用、回执跳转、中英文；错配request_id/503时清除结果，恢复读后仍可读取；改原材料后标题不再确认；所有多次刷新不增执行调用。两次tick HTTP请求中一次为明确故障注入响应、一次为实际独立执行。0页面错误/0正式Finding/0模型。初次UI失败暴露测试临时目录/var父链接与已加固读取门冲突，测试根从创建起规范为实际/private路径；未放松产品读门。失败诊断日志保留。JS/diff通过。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常退出确认端口关闭，再启动来源链接App加载；不向主库注入样例或执行复验。新结果区当前主库无材料，仅以隔离真实API和原生页面启动验收为证，不声称主库结果点击完成。全量1353基线早于本次增量，完整15Task/8Gaps及三域自动发现/独立确认/报告仍未完成。
+
+
+## 2026-10-17 包适用性结果确认与历史回执
+
+包复验UI新增明确的确认记录表单，仅对完整、当前、独立且promotion_eligible的verified包回执出现；调用原intel match verify门，不生成正式Finding。确认失败先清除旧结果，刷新重新读取后可重试；服务端确认响应current不为true时不恢复当前确认标题。匹配列表保存回执后提供查看已记录回执，重新进入页面只读获取原绑定回执及request，核对campaign/claim/contract match/产物/域，过期匹配仍可核查历史但不能准备当前复验，并明确输入或授权已变化。历史视图不伪造Run或预览指纹；缺Run明确标示，不新建计划。
+
+后端同一match/claim/receipt重复确认仍先核对当前授权/材料/回执，再返回已有记录，不变updated_at、不重复match.verified事件。材料变化后即便重复原确认也409，不以幂等旁路验证门。
+
+27相关测试通过（build/package-result-recording-final-tests.log，9.63s），覆盖新确认/重复幂等/确认后材料变化拒绝和既有包计划/情报/独立Verifier。真实API浏览器（build/package-result-recording-ui-verified.log）完整正例确认保存、失败确认503清除旧结果并恢复、页面状态清空后从已记录回执恢复且0新写、错配/503/变化材料、过期列表历史只读入口和不重执行通过，0页面错误/0正式Finding/0模型。日志中两次tick为一次故障响应+一次实际独立执行；两次verify为一次503注入+一次真实确认，未混称真实重复执行。JS/diff通过。
+
+主库无活动Run/执行任务/模型调用/活动监控后来源链接App正常退出，端口关闭再启动加载；主库不注入样例、不确认任何实际研究结果。已有页面/入口/控件保留。当前空主库资料不足以原生点击该流程，证据为隔离真实API浏览器及原生启动加载。全量1353基线早于本轮，完整规划与三域自动发现/确认/报告仍未完成。
+
+
+## 2026-10-17 扫描产物自动包指纹入口
+
+新增Campaign当前授权范围下Trivy产物分页列表（不返回文件URI），只读fingerprint-plan与绑定preview_hash的提交接口。产物必须同项目、当前Scope/Policy、非合成、已脱敏JSON；用既有稳定有界读取器核对SHA/实际完成状态。直接提取实际PURL/名称/版本并核对一致性、去重，目前支持PyPI/npm；其他类型明确列出，漏洞记录-only材料明确不是完整包清单。不完整清单、错误类型/PURL、过长名称版本、超过200观测或100唯一包版本拒绝。旧fingerprint接口抽出同事务helper保持行为；提交前后复核来源，变化则回滚全部图节点/匹配。
+
+研究假设页现有复验区增量加入产物分页/选择、包指纹预览、可展开包清单与显式确认；处理后显示包数/当前匹配并刷新后续验证入口。不启动扫描、模型或验证，不晋升正式Finding。页面切换代际守卫保留，选择器限宽，原匹配/复验/结果/历史入口保留。
+
+42相关通过、1既有warning，build/artifact-fingerprint-final-tests.log（11.71s），包括3实际Trivy产物通过新自动提取接口进入原独立回执链（测试不再自行提交包名版本），以及预览无写入、同源幂等、错项目/陈旧摘要/变化字节拒绝、写后来源变动整事务回滚、缺/错/过长/超量清单及原情报/包复验/独立Verifier。真实工具stdout为此前已冻结的真实扫描输出，本轮不重扫/下载或调用模型。正常样本结论保持正例仅适用性verified、定向修复inconclusive、无关包无匹配。
+
+真实API浏览器build/artifact-fingerprint-ui-full-flow-retry.log从无匹配开始，经产物预览/展开核查/确认指纹→匹配→请求→实际独立执行→记录结果→历史恢复及既有故障注入/过期只读流程通过，0页面错误/0正式Finding/0模型。首次测试在折叠details内读取可见文本失败，测试改为实际展开核查后通过，未降低产品功能或检查。JS/diff检查通过。未再次全仓，1353基线早于本轮。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常退出确认端口关闭，再启动来源链接App加载。主库不注入样例或生成指纹/复验。当前原生无合适材料，原生仅确认启动，实际点击证据来自隔离真实API浏览器。情报源导入治理、真实模型发现、三域确认与报告等完整15Task/8Gaps仍在进行。
+
+
+## 2026-10-17 审阅后情报来源导入入口
+
+新增records/preview与records/import-reviewed，纯规范化helper复用于原records导入：最大2MB、1–100记录，预览返回规范化记录ID/受影响包数量/摘要及preview_hash，不写库、不访问来源URL；确认时重算规范化内容和来源声明摘要，不一致409，超过上限413，原幂等导入保留。明确source_terms_verified=false，不声称发布者、许可或来源条款被验证。
+
+新static/v5-intel-import.js在研究假设页有选中Campaign时显示本机全局情报导入表单：OSV/normalized格式、来源名、许可证/条款声明、只记录不访问的HTTPS来源、JSON粘贴或本地文件（2MB）、规范化预览与独立确认。新修订可能使旧匹配过期，历史保留。输入变化使预览/勾选失效；异步文件读取和请求有代际守卫，失败/上下文变化不自动重发。导入成功刷新既有产物/匹配区，不启动指纹、扫描、模型或复验。所有原页面/入口保留。
+
+36相关通过、1既有warning，build/reviewed-intel-import-final-tests.log（9.93s），包含预览零写入、重复导入幂等、改许可/改记录摘要不匹配、超大输入零写入及原情报/自动指纹/包计划、3真实Trivy冻结产物重放。普通测试真实产物仍需显式开关，本轮不重新扫描或下载，不发模型请求。真实API浏览器build/reviewed-intel-import-ui.log从空情报库开始实际上传JSON，预览无写入、修改声明清空预览、确认导入1记录，然后走自动指纹/独立回执/确认/历史与原故障分支，0页面错误/0正式Finding/0模型。日志writes包含两个POST预览请求，不能把POST方法计数当作数据库写入数。原研究页候选衔接/结果摘要/项目隔离/删除确认检查通过，build/reviewed-intel-import-page-ui.log。JS/diff检查通过。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常退出确认端口关闭，再启动来源链接App加载。主库未自动导入来源、创建匹配或复验任务；原生当前无Campaign材料，仅确认启动，具体交互以隔离真实API浏览器为证。全量1353基线早于本次增量。官方源使用条款/速率/缓存/新鲜度治理与签名认证、完整三域真实模型发现/独立确认/报告仍未完成；完整15Task/8Gaps继续。
+
+
+## 2026-10-17 来源复验UI语言与窄屏可读性
+
+使用实际六份V5样式表检查新增来源导入/包复验模块，覆盖en/zh-CN × dark/light ×1440/1024/680/375共16组合，并在导入预览及指纹展开预览阶段额外检查375宽度。发现并修复：导入完成/文件读取/预览等自有状态字符串在切语言后未更新，改为语言求值状态绑定且保留表单内容；匹配行名称/原始状态/过期说明挤在一起，增加仅packageVerification内作用的分行与操作间距，状态名称中英映射，任务succeeded显示执行完成。回执原文保留，不改证明内容。原页面及全部控件保留。
+
+真实API完整导入→指纹→独立回执→确认→历史/故障链及16显示组合通过，build/package-source-layout-ui-final-verified.log：0页面错误，导入/复验区各唯一1个、无横向溢出、语言/主题切换不新增POST、不丢来源输入值；断言导入提示/任务状态/适用性状态语言一致。DOM与视口图核查确认无重复模块。早期fullPage抓取出现重复绘制图像但DOM仅2个面板，最终证据采用视口top/result分区截图，build/acceptance/package-source-layout/*-top.png及*-result.png，已查看375中文暗色结果及亮色导入视口。不用异常fullPage拼图断言产品重复。
+
+本轮仅前端/样式/验收脚本改动，无后端行为或schema变更，不为转绿删除功能；node语法及git diff --check通过。浏览器仍使用明确持久化工具fixture/实际隔离Verifier，非新扫描或模型发现。真实HTTP故障注入与正式Finding0边界保留。
+
+主库0活动Run/执行任务/模型调用/活动监控后正常退出、端口关闭，再启动来源链接App加载。主库未导入或执行研究。原生缺实际Campaign材料，具体表单操作以隔离浏览器为证。不是全站18页或当前全仓重跑；全量1353基线及原完整15Task/8Gaps范围保留，三域自动发现/独立确认/报告和源治理继续未完成。
+
+
+## 2026-10-17 监控登录启动与异常重启
+
+新增 monitor_startup.py 与固定前台入口 monitor_login_worker.py。macOS 登录任务绑定当前工作区、解释器、入口及版本，仅处理已启用监控，不自动授权采集或调用模型。预览摘要绑定现有配置与注册状态，确认后私有原子写入 plist 并 bootstrap；停用按固定自有 label bootout，拒绝未知配置及未解决手动进程。执行锁与 management 锁围栏阻止重复进程，仅恢复可证明属于登录任务的崩溃遗留；正常停止不立即重启。恢复备份在登录配置存在时拒绝，防止未来登录写入。
+
+安全监控页保留原入口，新增登录启动/确认/撤销表单、配置与实际心跳分离提示；旧高级预览保留，自动独立复验与告警明确未完成。启动已有登录任务使用 kickstart，不另起手动子进程。
+
+验收：build/monitor-startup-regression-tests.log 为82通过/1既有warning（31.38s）；build/monitor-startup-native-launchd.log 为实际隔离 launchd 1通过（73.54s），验证当前gui域注册、按自有label注入异常退出、不同身份/PID重启、正常停止35秒不重启以及撤销清理，DB字节不变。未测试真实注销/重登录或重启电脑。build/monitor-startup-focused-ui.log 为真实API隔离文件+模拟launchctl的表单启用/撤销及未确认不提交、英文/680宽度检查，2提交/1bootstrap/1bootout/0页面错误/0模型；初次脚本漏 TestClient lifespan导致agent_audits表缺失，修复测试初始化后通过，原失败日志不作通过证据。build/monitor-startup-workspace-ui.log 为18页面/5Agent页签/144显示组合原工作区回归通过；该次不含新增表单点击，不以零字节的controls-final日志作通过证据。JS语法与git diff --check通过，当前全仓未重跑。
+
+主库检查0活动Run/执行任务/模型调用/活动监控且无登录配置后，CUA正常退出App，确认8000端口关闭，再启动来源链接 /Applications/Fieldwork.app。health ready，原生安全监控页显示0.68.75、独立进程未运行、尚未启用登录启动及两个未勾选确认项。没有启用主库登录任务、采集或研究。现有DeepSeek选择继续沿用，凭据未写日志/归档。来源链接App可变代码路径不等于独立签名可信辅助程序或正式分发；当前gui域测试不等于冷登录验收。完整15Task/8Gaps继续，自动独立复验/告警、真实三域模型发现与报告、来源治理、迁移激活及发布门均未整体完成。未提交或推送Git。
+
+
+## 2026-10-17 本机策略告警收件箱
+
+按UI-05四段拆分要求继续接通告警的本机通道；完整规划范围保留。新增monitor_alerts.py，使用既有v5_events追加配置、告警及处理记录，无schema变更。配置默认关闭、revision并发检查和明确确认，仅应用于启用后新分析窗口。agent_monitor_windows.tick在同一BEGIN IMMEDIATE事务中提交窗口、消费事件及本机告警；有策略异常才派发，每窗口一次，派发失败回滚窗口与消费标记，可安全重试。关闭不删除历史且不回填旧窗口。没有新增采集授权、模型调用、外部网络或独立复验。
+
+本机收件箱分页读取冻结窗口，校验产物及input_digest后展示异常数、策略边界、来源ID和处理状态。review_hash绑定审阅内容及处理状态，标记已处理只追加审阅记录，不改复验状态或创建Finding；重复当前回执幂等、旧摘要拒绝。配置/读取/确认API严格限制输入及分页。UI在安全监控后台生命周期追加真实配置、来源展开、标记处理、分页及语言切换，原页面/登录进程控制/高级预览均保留。系统通知、外部通知和自动独立复验未实现；本机派发是已完成的独立增量，不能据此关闭整个告警或UI-05条目。
+
+证据：build/monitor-alerts-regression.log为77通过、1显式真实launchd测试跳过、1既有warning（13.15s），覆盖原Agent Audit、窗口并发恰一次、配置竞争/确认、分页、处理幂等、来源篡改拒绝、派发失败事务回滚及原监控退避/登录控制。build/monitor-alerts-ui-final.log为隔离真实API、合成策略源、模拟launchctl的表单启用/未确认不提交、来源查看/标记处理/停用/英文及680宽度通过，2配置提交，0页面错误/0模型/0正式Finding/0系统任务变动。合成材料不是真实采集或自动漏洞发现。Python编译、JS语法、git diff --check通过。未重跑全仓或全站144组合。
+
+主库0活动Run/执行任务/模型调用/活动监控、登录配置不存在、本机告警默认关闭后，CUA正常退出App并确认8000端口关闭，再启动来源链接/Applications/Fieldwork.app；health ready，原生安全监控页显示新收件箱、两个未勾选配置项、本机派发已关闭及空历史，原登录控制和当前暂停监控仍在。没有向主库注入样例、启用通知或运行研究。完整15Task/8Gaps、真实三域模型发现/独立复验/报告、来源治理、迁移激活及正式分发门仍未整体完成。未Git提交推送。
+
+
+## 2026-10-17 告警冻结来源审阅与所属监控衔接
+
+继续UI-05，补齐原“查看来源”只有摘要/证据ID的问题。新增只读monitor-alerts/{window_id}/source，校验既有窗口/产物/摘要绑定后返回该窗口异常对应的冻结事件、当时策略判定、可信度、证据ID、策略版本与原始输入摘要，使用既有结构脱敏；不拿后来实时策略替换历史判定，也不执行复验/模型/采集。UI显示事件表、判定边界、可展开冻结策略与证据，并可打开所属监控历史，明确该历史可能包含后续事件。原摘要及全部控制保留。
+
+FieldworkOpenMonitorRecords在目标不在旧清单时刷新真实审计列表，拒绝演示或不可用目标，加载后核对实际选择和detail.id再展开历史，避免页面打开后新增监控的上下文丢失。异步来源读取有页面/节点/选择代际校验，失败时不保留旧来源结论。
+
+build/monitor-alert-source-tests.log为62相关通过/1既有warning（9.04s）：原Agent Audit与告警回归、新只读接口零事件写入、策略改为允许后旧冻结结果不变、URL凭据脱敏、缺失来源404与产物篡改409。build/monitor-alert-source-handoff-ui.log为隔离真实API浏览器：页面打开后新建合成审计、派发窗口、查看实际冻结事件表、打开新审计精确选中、标记处理/停用、英文及1440/1024/680/375无横向溢出；0页面错误/模型/正式Finding/系统任务变化。早期UI断言inner_text无法读取折叠details内JSON而失败，修正验收为text_content后通过，不把失败运行视为通过。当前未重新跑全站144组合或全仓。
+
+主库0活动Run/执行任务/模型调用/活动监控，登录与告警关闭后，正常退出来源链接App、curl确认8000端口关闭，再启动/Applications/Fieldwork.app。health ready，原生导航/原监控及收件箱均保留，主库为空收件箱，因此真实来源操作证据来自隔离API浏览器，不声称原生真实告警全流程验收；未注入主库或启用采集。自动独立复验、系统/外部通知、真实三域模型发现/报告等仍未完成，完整15Task/8Gaps持续，不标记整体完成。无Git提交推送。
+
+
+## 2026-10-18 冻结监控窗口策略重放回执
+
+继续完整UI-05范围，未把整审计旧验证器用于晋升版本化监控策略线索。新增monitor_window_replay.py与固定monitor_window_replay_worker.py：确认审阅摘要后，在独立Python子进程重算冻结事件的策略判定/信号，2MB/500事件/15秒界限，固定入口与清理环境，不接受命令、目标或自定义程序，不连接研究目标、不调用模型。执行全程持有存储共享门，前后验证来源/审阅摘要及worker、agent_audit两份实现文件摘要；超时/来源变化/维护占用不保存成功回执。结果按窗口幂等持久到完整性校验产物与既有v5_events，记录App/Python版本、实际执行PID、两份源码SHA256。并发重复提交复查后只存一份，刷新只读回执不自动重放。
+
+来源审阅区保留原事件/策略/证据与打开所属监控功能，追加明确确认的执行表单、重放一致/不一致状态和持久回执。独立进程复用相同策略判定函数，只证明记录重算一致，不是独立算法、OS沙箱、实际行为回放或真实性验证。所有结果verification_status=human_review、behavior_authenticity_verified=false、canonical_finding_created=false，不创建正式Finding，不改变原告警处理状态。自动独立复验派发及真实第二来源验证仍待开发，不能据此关闭UI-05或完整目标。
+
+证据：build/monitor-window-replay-final-tests.log为76相关通过/1既有warning（11.95s），覆盖重放/告警/Agent Audit/调度退避；随后新增维护/超时及错误映射后build/monitor-window-replay-final-boundaries.log为8相关通过/1既有warning（2.94s），不可把二者相加为当前独立测试数。真实子进程执行PID不同于测试父进程、实现摘要记录、持久读取/重复不再执行、拒绝旧审阅摘要、工作进程失败/执行中处理状态变化无回执、模拟不一致结果不晋升均通过。build/monitor-window-replay-ui-final.log真实API隔离合成窗口：未确认不提交、实际子进程重放一致、人审边界、刷新找回回执且仅1次执行提交、所属历史/处理/停用及英文4宽度检查通过，0页面错误/模型/正式Finding/系统任务变动。不是实际目标采集或完整独立行为验证。JS语法与git diff --check通过，未重跑当前全仓或全站144组合。
+
+主库0活动Run/执行任务/模型调用/活动监控且登录与告警关闭后，CUA正常退出并curl确认8000端口关闭，再启动来源链接/Applications/Fieldwork.app，health ready，原生监控页/原导航/收件箱保留且关闭。主库没有告警，重放交互证据来自隔离真实API浏览器，不冒充原生真实告警验收。完整15Task/8Gaps、实际三域模型发现/独立复验/报告、通知及正式分发等仍未完成，目标继续；无Git提交推送。
+
+
+## 2026-10-18 当前完整回归与18页保留验收
+
+上一轮为实际功能与证据进展，本轮按原完整目标补当前工作区完整回归，不缩小15Task/8Gaps范围。build/full-current-regression-20261018.log：1406通过、8跳过、2warning，479.25s。warning为既有Starlette弃用和恶意ZIP重复entry.py夹具提示。8跳过单列于build/full-regression-skips-20261018.log：真实Trivy冻结产物3、真实DeepSeek1、显式Chrome登录捕获2、原生Keychain1、真实launchd1。它们默认需显式开关，本轮没有执行；历史特定验收不能替换本轮跳过事实。
+
+完整工作区真实API隔离浏览器build/full-workspace-ui-20261018.log通过：18导航、5Agent子页、动态队伍规模、能力申请/授予/撤销、记忆导入比较、事件筛选、证据关系、候选调查/分诊、执行节点登记、优先级/暂停、备份恢复演练、登录表单模拟系统注册/撤销，以及18×2语言×2主题×2宽度=144显示组合。检查实际导航集合、每页可见标题/内容、全页无横向溢出及非滚动容器控件未越界，0页面错误/0模型调用。此为隔离真实API夹具，不是18页所有业务的原生真实目标生产验收。具体新增告警/来源/窗口重放交互另有前几轮专项证据，本次不把遍历页面等同重验每项新操作。
+
+独立留存显示矩阵build/workspace-display-matrix-20261018.json（144条/18页/0溢出或控件越界）及当前截图build/workspace-ui-20261018.png，避免继续沿用脚本默认旧版本文件名。源码快照build/regression-source-manifest-20261018.json包含356个Python/JS/CSS/HTML/Swift文件，aggregate_sha256=32fe4beea659e0d6b40b60104989872ae77d62522dbd5eaa57cfa643d8202844，完整回归及UI前后逐文件摘要一致。仅新增/更新文档，未修改产品代码或schema，不需再次安装重启；此前已重载的来源链接Apphealth ready。主库复查0活动Run/执行任务/模型调用/活动监控，登录配置不存在、告警关闭，无样例注入/自动研究。没有Git提交推送。
+
+新docs/roadmap/UI_CURRENT_GAP_MATRIX_2026-10-18.md逐页列出18个保留入口与尚需开发/验收的真实范围；旧进度档顶部加当前矩阵链接，明确早期表格是历史快照。源码仍有主动攻击派发、自动数据保留、版本来源及高级后台/告警预览；原控件保留，不冒充已接通。下一步按独立行为复验契约和派发、通知、三域实际工具+模型正负对照与三次清洁启动、治理/迁移/发布门继续。全回归通过不能关闭整体可靠自动发现确认目标。
+
+
+## 2026-10-18 真实浏览器授权读取与合法共享对照
+
+继续UI-03/QA-07支持类型验收，而非用完整回归代替真实流程。显式开启FIELDWORK_TEST_BROWSER，原真实Chrome两用例先2通过（17.43s），随后扩展为vulnerable/fixed/legitimate_shared三类，确认Scope绑定exact对象业务规则，前两owner_only、合法共享allowlist=['b']。每类实际启动隔离Chrome登录两个本地测试账号、捕获/api/me及对象响应、实际存取测试Keychain会话，guided自动续行发送两轮10次HTTP请求并精确计费10次；finally仅撤销本用例捕获并删除自己创建的测试Keychain账号。build/browser-auth-controls-20261018.log为3通过/1既有warning（25.86s）。冻结摘要build/browser-auth-real-20261018/{case}.json与manifest.json包含实际浏览器/执行版本、测试源码SHA、重放产物SHA及预算，不存凭据。
+
+正例读取reproduced且business_boundary=denied；修复负例not_established且规则仍denied；合法共享读取仍可重现但business_boundary=permitted/access_permitted_by_rule。三类均0正式Finding/0模型调用。本工程用例显式创建候选与观察，不是模型/扫描自动发现，也未走正式晋升、报告、三次清洁启动或安装App真实目标链；不能据此关闭可靠自动发现门。合法共享的无晋升还受既有独立确认门约束，本轮不新建正式Finding。
+
+发现UI只显示“读取行为已复现”可能掩盖共享规则，static/v5-candidate-workflow.js新增统一结果表述：已允许共享优先明确未建立越权；规则未知显示授权边界未确认；规则禁止显示仍需独立确认/影响证据。用于单候选和持续深挖批次，原始重放状态、证据、回执及操作不删改。build/business-boundary-result-ui-20261018-complete.log通过原草稿规则/冻结门/语言保留/执行确认/取消/陈旧计划/回执/正式保存与修复确认/窄屏主题流程，并增加3种业务提示、中英文、提示切换零额外写入及无晋升按钮断言；此脚本使用明确拦截API夹具，不是真实HTTP后端。初始旧脚本未渲染asset_url、未接新增只读预检POST且未关闭新执行计划弹窗、关闭定位器重复，均为验收夹具与当前UI衔接失配，修复夹具后保留原断言通过，未放宽产品门或据失败运行报通过。另build/browser-business-outcome-ui-20261018.log原研究8状态/6证据衔接/4组队前置路由检查通过。
+
+本轮仅产品前端文案及验收脚本/测试改动，后端行为/schema不变。上轮1406完整基线早于本增量，没有宣称重新跑当前全仓。JS语法和git diff --check通过。主库0活动Run/执行任务/模型调用/活动监控、登录/告警关闭后CUA正常退出，端口关闭确认，再启动来源链接App；原生独立复验工作台、运行选择、分诊/深挖入口、候选及回执区保留，主库无候选所以三类新提示以隔离UI证据为准。未注入主库样例或启用采集/研究。完整15Task/8Gaps及所有未完成门继续，无Git提交推送。
+
+
+## 2026-10-18 实际扫描工具到真实DeepSeek研究草稿
+
+继续QA-07工具/模型衔接，不以分别可用代替连接验收。新增显式付费开关tests/test_live_tool_model_research.py，复用实际Nuclei deep/受控GET broker/真实loopback正例与修复服务，原始产物SHA核验后按同项目同Run生产bridge函数投射观察到图谱。只有构造loopback夹具节点被标记public并明确allow_cloud_context；不发送主库目标/用户资料，凭据复用现有DeepSeek后端设置，保存在隔离secret_root，不打印或归档。
+
+工具用例新增可选real_run单工具模式：直接构造当前已确认Scope/Policy下queued且非synthetic的隔离Run及预算，然后真实调用工具API。它不是完整App启动/完整管线完成；Run未被伪标completed。原默认工具用例行为保留。新增用例开始时无Claim，实际Nuclei输出不替换、不注入模型答案/Claim，研究组通过真实预览与确认创建，实际Worker/模型路由/账本执行，唯一研究任务无工具权限。模型输出草稿仍经既有引用校验，0正式Finding。
+
+实际结果：首个有效模型调用输出JSON不合法，任务暂停、usage settled，425输入/1450输出/18750micros保守费用上界；failure-pytest-13.json与原失败日志保留，未据此签成功草稿。显式一次诊断调用正例成功，417输入/2292输出/27090micros，4条draft Claim、9个问题，内容明确检测级观察不足以证明实际行为影响；build/actual-tool-model-20261018-diagnostic.log为1通过/1未选（16.97s）。修复负例单独执行成功，312输入/601输出/9130micros、0Claim，build/actual-tool-model-20261018-fixed.log为1通过/1未选（10.17s）。不是同一命令两用例全绿，更不是无失败稳定率。三次记录用量费用上界合计54970micros，以10USD/百万token保守换算，不是账单/官方定价。
+
+保留build/actual-tool-model-20261018/两份原工具产物、两份任务冻结输入、正例/修复报告与失败摘要及manifest；原工具字节SHA匹配既有Artifact，报告包含输入hash/来源观察ID、模型草稿/引用/问题/用量、非晋升边界。诊断仅输出finish_reason、字符串长度与SHA等，不保存原始模型正文或推理段；成功草稿是实际结构化产出，和原始模型传输内容分开。没有真实行为独立复验、负向复现、正式Finding/报告、保留样本或三次清洁启动；两构造夹具不能代表三域生产发现率、多Agent质量或原完整验收门。
+
+开发中的初始失败如实保留：产物kind应为traditional.tool.nuclei、观察引用为raw_ref；旧默认演示Run被编排门拒绝；暂停Run被broker拒绝；均修正验收夹具状态/真实记录定位，没有放宽生产守卫。实际调用JSON失败后不自动重试，诊断仅是显式新验收调用，未删失败来宣称可靠。
+
+build/actual-tool-model-regression-20261018.log为16相关通过/2显式付费测试默认跳过/1既有warning（24.49s）；末尾只增补可选验收产物留存语句，不影响默认路径，不用本轮局部回归宣称当前全仓1406。产品代码/UI/schema本轮未改变，不需再次安装/重启；已加载Apphealth ready。主库0活动Run/执行任务/模型调用/活动监控、登录/告警关闭，无主库样例或研究；付费账本均在隔离验收库。完整15Task/8Gaps继续，无Git提交推送。
+
+
+## 2026-10-18 模型输出安全诊断与结构错误暂停
+
+根据上一轮真实DeepSeek格式失败继续UI-01/02任务可诊断性。v5_model_response.ModelOutputRejected新增白名单model_output_reason和model_finish_reason，不存正文、推理、原响应、JSON错误片段或未知服务端finish_reason。解析区分invalid_json、output_truncated、content_filtered、non_text_content、non_object_json、invalid_json_constant、json_too_deep、missing_output；显式length/content_filter即使文本可解析也拒绝，不把截断/过滤当成功完成。用量无效仍保持原unknown/预算保留路径，不借诊断虚构消耗。
+
+研究Worker与结构化Worker保存固定原因码。有效JSON但Pydantic字段/类型失败，仅当该调用已settled时标schema_mismatch且暂停：既有消耗保留，不重新结算，不走普通local_worker_failed自动重试。结算失败仍unknown并保留预算。语义/Scope/证据独立守卫保留，未自动修JSON、移除字段或绕过引用校验。原历史通用错误不倒推具体原因。
+
+智能体任务表保留所有列和操作，主提示改为“模型输出未通过校验”，子行说明截断/非JSON/结构不符等，并明确不自动重试、先核对模型与预算。原因码中英映射，原错误详情与传输错误仍适用；没有凭空推断上一轮真实失败是哪一种。
+
+验收：build/model-output-diagnostics-final-tests-20261018.log为73相关通过/1既有warning（29.62s），覆盖研究/结构化Worker、llama_cpp/Ollama协议、语法/结构/截断、结算正常或失败、1次调用后暂停/刷新与重复tick不重发、累计用量/账本与无正式Finding/无私有输出标记进入API和事件；随后构造器白名单补强与额外单测后build/model-output-diagnostics-final-bounds-20261018.log为19通过/24未选（0.79s），不可相加当独立总数。build/model-output-diagnostics-ui-20261018.log真实API隔离模型HTTP协议夹具：3组11任务原创建/更新/权限/预览陈旧/语言保留/错误读取/刷新/节点/草稿来源等操作保留；真实非法响应得到invalid_json、账本结算，新增截断/结构错误展示fixture切换及不重发；8语言主题宽度组合、0页面错误，1协议请求。不是新真实DeepSeek调用。本轮不额外付费或重放实际扫描，初始旧真实失败只保留历史证据。
+
+Python编译、JS语法及git diff --check通过。完整1406基线早于本改动，当前全仓和全站144组合未重跑。主库0活动Run/执行任务/模型调用/活动监控且登录/告警关闭后，正常退出并确认端口关闭，再启动来源链接/Applications/Fieldwork.app，health ready；原生智能体页5子页/创建前置/模型配置/刷新/Run选择/建立Campaign保留。主库无相关研究组，具体错误操作证据来自隔离真实API浏览器，未注入主库或启动研究。没有schema改变或Git提交推送。完整15Task/8Gaps继续，实际独立行为确认/正式报告/三域与质量发布门均未整体完成。

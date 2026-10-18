@@ -50,7 +50,7 @@ def _connect(address, port, check_current):
         raise
 
 
-def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
+def request_once(spec, addresses, check_current=None, *, scalar_fields=(), trusted_ca_pem=None, raw_body=False, raw_headers=False):
     import traditional_runtime as http
     from reporting import redact
     if sys.platform != 'darwin' or not Path('/usr/bin/sandbox-exec').is_file():
@@ -61,7 +61,14 @@ def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
     address = sorted(addresses)[0]
     address = str(ipaddress.ip_address(address))
-    encoded = json.dumps({'url': spec.url, 'address': address, 'headers': spec.headers, 'scalar_fields': list(scalar_fields)}).encode()
+    payload = {'url': spec.url, 'address': address, 'headers': spec.headers, 'scalar_fields': list(scalar_fields), 'raw_headers': raw_headers}
+    if trusted_ca_pem is not None:
+        import ssl
+        if parsed.scheme != 'https' or not isinstance(trusted_ca_pem, str) or len(trusted_ca_pem.encode()) > 16384:
+            raise ValueError('invalid scoped TLS issuer')
+        ssl.create_default_context().load_verify_locations(cadata=trusted_ca_pem)
+        payload['trusted_ca_pem'] = trusted_ca_pem
+    encoded = json.dumps(payload).encode()
     if len(encoded) > 131072:
         raise ValueError('isolated HTTP input exceeds limit')
     def quote(value):
@@ -127,7 +134,7 @@ def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
                 raise ValueError('isolated HTTP output invalid')
             text = body.decode(errors='replace')
             # Raw output only lives in memory; artifacts receive the existing redacted representation.
-            return {'status': value['status'], 'body_sha256': hashlib.sha256(body).hexdigest(), 'body_bytes': len(body),
+            result = {'status': value['status'], 'body_sha256': hashlib.sha256(body).hexdigest(), 'body_bytes': len(body),
                     'headers': {k: redact(v) for k, v in value['headers'].items()}, 'body_preview': http._safe_body_preview(text),
                     '_transient_body': text, 'scalar_sha256': value.get('scalar_sha256', {}), 'process_execution': {
                         'parent_pid': os.getpid(), 'child_pid': process.pid, 'exit_code': process.returncode,
@@ -135,6 +142,13 @@ def request_once(spec, addresses, check_current=None, *, scalar_fields=()):
                         'script_sha256': script_sha, 'file_read_denied': True, 'pinned_address': address,
                         'observed_by': 'fieldwork_local_supervisor', 'scope': 'transport_only',
                         'network_grant': 'single_connected_socket', 'network_connect_denied': True}}
+            if trusted_ca_pem is not None:
+                result['process_execution']['trusted_ca_sha256'] = hashlib.sha256(trusted_ca_pem.encode()).hexdigest()
+            if raw_body:
+                result['_transient_bytes'] = body
+            if raw_headers:
+                result['_transient_headers'] = value.get('raw_headers', [])
+            return result
         finally:
             try:
                 if process.poll() is None:

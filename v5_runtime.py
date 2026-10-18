@@ -6,6 +6,9 @@ import ipaddress
 import json
 import math
 import socket
+import ssl
+
+import certifi
 import sqlite3
 import urllib.error
 import urllib.parse
@@ -98,7 +101,7 @@ def _provider_view(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _profile_view(row: sqlite3.Row) -> dict[str, Any]:
+def _profile_view(row: sqlite3.Row, providers=None) -> dict[str, Any]:
     raw = _load(row["config_json"], {})
     try:
         config = ProfileConfig.model_validate(raw).model_dump(mode="json")
@@ -107,7 +110,17 @@ def _profile_view(row: sqlite3.Row) -> dict[str, Any]:
             "local_provider_ids", "cloud_provider_ids", "independent_provider_ids", "allow_fallback",
             "cloud_complexity_threshold", "max_tokens_per_call", "max_cost_micros",
         ) if key in raw}
+    bound = "provider_config_hashes" in raw
+    if providers is None:
+        with _core().connect() as db:
+            providers = db.execute("SELECT * FROM runtime_providers").fetchall()
+    current_hashes = {item["id"]: _provider_config_hash(item) for item in providers}
+    snapshots = config.get("provider_config_hashes", {})
+    changed = sorted(key for key, digest in snapshots.items() if current_hashes.get(key) != digest)
     return {
+        "provider_configuration_current": not changed if bound else None,
+        "provider_configuration_status": ("stale" if changed else "current") if bound else "unbound",
+        "changed_provider_ids": changed,
         "id": row["id"], "name": row["name"], "mode": row["mode"],
         "config": config, "immutable_hash": row["immutable_hash"],
         "provider_configuration_bound": "provider_config_hashes" in raw,
@@ -169,6 +182,7 @@ class ProviderUpdate(BaseModel):
     enabled: bool | None = None
     api_key: str | None = Field(default=None, min_length=8, max_length=16384)
     clear_secret: bool = False
+    cost_micros_per_million_tokens: int | None = Field(default=None, strict=True, ge=0, le=10_000_000_000)
 
 
 class ProfileConfig(BaseModel):
@@ -288,6 +302,9 @@ def update_provider(provider_id: str, body: ProviderUpdate):
     if body.enabled is not None:
         assignments.append("enabled=?")
         values.append(1 if body.enabled else 0)
+    if body.cost_micros_per_million_tokens is not None:
+        assignments.append("metadata_json=json_set(metadata_json,'$.cost_micros_per_million_tokens',?)")
+        values.append(body.cost_micros_per_million_tokens)
     if body.api_key or body.clear_secret:
         assignments.append("secret_ref=?")
         values.append(None if body.clear_secret else secret_ref)
@@ -384,7 +401,7 @@ def get_config():
         providers = db.execute("SELECT * FROM runtime_providers ORDER BY created_at,id").fetchall()
         profiles = db.execute("SELECT * FROM runtime_profiles ORDER BY created_at,id").fetchall()
     return {"providers": [_provider_view(row) for row in providers],
-            "profiles": [_profile_view(row) for row in profiles]}
+            "profiles": [_profile_view(row, providers) for row in profiles]}
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -423,13 +440,19 @@ def _health_request(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
             return {"status": "unconfigured", "detail": "missing_secret"}
         headers["Authorization"] = f"Bearer {secret}"
     request = urllib.request.Request(endpoint, headers=headers, method="GET")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=certifi.where())),
+    )
     try:
         with opener.open(request, timeout=3) as response:
             return {"status": "healthy" if 200 <= response.status < 300 else "degraded",
                     "http_status": response.status}
     except urllib.error.HTTPError as error:
         return {"status": "degraded", "http_status": error.code}
+    except urllib.error.URLError as error:
+        detail = "tls_certificate_verification_failed" if isinstance(error.reason, ssl.SSLCertVerificationError) else type(error.reason).__name__
+        return {"status": "unavailable", "detail": detail}
     except Exception as error:
         return {"status": "unavailable", "detail": type(error).__name__}
 

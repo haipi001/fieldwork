@@ -496,7 +496,8 @@ class TargetPackageApplyInput(TargetPackageInput):
 
 
 class EngagementInput(ResolveTargetInput):
-    name: str = Field(default="New security analysis", min_length=2, max_length=160)
+    auto_mode: bool = Field(default=False, strict=True)
+    name: str | None = Field(default=None, min_length=2, max_length=160)
     scope: dict[str, Any] = Field(default_factory=dict)
     policy: dict[str, Any] = Field(default_factory=dict)
     scope_source: str = "manual"
@@ -686,8 +687,10 @@ class RoutingPlanInput(BaseModel):
 
 
 class StartAnalysisInput(BaseModel):
+    assisted_plan_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     guided_followup: bool = False
-    execution_mode: Literal["demo", "real"] = "real"
+    contract_import_id: str | None = Field(default=None, pattern=r"^import-[0-9a-f]{32}$")
+    execution_mode: Literal["demo", "real", "read_only"] = "real"
     include_recon: bool = True
     include_code: bool = False
     source_path: str | None = None
@@ -833,6 +836,8 @@ class SessionCaptureInput(BaseModel):
 
 def _planned_capabilities(engagement: dict[str, Any], body: StartAnalysisInput) -> list[str]:
     repository = engagement.get("target_type") == "repository"
+    if body.execution_mode == "read_only":
+        return []
     if engagement["mode"] == "web3":
         planned = ["forge", "slither", "aderyn", "echidna", "medusa", "halmos", "gitleaks", "trivy"]
         if not repository:
@@ -866,9 +871,27 @@ def latest_deployment_alignment(engagement_id: str) -> dict[str, Any] | None:
     return None
 
 
+def contract_execution_context(engagement: dict[str, Any], body: StartAnalysisInput) -> dict[str, Any]:
+    alignment = latest_deployment_alignment(engagement['id'])
+    rules = alignment['rules'] if alignment else {}
+    if not alignment or rules.get('status') != 'aligned':
+        raise HTTPException(409, '必须先完成 source/compiler/runtime bytecode 部署对齐')
+    chain, block = rules.get('chain_id'), rules.get('block_number')
+    if type(chain) is not int or chain <= 0 or type(block) is not int or block < 0:
+        raise HTTPException(409, '部署对齐缺少明确的 Chain ID 或区块，请重新对齐')
+    if not body.source_path or Path(alignment.get('source_uri') or '').resolve() != Path(body.source_path).expanduser().resolve():
+        raise HTTPException(409, '当前 source 与已对齐 ProgramSnapshot 不一致')
+    if body.chain_id is not None and body.chain_id != chain:
+        raise HTTPException(409, '当前 Chain ID 与已对齐 ProgramSnapshot 不一致')
+    if body.fork_block_number is not None and body.fork_block_number != block:
+        raise HTTPException(409, '当前 Fork 区块与已对齐 ProgramSnapshot 不一致')
+    return {'deployment_alignment_id': alignment['id'], 'chain_id': chain, 'fork_block_number': block}
+
+
 def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -> dict[str, Any]:
     blockers: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
+    contract_context = None
     source = Path(body.source_path).expanduser() if body.source_path else None
     repository = engagement.get("target_type") == "repository"
     if engagement["status"] != "ready" or not engagement.get("confirmed_at"):
@@ -883,22 +906,34 @@ def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -
         parsed_rpc = urlparse(body.fork_rpc_url or "")
         if parsed_rpc.scheme != "https" or not parsed_rpc.netloc:
             blockers.append({"id": "fork_rpc", "message": "链上目标需要 HTTPS RPC 创建本地 Fork"})
-        alignment = latest_deployment_alignment(engagement["id"])
-        rules = alignment["rules"] if alignment else {}
-        if not alignment:
-            blockers.append({"id": "deployment_alignment", "message": "必须先证明本地源码与链上 Runtime Bytecode 一致"})
-        elif rules.get("status") != "aligned":
-            blockers.append({"id": "deployment_alignment", "message": "最新部署对齐未通过，不能把本地结果归因到链上合约"})
-        else:
-            if source and Path(alignment.get("source_uri") or "").resolve() != source.resolve():
-                blockers.append({"id": "deployment_alignment", "message": "当前源码目录与已对齐 ProgramSnapshot 不一致"})
-            if body.chain_id and rules.get("chain_id") != body.chain_id:
-                blockers.append({"id": "deployment_alignment", "message": "当前 Chain ID 与已对齐 ProgramSnapshot 不一致"})
-            if body.fork_block_number is not None and rules.get("block_number") != body.fork_block_number:
-                blockers.append({"id": "deployment_alignment", "message": "当前 Fork 区块与已对齐 ProgramSnapshot 不一致"})
+        try:
+            contract_context = contract_execution_context(engagement, body)
+            warnings.append({'id': 'fork_context', 'message': f"本地 Fork 固定为已对齐链 {contract_context['chain_id']} / 区块 {contract_context['fork_block_number']}"})
+        except HTTPException as error:
+            blockers.append({'id': 'deployment_alignment', 'message': str(error.detail)})
     if body.include_shannon and (engagement["mode"] != "traditional" or repository or not body.source_path):
         blockers.append({"id": "shannon", "message": "Shannon 需要 Traditional 运行 URL 和本地源码"})
 
+    if body.execution_mode == "read_only":
+        if engagement["mode"] != "web3" or not body.contract_import_id:
+            blockers.append({"id": "import", "message": "只读研究需要本项目的合约导入资料"})
+        else:
+            from web3_import_api import read_only_materials
+            try:
+                read_only_materials(engagement["id"], body.contract_import_id)
+            except HTTPException as error:
+                blockers.append({"id": "import", "message": str(error.detail)})
+        warnings.append({"id": "read_only", "message": "仅研究已有公开资料；不运行 Fork、属性测试或漏洞验证"})
+
+    template_inventory = {}
+    if 'nuclei' in _planned_capabilities(engagement, body):
+        from traditional_tools import nuclei_template_inventory
+        try:
+            template_inventory = nuclei_template_inventory(body.scan_profile)
+            if template_inventory:
+                warnings.append({'id': 'nuclei_template_scope', 'message': f'本档执行 {len(template_inventory)} 个明确选定的只读 HTTP 模板；每项受当前范围与请求预算约束。'})
+        except HTTPException as error:
+            blockers.append({'id': 'nuclei_templates', 'message': str(error.detail)})
     inventory = {item["id"]: item for item in capabilities()}
     from native_agent import readiness as native_agent_readiness
     native = native_agent_readiness()
@@ -914,6 +949,8 @@ def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -
                 ready = False
         reason = "已就绪" if ready else ("需要模型 API 或系统 Chrome" if capability == "native-agent" else "未安装、未配置或运行时不可用")
         tools.append({"id": capability, "ready": ready, "version": item.get("version") or item.get("browser") or "未探测", "reason": reason, "optional": capability in {"native-agent", "strix", "shannon", "aderyn", "echidna", "medusa", "halmos"}})
+        if capability == 'nuclei':
+            tools[-1]['template_sha256'] = template_inventory
         if not ready:
             warnings.append({"id": capability, "message": f"{capability} 会记录为 NOT TESTED：{reason}"})
 
@@ -928,6 +965,7 @@ def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -
         "engagement_id": engagement["id"], "name": engagement["name"], "mode": engagement["mode"],
         "target": engagement["normalized_target"], "target_type": engagement["target_type"],
         "ready": not blockers, "blockers": blockers, "warnings": warnings, "tools": tools,
+        "contract_context": contract_context,
         "identities": {"total": len(identities), "ready": len(ready_identities)},
         "budget": {
             "requests": int(policy.get("max_requests", 100)),
@@ -936,7 +974,7 @@ def build_execution_plan(engagement: dict[str, Any], body: StartAnalysisInput) -
             "tool_calls": int(policy.get("max_tool_calls", 200)),
             "model_usd": float(policy.get("max_model_budget_usd", 10)),
         },
-        "actions": ["read", "analyze", "local_fork_write"] if engagement["mode"] == "web3" else ["read", "analyze", "scoped_http"],
+        "actions": ["read", "analyze"] if body.execution_mode == "read_only" else (["read", "analyze", "local_fork_write"] if engagement["mode"] == "web3" else ["read", "analyze", "scoped_http"]),
         "denied_actions": ["destructive", "credential_attack", "fund_transfer", "production_write", "transaction_broadcast"],
         "remaining_stages": ["target", "scope", "surface", "analysis", "processing", "verification", "impact", "report"],
         "disclaimer": "这是有界执行计划，不预测结束时间；未覆盖项将进入 Coverage Ledger。",
@@ -949,6 +987,9 @@ class MaintenanceConfirmInput(BaseModel):
 
 def resolve_target_value(body: ResolveTargetInput) -> dict[str, Any]:
     raw = body.target.strip()
+    if getattr(body,"auto_mode",False):
+        from assisted_research import infer_mode
+        body.mode=infer_mode(raw)
     if body.mode == "traditional":
         try:
             network = ipaddress.ip_network(raw, strict=False)
@@ -992,8 +1033,19 @@ def resolve_target_value(body: ResolveTargetInput) -> dict[str, Any]:
         metadata = {"host": parsed.hostname.lower(), "path": parsed.path or "/", "scheme": parsed.scheme or "https"}
     else:
         lower = raw.lower()
-        if lower.startswith("0x") and len(lower) == 42:
-            target_type, normalized = "contract", lower
+        from web3_contract_import import parse_target, EXPLORERS, ImportFailure
+        if lower.startswith("0x") or urlparse(raw).hostname in EXPLORERS:
+            try:
+                parsed_contract = parse_target(raw, body.chain_id)
+            except ImportFailure as error:
+                # Existing bare-address projects can still be drafted without a chain;
+                # the importer requires chain selection before contacting providers.
+                if error.code == "chain_required" and re.fullmatch(r"0x[0-9a-f]{40}", lower):
+                    parsed_contract = {"address": lower, "chain_id": None}
+                else:
+                    raise HTTPException(422, error.message)
+            target_type, normalized = "contract", parsed_contract["address"]
+            body.chain_id = parsed_contract["chain_id"]
         elif raw.endswith((".sol", ".vy")) or "/" in raw or raw.startswith("git@"):
             target_type, normalized = "repository", raw
         else:
@@ -1354,6 +1406,7 @@ def create_engagement(body: EngagementInput):
 
 
 def _insert_engagement(db: sqlite3.Connection, body: EngagementInput, resolved: dict[str, Any]) -> str:
+    from assisted_research import automatic_name
     timestamp = utcnow()
     target_id, engagement_id = uid("target"), uid("eng")
     scope_id, policy_id = uid("scope"), uid("policy")
@@ -1370,8 +1423,15 @@ def _insert_engagement(db: sqlite3.Connection, body: EngagementInput, resolved: 
         "allow_concurrency_testing": False,
         "environment_class": "production",
         "requires_confirmation": True,
+        "authorization_notes": "仅允许目标范围内的读取与分析，禁止破坏、资金转移和凭据攻击；授权由用户在确认步骤明确声明。",
         **body.scope,
     }
+    if 'http_tls_trust' in scope:
+        from http_tls_trust import validate as validate_tls_issuers
+        try:
+            scope['http_tls_trust'] = validate_tls_issuers(scope)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
     policy = {
         "max_requests": 100,
         "max_requests_per_second": 1,
@@ -1386,10 +1446,10 @@ def _insert_engagement(db: sqlite3.Connection, body: EngagementInput, resolved: 
     }
     db.execute("INSERT INTO target_specs VALUES(?,?,?,?,?,?,?,?)", (
             target_id, body.mode, resolved["raw_target"], resolved["target_type"],
-            resolved["normalized_target"], body.chain_id, dump(resolved["metadata"]), timestamp,
+            resolved["normalized_target"], resolved["chain_id"], dump(resolved["metadata"]), timestamp,
         ))
     db.execute("INSERT INTO engagements_v2 VALUES(?,?,?,?,?,?,?,?,?)", (
-            engagement_id, body.name, body.mode, target_id, "draft", scope_id, policy_id, timestamp, timestamp,
+            engagement_id, body.name or automatic_name(resolved), body.mode, target_id, "draft", scope_id, policy_id, timestamp, timestamp,
         ))
     db.execute("INSERT INTO scope_snapshots VALUES(?,?,?,?,?,?,?,?)", (
             scope_id, engagement_id, 1, body.mode, dump(scope), body.scope_source, None, timestamp,
@@ -1659,6 +1719,12 @@ async def safe_demo_pipeline(run_id: str) -> None:
     add_event(run_id, "report", "run.completed", "安全演示完成；不代表真实扫描或漏洞验证", {"synthetic": True})
 
 
+@router.get("/engagements/{engagement_id}/assisted-plan")
+def assisted_execution_plan(engagement_id: str, preferred_profile_id: str | None = None):
+    from assisted_research import prepare
+    return prepare(engagement_id, preferred_profile_id=preferred_profile_id)
+
+
 @router.post("/engagements/{engagement_id}/execution-plan")
 def execution_plan(engagement_id: str, body: StartAnalysisInput | None = None):
     return build_execution_plan(get_engagement(engagement_id), body or StartAnalysisInput())
@@ -1671,6 +1737,11 @@ async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = N
     if body.execution_mode == "demo" and not test_demo_enabled:
         raise HTTPException(422, "生产模式不提供演示执行，请启动真实工具链")
     engagement = get_engagement(engagement_id)
+    if body.assisted_plan_hash:
+        from assisted_research import prepare
+        prepared = prepare(engagement_id, overrides=body.model_dump(exclude={'assisted_plan_hash'}))
+        if not prepared['auto_start_ready'] or prepared['plan_hash'] != body.assisted_plan_hash:
+            raise HTTPException(409, "Prepared plan changed; review the current tools, model and budget before starting")
     if engagement["mode"] == "agent_audit":
         raise HTTPException(409, "Agent Audit 仅执行离线分析，请使用审计分析入口")
     if engagement["status"] != "ready" or not engagement["confirmed_at"]:
@@ -1682,6 +1753,12 @@ async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = N
         body = body.model_copy(update={"source_path": str(Path(source_path).expanduser().resolve()), "include_code": True, "include_recon": False})
     if body.include_shannon and (engagement["mode"] != "traditional" or engagement.get("target_type") != "host" or not body.source_path):
         raise HTTPException(422, "Shannon 仅用于同时提供运行 URL 与本地源码目录的 Traditional 白盒任务")
+    if body.execution_mode == "read_only":
+        if engagement["mode"] != "web3" or not body.contract_import_id:
+            raise HTTPException(409, "只读研究需要 Web3 合约导入资料")
+        from web3_import_api import read_only_materials
+        read_only_materials(engagement_id, body.contract_import_id)
+        body = body.model_copy(update={"include_recon": False, "include_code": False, "include_native_agent": False, "fork_rpc_url": None})
     with connect() as db:
         active_count = db.execute("SELECT COUNT(*) AS n FROM analysis_runs WHERE status IN ('queued','running','paused')").fetchone()["n"]
         if active_count >= 4:
@@ -1697,17 +1774,9 @@ async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = N
             parsed_rpc = urlparse(body.fork_rpc_url)
             if parsed_rpc.scheme != "https" or not parsed_rpc.netloc:
                 raise HTTPException(422, "RPC Fork 地址必须使用 HTTPS")
-            alignment = latest_deployment_alignment(engagement_id)
-            rules = alignment["rules"] if alignment else {}
-            if not alignment or rules.get("status") != "aligned":
-                raise HTTPException(409, "必须先完成 source/compiler/runtime bytecode 部署对齐")
-            if Path(alignment.get("source_uri") or "").resolve() != source.resolve():
-                raise HTTPException(409, "当前 source 与已对齐 ProgramSnapshot 不一致")
-            if body.chain_id and rules.get("chain_id") != body.chain_id:
-                raise HTTPException(409, "当前 Chain ID 与已对齐 ProgramSnapshot 不一致")
-            if body.fork_block_number is not None and rules.get("block_number") != body.fork_block_number:
-                raise HTTPException(409, "当前 Fork 区块与已对齐 ProgramSnapshot 不一致")
-            body = body.model_copy(update={"source_path": str(source.resolve()), "include_code": True, "include_recon": False, "include_native_agent": False})
+            contract_context = contract_execution_context(engagement, body)
+            body = body.model_copy(update={"source_path": str(source.resolve()), "include_code": True, "include_recon": False, "include_native_agent": False,
+                                           'chain_id': contract_context['chain_id'], 'fork_block_number': contract_context['fork_block_number']})
         db.execute("INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             run_id, engagement_id, engagement["mode"], engagement["current_scope_snapshot_id"],
             engagement["current_policy_id"], "queued", "target", int(synthetic), None, None, None, None, utcnow(),
@@ -1718,11 +1787,23 @@ async def start_analysis(engagement_id: str, body: StartAnalysisInput | None = N
             int(float(policy.get("max_model_budget_usd", 10)) * 1_000_000), 0, utcnow(),
         ))
         stored_config = body.model_dump()
+        if body.execution_mode == 'real' and engagement['mode'] == 'web3' and engagement.get('target_type') != 'repository':
+            stored_config['deployment_alignment_id'] = contract_context['deployment_alignment_id']
+        if body.assisted_plan_hash:
+            reviewed_nuclei = next((tool for tool in prepared['plan']['tools'] if tool['id'] == 'nuclei'), None)
+            if reviewed_nuclei is not None:
+                stored_config['reviewed_nuclei_templates'] = reviewed_nuclei.get('template_sha256', {})
         if stored_config.get("fork_rpc_url"):
             stored_config["fork_rpc_url"] = None
             stored_config["fork_rpc_configured"] = True
         db.execute("INSERT INTO run_configs_v2 VALUES(?,?,?)", (run_id, dump(stored_config), utcnow()))
-    if synthetic:
+    if body.execution_mode == "read_only":
+        from web3_import_api import execute_read_only
+        from storage_access import storage_call
+        from storage_paths import data_directory
+        add_event(run_id, "target", "run.queued", "已进入公开资料只读研究队列", {"synthetic": False})
+        await asyncio.to_thread(storage_call, data_directory().resolve(), execute_read_only, run_id, engagement_id, body.contract_import_id)
+    elif synthetic:
         add_event(run_id, "target", "run.queued", "已进入本地安全演示队列", {"synthetic": True})
         asyncio.create_task(safe_demo_pipeline(run_id))
     else:
@@ -1788,8 +1869,11 @@ def task_center(mode: Literal["traditional", "web3", "agent_audit"] | None = Non
     for run in runs:
         completed = {event["stage"] for event in run["events"] if event["kind"] == "stage.completed"}
         all_stages = ("target", "scope", "surface", "analysis", "processing", "verification", "impact", "report")
-        if run["status"] == "completed":
+        if run["status"] == "completed" and run['synthetic']:
             completed = set(all_stages)
+        elif not run['synthetic']:
+            completed = {stage['id'] for stage in get_run_details(run['id'])['stages']
+                         if stage['status'] == 'completed'}
         remaining = [stage for stage in all_stages if stage not in completed]
         last = run["events"][-1] if run["events"] else None
         last_at = last["created_at"] if last else run["created_at"]
@@ -1866,6 +1950,25 @@ def get_run_details(run_id: str):
             "SELECT COUNT(*) FROM canonical_findings f JOIN candidate_findings c ON c.id=f.candidate_id WHERE c.run_id=? AND f.status='verified'", (run_id,),
         ).fetchone()[0]
         candidate_count = db.execute("SELECT COUNT(*) FROM candidate_findings WHERE run_id=? AND status NOT IN ('archived','verified','graveyard')", (run_id,)).fetchone()[0]
+    recorded_verified_count = verified_count
+    proof_review_count = 0
+    proof_reviews = []
+    if verified_count and not run['synthetic']:
+        with connect() as db:
+            finding_rows = [dict(row) for row in db.execute(
+                "SELECT f.id finding_id,c.id candidate_id,c.title,c.engagement_id,c.run_id FROM canonical_findings f JOIN candidate_findings c ON c.id=f.candidate_id WHERE c.run_id=? AND f.status='verified' ORDER BY f.id LIMIT 51", (run_id,))]
+        # Bound this read-only proof check. Larger histories stay pending review.
+        verified_count = 0
+        for finding_row in finding_rows[:50]:
+            finding_id = finding_row['finding_id']
+            try:
+                finding, proof_evidence, proof_scope = finding_report_inputs(finding_id)
+                build_proof_attachments(finding, proof_evidence, proof_scope)
+                verified_count += 1
+            except (HTTPException, OSError, ValueError, KeyError):
+                proof_reviews.append({**finding_row, 'reason': 'proof_review_required'})
+        proof_reviews.extend({**item, 'reason': 'check_limit'} for item in finding_rows[50:])
+        proof_review_count = recorded_verified_count - verified_count
     config = load(config_row["config"], {}) if config_row else {}
     coverage = []
     by_capability: dict[str, list[dict[str, Any]]] = {}
@@ -1877,7 +1980,34 @@ def get_run_details(run_id: str):
         if len(parts) > 1 and parts[0] == "capability":
             by_capability.setdefault(parts[1], []).append(item)
     repository = engagement.get("target_type") == "repository"
-    if repository:
+    audit_mode = engagement.get("mode") == "agent_audit"
+    read_only_contract = engagement.get("mode") == "web3" and config.get("execution_mode") == "read_only"
+    if audit_mode:
+        planned = [
+            ("agent-materials", "行为与自述材料导入", "surface", "读取已登记的脱敏行为材料，不代表全量采集覆盖"),
+            ("agent-reconciliation", "行为边界与自述对账", "analysis", "使用已保存的确定性对账结果；候选仍需独立复验"),
+        ]
+    elif read_only_contract:
+        planned = [
+            ("contract-materials", "合约公开资料纳入", "surface", "仅纳入已导入的公开资料，不代表独立安全分析"),
+            ("forge-build", "生产合约编译", "analysis", "本次只读运行不执行编译；导入历史不计本次执行"),
+            ("forge-test", "合约属性与测试", "analysis", "本次只读运行不执行测试或Fork"),
+        ]
+    elif engagement.get("mode") == "web3" and not repository:
+        planned = [
+            ("web3-fork", "链与区块执行上下文", "surface", "核对本次运行建立的本地Fork记录；Fork就绪不代表漏洞已验证"),
+            ("forge-build", "生产合约编译", "analysis", "编译实际源码并记录执行覆盖"),
+            ("forge-test", "Forge 单元与 Fuzz 测试", "analysis", "运行提供的测试并记录结果"),
+            ("slither", "Slither 静态分析", "analysis", "分析实际Solidity源码"),
+            ("aderyn", "Aderyn 静态分析", "analysis", "交叉检查源码风险"),
+            ("echidna", "Echidna 属性测试", "analysis", "需要已有属性测试入口"),
+            ("medusa", "Medusa 属性测试", "analysis", "需要已有属性测试入口"),
+            ("halmos", "Halmos 符号执行", "analysis", "需要已有符号测试入口"),
+            ("semgrep", "静态代码规则分析", "analysis", "检查导入源码的规则命中"),
+            ("gitleaks", "密钥与凭据泄露检查", "analysis", "检查源码Secret模式"),
+            ("trivy", "依赖与错误配置检查", "analysis", "检查源码依赖和配置"),
+        ]
+    elif repository:
         planned = [
             ("checkout", "检出并固定仓库版本", "target", "以浅克隆获取授权源码并记录 commit"),
             ("semgrep", "静态代码规则分析", "analysis", "检查危险 API、注入、权限和语言规则命中"),
@@ -1922,7 +2052,29 @@ def get_run_details(run_id: str):
     test_items = []
     for capability, label, stage, description in planned:
         rows = by_capability.get(capability, [])
-        if capability == "checkout":
+        if capability == "web3-fork":
+            fork_ids = [event['payload'].get('fork_id') for event in run['events'] if event['kind'] == 'web3.fork.ready']
+            with connect() as db:
+                recorded = any(db.execute("SELECT 1 FROM web3_forks WHERE id=? AND engagement_id=? AND status IN ('ready','running','stopped')", (identity, engagement['id'])).fetchone() for identity in fork_ids if identity)
+            status = "completed" if recorded else "not_tested" if terminal else "queued"
+            result = "本次运行已保存Fork上下文；不代表漏洞证明" if recorded else "尚无本次运行的Fork上下文记录"
+            count = 0
+        elif capability in {"agent-materials", "agent-reconciliation", "contract-materials"}:
+            event_kind = {"agent-materials": "agent.imported", "agent-reconciliation": "agent.reconciled",
+                          "contract-materials": "web3.import.read_only"}[capability]
+            if capability == "agent-reconciliation":
+                with connect() as db:
+                    recorded = bool(db.execute("SELECT 1 FROM agent_reconciliations WHERE run_id=? LIMIT 1", (run_id,)).fetchone())
+            elif capability == "agent-materials":
+                with connect() as db:
+                    recorded = bool(db.execute("SELECT 1 FROM agent_events WHERE audit_id=? LIMIT 1", (engagement['id'],)).fetchone())
+            else:
+                recorded = any(item['source_capability'] == 'web3-public-source-import' for item in observations) and bool(artifacts)
+            completed = event_kind in event_kinds and recorded
+            status = "completed" if completed else "not_tested" if terminal else "queued"
+            result = "已保存实际材料与处理记录" if completed else "尚无本次运行的完整处理记录"
+            count = len(observations) if completed else 0
+        elif capability == "checkout":
             if "repository.checkout_completed" in event_kinds:
                 status, result, count = "completed", next((e["message"] for e in reversed(run["events"]) if e["kind"] == "repository.checkout_completed"), "仓库检出完成"), 0
             elif "repository.checkout_failed" in event_kinds:
@@ -1948,17 +2100,29 @@ def get_run_details(run_id: str):
         test_items.insert(0, {"id": "imported-api", "label": "导入的接口研究清单", "stage": "surface",
                               "description": "方法、路径、参数和 Body 字段来自授权目标包；导入本身不代表接口已接受请求或完成漏洞验证",
                               "status": "not_tested", "result": f"{len(imported_surface)} 个范围内端点已纳入研究清单；尚须独立测试", "observation_count": 0})
+    def execution_stage_status(stage):
+        items = [item for item in test_items if item['stage'] == stage]
+        if not terminal:
+            return run['status']
+        if any(item['status'] == 'failed' for item in items):
+            return 'failed'
+        if items and all(item['status'] == 'completed' for item in items):
+            return 'completed'
+        if any(item['status'] == 'completed' for item in items):
+            return 'partial'
+        return 'not_tested'
+
     stages_detail = [
         {"id": "target", "label": "目标与版本", "status": "completed" if ("repository.checkout_completed" in event_kinds or "toolchain.started" in event_kinds) else run["status"], "summary": engagement["normalized_target"]},
         {"id": "scope", "label": "授权范围与策略", "status": "completed", "summary": f"{engagement['policy'].get('max_requests_per_second', 1)} req/s · {engagement['policy'].get('max_runtime_minutes', 30)} min · read/analyze"},
-        {"id": "surface", "label": "攻击面与输入清单", "status": "completed" if terminal else run["status"], "summary": f"{len([x for x in test_items if x['stage']=='surface'])} 个表面测试项"},
-        {"id": "analysis", "label": "工具执行", "status": "completed" if terminal else run["status"], "summary": f"{len(test_items)} 个计划项，{sum(x['status']=='completed' for x in test_items)} 完成，{sum(x['status']=='failed' for x in test_items)} 失败"},
-        {"id": "processing", "label": "结果归一化", "status": "completed" if terminal else "queued", "summary": f"{len(observations)} 条 Observation · {len(artifacts)} 个 Artifact"},
-        {"id": "verification", "label": "候选与独立复验", "status": ("human_review" if candidate_count else "completed" if verified_count else "not_tested") if terminal else "queued", "summary": f"{candidate_count} 个 Candidate · {verified_count} 个 Verified"},
+        {"id": "surface", "label": "攻击面与输入清单", "status": execution_stage_status('surface'), "summary": f"{len([x for x in test_items if x['stage']=='surface'])} 个表面测试项"},
+        {"id": "analysis", "label": "工具执行", "status": execution_stage_status('analysis'), "summary": f"{len(test_items)} 个计划项，{sum(x['status']=='completed' for x in test_items)} 完成，{sum(x['status']=='failed' for x in test_items)} 失败"},
+        {"id": "processing", "label": "结果归一化", "status": ("completed" if observations else "not_tested") if terminal else "queued", "summary": f"{len(observations)} 条 Observation · {len(artifacts)} 个 Artifact"},
+        {"id": "verification", "label": "候选与独立复验", "status": ("human_review" if candidate_count or proof_review_count else "completed" if verified_count else "not_tested") if terminal else "queued", "summary": f"{candidate_count} 个 Candidate · {verified_count} 个有效证明 · {proof_review_count} 个历史结论待复核"},
         {"id": "impact", "label": "影响与可提交性", "status": ("completed" if verified_count else "not_applicable") if terminal else "queued", "summary": "无 Verified Finding，未形成影响结论" if not verified_count else f"{verified_count} 个结果进入影响评估"},
         {"id": "report", "label": "覆盖与总结报告", "status": "completed" if terminal else "queued", "summary": "运行总结与 Coverage Ledger 已生成" if terminal else "等待运行进入终态"},
     ]
-    return {"run_id": run_id, "engagement": {"id": engagement["id"], "name": engagement["name"], "target": engagement["normalized_target"], "mode": engagement["mode"], "target_type": engagement["target_type"]}, "config": config, "stages": stages_detail, "test_items": test_items, "imported_surface": imported_surface, "observations": observations, "artifacts": artifacts, "coverage": coverage}
+    return {"run_id": run_id, "engagement": {"id": engagement["id"], "name": engagement["name"], "target": engagement["normalized_target"], "mode": engagement["mode"], "target_type": engagement["target_type"]}, "config": config, "proof_status": {"recorded_verified": recorded_verified_count, "proof_checked": verified_count if not run["synthetic"] else 0, "review_required": proof_review_count, "synthetic": run["synthetic"], "check_limit": 50, "items": proof_reviews}, "stages": stages_detail, "test_items": test_items, "imported_surface": imported_surface, "observations": observations, "artifacts": artifacts, "coverage": coverage}
 
 
 @router.get("/runs/{run_id}/events")
@@ -2802,13 +2966,31 @@ def run_summary_report(run_id: str):
     verdict = "发现已验证漏洞" if findings["verified"] else "本次分析未形成已验证漏洞"
     content_lines = [
         f"# {engagement['name']} 分析总结", "", f"- 目标：{engagement['normalized_target']}",
-        f"- 运行：{run_id}", "- 执行模式：真实扫描",
+        f"- 运行：{run_id}", f"- 执行模式：{'安全演示（合成数据）' if run['synthetic'] else '受控研究（实际执行范围见覆盖账本）'}",
         f"- 状态：{run['status']}", f"- 开始时间：{run['started_at'] or run['created_at']}",
         f"- 完成时间：{run['completed_at'] or run['stopped_at'] or '未结束'}", f"- 结论：{verdict}", "",
         "## 结果统计", "", f"- 候选：{len(findings['candidates'])}", f"- 已验证漏洞：{len(findings['verified'])}",
         f"- 测试项：{len(tests)}（完成 {completed_tests} / 失败 {failed_tests} / 未测试 {not_tested}）",
-        f"- 覆盖项：{len(coverage)}", f"- 已测试覆盖项：{tested}", "", "## 实际测试与反馈", "",
+        f"- 覆盖项：{len(coverage)}", f"- 已测试覆盖项：{tested}", "",
     ]
+    content_lines.extend(['## 八阶段实际状态', ''])
+    for stage in details['stages']:
+        content_lines.append(f"- [{stage['status']}] {stage['label']}：{stage['summary']}")
+    content_lines.extend(['', '## 已验证结果与影响', ''])
+    if findings['verified']:
+        for finding in findings['verified']:
+            impact = finding.get('impact') or {}
+            verification = finding.get('verification') or {}
+            content_lines.extend([
+                f"### {finding['title']}", '', f"- Finding：{finding['id']}",
+                f"- 严重程度：{finding.get('severity', '未记录')}",
+                f"- 影响：{impact.get('description') or '未记录，需补充证据支持的影响说明'}",
+                f"- 验证回执：{verification.get('receipt_id') or '未记录'}",
+                f"- 证据：{', '.join(finding.get('evidence_ids') or []) or '未记录'}", '',
+            ])
+    else:
+        content_lines.extend(['没有已验证结果；候选与观察不能作为已确认漏洞交付。', ''])
+    content_lines.extend(['## 实际测试与反馈', ''])
     if tests:
         for item in tests:
             content_lines.extend([
@@ -2831,7 +3013,8 @@ def run_summary_report(run_id: str):
         "counts": {"candidates": len(findings["candidates"]), "verified": len(findings["verified"]),
                    "coverage": len(coverage), "tested": tested, "tests": len(tests),
                    "completed_tests": completed_tests, "failed_tests": failed_tests, "not_tested": not_tested},
-        "tests": tests, "coverage": coverage, "content": "\n".join(content_lines),
+        "tests": tests, "stages": details['stages'], "coverage": coverage,
+        "verified_findings": findings['verified'], "content": redact("\n".join(content_lines)),
     }
 
 
@@ -2869,11 +3052,21 @@ def finding_report_inputs(finding_id: str) -> tuple[dict[str, Any], list[dict[st
             raise HTTPException(404, "Verified CanonicalFinding 不存在")
         finding = dict(row)
         for key in ("impact", "eligibility", "verification", "evidence_ids"):
-            finding[key] = load(finding[key], {} if key != "evidence_ids" else [])
+            try:
+                finding[key] = json.loads(finding[key])
+            except (TypeError, ValueError, RecursionError) as error:
+                raise HTTPException(409, '历史证明字段无法解析，请重新验证') from error
+            expected = list if key == 'evidence_ids' else dict
+            if not isinstance(finding[key], expected):
+                raise HTTPException(409, '历史证明字段格式异常，请复核后重新验证')
+        if any(not isinstance(item, str) for item in finding['evidence_ids']):
+            raise HTTPException(409, '历史证明证据引用格式异常，请重新验证')
         evidence = [dict(e) for e in db.execute(
             f"SELECT * FROM evidence_v2 WHERE id IN ({','.join('?' for _ in finding['evidence_ids'])})" if finding["evidence_ids"] else "SELECT * FROM evidence_v2 WHERE 0",
             tuple(finding["evidence_ids"]),
         )]
+        if {item['id'] for item in evidence} != set(finding['evidence_ids']):
+            raise HTTPException(409, '历史证明引用的证据缺失，请重新验证')
         candidate = db.execute("SELECT run_id FROM candidate_findings WHERE id=?", (finding["candidate_id"],)).fetchone()
         run = db.execute("SELECT scope_snapshot_id FROM analysis_runs WHERE id=?", (candidate["run_id"],)).fetchone() if candidate else None
     return finding, evidence, run["scope_snapshot_id"] if run else "MISSING_SCOPE_SNAPSHOT"
@@ -2881,16 +3074,43 @@ def finding_report_inputs(finding_id: str) -> tuple[dict[str, Any], list[dict[st
 
 def build_proof_attachments(finding, evidence, scope_id):
     """Resolve actual proof bytes, validating ownership and integrity before exporting."""
+    from proof_materials import read_proof_file
     with connect() as db:
         candidate = db.execute("SELECT * FROM candidate_findings WHERE id=?", (finding["candidate_id"],)).fetchone()
+        if not candidate or candidate['engagement_id'] != finding['engagement_id']:
+            raise HTTPException(409, '历史证明候选归属缺失或不一致')
         run = db.execute("SELECT * FROM analysis_runs WHERE id=?", (candidate["run_id"],)).fetchone()
         scope = db.execute("SELECT * FROM scope_snapshots WHERE id=?", (scope_id,)).fetchone()
-        receipt_id = finding["verification"].get("receipt_id")
+        if not run or not scope or run['engagement_id'] != candidate['engagement_id'] or run['scope_snapshot_id'] != scope_id or scope['engagement_id'] != candidate['engagement_id']:
+            raise HTTPException(409, '历史证明运行或授权范围缺失或不一致')
+        verification = finding['verification']
+        if not isinstance(verification, dict) or not isinstance(finding['eligibility'], dict):
+            raise HTTPException(409, '历史证明字段格式异常，请重新验证')
+        receipt_id = verification.get('receipt_id')
+        if receipt_id is not None and not isinstance(receipt_id, str):
+            raise HTTPException(409, '历史证明收据引用格式异常')
         row = db.execute("SELECT result FROM verification_attempts WHERE id=? AND candidate_id=? AND status='machine_receipt'", (receipt_id, candidate["id"])).fetchone()
         if not row:
             raise HTTPException(409, "历史结论没有机器复验收据，请重新验证后导出证明包")
-        receipt = load(row["result"], {})
+        try:
+            receipt = json.loads(row['result'])
+        except (TypeError, ValueError, RecursionError) as error:
+            raise HTTPException(409, '机器复验收据无法解析，请重新验证') from error
+        if not isinstance(receipt, dict):
+            raise HTTPException(409, '机器复验收据格式异常，请重新验证')
+        artifact_map = receipt.get('artifacts', {})
+        artifact_ids_value = verification.get('poc_artifact_ids', [])
+        steps = verification.get('steps', [])
+        oracle_value = verification.get('oracle')
+        if (not isinstance(artifact_map, dict)
+                or any(not isinstance(key, str) or not isinstance(value, str) for key, value in artifact_map.items())
+                or not isinstance(artifact_ids_value, list) or any(not isinstance(item, str) for item in artifact_ids_value)
+                or not isinstance(steps, list) or any(not isinstance(item, str) for item in steps)
+                or (oracle_value is not None and not isinstance(oracle_value, str))):
+            raise HTTPException(409, '历史证明复现材料格式异常，请重新验证')
         if receipt.get('v5_verification_receipt_id'):
+            if not isinstance(receipt['v5_verification_receipt_id'], str) or not isinstance(receipt.get('proof'), dict):
+                raise HTTPException(409, '历史 HTTP 证明绑定格式异常，请重新验证')
             from verification_receipts import _validate_v5_http_binding
             from v5_verification import _validated_receipt
             _validate_v5_http_binding(db, candidate, VerificationInput.model_validate(receipt['proof']), receipt['v5_verification_receipt_id'])
@@ -2919,15 +3139,16 @@ def build_proof_attachments(finding, evidence, scope_id):
             if not artifact:
                 raise HTTPException(409, "复现 Artifact 不存在或不属于当前运行")
             path = Path(artifact["uri"])
-            if not path.is_file() or path.stat().st_size > 10_000_000:
-                raise HTTPException(409, "复现 Artifact 缺失或超过导出大小限制")
-            raw = path.read_bytes()
+            try:
+                raw = read_proof_file(path, 10_000_000)
+            except (OSError, ValueError) as error:
+                raise HTTPException(409, '复现 Artifact 缺失、变化、链接或超过导出大小限制') from error
             digest = hashlib.sha256(raw).hexdigest()
             if digest != artifact["sha256"] or digest != receipt["artifacts"][artifact_id]:
                 raise HTTPException(409, "复现 Artifact 哈希校验失败")
             try:
                 value = json.loads(raw) if artifact["media_type"] == "application/json" else raw.decode("utf-8")
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, RecursionError):
                 raise HTTPException(409, "复现 Artifact 无法安全解析和脱敏")
             extension = "json" if artifact["media_type"] == "application/json" else "txt"
             proof_name = f"proof/evidence/{artifact_id}.{extension}"
@@ -2955,8 +3176,13 @@ def build_proof_attachments(finding, evidence, scope_id):
             source = db.execute("""SELECT subject FROM observations
                 WHERE run_id=? AND observation_type='web3.compiler_result'
                 ORDER BY created_at DESC LIMIT 1""", (run["id"],)).fetchone()
-            root = Path(source["subject"]).expanduser().resolve() if source else None
+            root = Path(source["subject"]).expanduser() if source else None
             if root and root.is_dir():
+                from storage_migration import _plain_directory
+                try:
+                    root = _plain_directory(root)
+                except (OSError, ValueError) as error:
+                    raise HTTPException(409, 'Foundry 源码目录包含链接或已失效') from error
                 selected = []
                 for relative in ("foundry.toml", "remappings.txt"):
                     path = root / relative
@@ -2968,8 +3194,11 @@ def build_proof_attachments(finding, evidence, scope_id):
                         selected.extend(path for path in base.rglob("*.sol") if path.is_file() and not path.is_symlink())
                 total = 0
                 for path in sorted(set(selected))[:300]:
-                    relative = path.resolve().relative_to(root).as_posix()
-                    raw = path.read_bytes()
+                    relative = path.relative_to(root).as_posix()
+                    try:
+                        raw = read_proof_file(path, 5_000_000 - total)
+                    except (OSError, ValueError) as error:
+                        raise HTTPException(409, 'Foundry 源码缺失、变化、链接或超过导出大小限制') from error
                     total += len(raw)
                     if total > 5_000_000:
                         raise HTTPException(409, "可移植 Foundry 源码超过 5MB 限制")
@@ -5818,6 +6047,14 @@ def web3_execution_check(body: Web3ExecutionCheck):
 def execution_policy_check(body: PolicyCheckInput):
     engagement = get_engagement(body.engagement_id)
     normalized = resolve_target_value(ResolveTargetInput(target=body.target, mode=engagement["mode"], chain_id=engagement.get("chain_id")))["normalized_target"]
+    if normalized.startswith(('http://', 'https://')):
+        resource = urlparse(body.target if '://' in body.target else 'https://' + body.target)
+        path = resource.path or ''
+        if (resource.username or resource.password or '\\' in path
+                or any(part in {'.', '..'} for part in path.split('/'))
+                or re.search(r'(?i)%(?:2e|2f|5c|25)', path)):
+            return {'allowed': False, 'reason': 'ambiguous_request_path', 'target': normalized}
+        normalized = normalized.rstrip('/') + path
     allowed_targets = engagement["scope"].get("allowed_targets", [])
     target_allowed = normalized in allowed_targets or any(
         normalized.startswith(item.rstrip("/") + "/") for item in allowed_targets if isinstance(item, str)
@@ -5837,7 +6074,9 @@ def execution_policy_check(body: PolicyCheckInput):
             if not allowed or not allowed.hostname or not candidate.hostname:
                 continue
             same_origin_class = candidate.scheme == allowed.scheme and candidate.port == allowed.port
-            if same_origin_class and candidate.hostname.endswith("." + allowed.hostname):
+            allowed_path = allowed.path.rstrip('/')
+            path_allowed = not allowed_path or candidate.path == allowed_path or candidate.path.startswith(allowed_path + '/')
+            if same_origin_class and path_allowed and candidate.hostname.endswith("." + allowed.hostname):
                 target_allowed = True
                 break
     if not target_allowed:

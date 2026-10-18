@@ -170,9 +170,14 @@ def _export_directory(snapshot: Path, destination: Path) -> None:
 
 def run_isolated(argv: list[str], cwd: Path, *, timeout: int = 120,
                  output_limit: int = DEFAULT_OUTPUT_LIMIT,
-                 export_dirs: tuple[str, ...] = ()) -> IsolatedResult:
+                 export_dirs: tuple[str, ...] = (), input_text: str | None = None,
+                 broker_port: int | None = None, broker_ca_pem: bytes | None = None) -> IsolatedResult:
     if not argv or timeout < 1 or output_limit < 1024:
         raise ValueError("invalid isolated execution request")
+    if broker_port is not None and (type(broker_port) is not int or not 1 <= broker_port <= 65535):
+        raise ValueError('invalid broker port')
+    if broker_ca_pem is not None and (broker_port is None or not isinstance(broker_ca_pem, bytes) or len(broker_ca_pem) > 16384):
+        raise ValueError('invalid task-local broker CA')
     root = cwd.expanduser().resolve()
     if not root.is_dir():
         raise ValueError("cwd must be an existing directory")
@@ -203,15 +208,29 @@ def run_isolated(argv: list[str], cwd: Path, *, timeout: int = 120,
             mapped_args.append(value)
         command = [str(executable), *mapped_args]
         profile = home / "sandbox.sb"
-        profile.write_text(_sandbox_profile(execution_root, home, executable))
+        policy = _sandbox_profile(execution_root, home, executable)
+        if broker_port is not None:
+            policy += f'\n(allow network-outbound (remote tcp "localhost:{broker_port}"))\n'
+        profile.write_text(policy)
+        environment = clean_environment(home, executable, execution_root)
+        if broker_ca_pem is not None:
+            ca_file = home / 'broker-ca.pem'
+            ca_file.write_bytes(broker_ca_pem)
+            environment['SSL_CERT_FILE'] = str(ca_file)
         command = [str(sandbox), "-f", str(profile), *command]
         isolation = "macos-sandbox"
 
+        input_stream = tempfile.TemporaryFile() if input_text is not None else None
+        if input_stream is not None:
+            input_stream.write(input_text.encode())
+            input_stream.seek(0)
         process = subprocess.Popen(
-            command, cwd=execution_root, env=clean_environment(home, executable, execution_root), shell=False,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            command, cwd=execution_root, env=environment, shell=False,
+            stdin=input_stream if input_stream is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True, preexec_fn=_limits,
         )
+        if input_stream is not None:
+            input_stream.close()
         selector = selectors.DefaultSelector()
         assert process.stdout is not None and process.stderr is not None
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
@@ -220,7 +239,16 @@ def run_isolated(argv: list[str], cwd: Path, *, timeout: int = 120,
         truncated = {"stdout": False, "stderr": False}
         deadline = time.monotonic() + timeout
         timed_out = False
+        resource_exceeded = False
+        resource_check_at = time.monotonic()
         while selector.get_map():
+            if time.monotonic() >= resource_check_at:
+                resource_check_at = time.monotonic() + 0.5
+                files = [p for p in execution_root.rglob("*") if p.is_file() and not p.is_symlink()]
+                if len(files) > MAX_SNAPSHOT_FILES or sum(p.stat().st_size for p in files) > MAX_SNAPSHOT_BYTES:
+                    resource_exceeded = True
+                    os.killpg(process.pid, signal.SIGKILL)
+                    break
             if time.monotonic() >= deadline:
                 timed_out = True
                 os.killpg(process.pid, signal.SIGKILL)
@@ -236,17 +264,20 @@ def run_isolated(argv: list[str], cwd: Path, *, timeout: int = 120,
                     target.extend(chunk[:remaining])
                 if len(chunk) > remaining:
                     truncated[key.data] = True
-        if timed_out:
+        if timed_out or resource_exceeded:
             process.wait(timeout=5)
         else:
             process.wait()
         suffix = b"\n[output truncated by Fieldwork]" if any(truncated.values()) else b""
         decode = lambda data: (bytes(data) + suffix).decode("utf-8", errors="replace")
         result = IsolatedResult(
-            None if timed_out else process.returncode, decode(captured["stdout"]),
-            decode(captured["stderr"]), "timeout" if timed_out else "completed", isolation,
+            None if timed_out or resource_exceeded else process.returncode, decode(captured["stdout"]),
+            decode(captured["stderr"]) + ("\n[workspace disk/file limit exceeded]" if resource_exceeded else ""), "resource_limit" if resource_exceeded else ("timeout" if timed_out else "completed"), isolation,
         )
-        if not timed_out:
+        if not timed_out and not resource_exceeded:
+            files = [p for p in execution_root.rglob("*") if p.is_file() and not p.is_symlink()]
+            if len(files) > MAX_SNAPSHOT_FILES or sum(p.stat().st_size for p in files) > MAX_SNAPSHOT_BYTES:
+                return IsolatedResult(None, result.stdout, result.stderr + "\n[workspace disk/file limit exceeded]", "resource_limit", isolation)
             for relative in export_dirs:
                 if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
                     raise ValueError("invalid isolated export path")

@@ -1,6 +1,6 @@
 (() => {
   "use strict";
-  window.createFieldworkRuntimeControl = ({state, esc, list, request, onConfig=()=>{}}) => {
+  window.createFieldworkRuntimeControl = ({state, esc, list, request, onConfig=()=>{}, openTeams}) => {
     const $ = selector => document.querySelector(selector);
     const t = (zh, en) => document.documentElement.lang.startsWith("en") ? en : zh;
     const copy = (zh, en) => `<span data-runtime-zh="${esc(zh)}" data-runtime-en="${esc(en)}">${esc(t(zh,en))}</span>`;
@@ -110,17 +110,29 @@
       try{await action()}catch(error){bindings.text($("#rcMessage"),()=>error.message)}
       finally{busy=false;control.disabled=false}
     }
+    const nextStep=document.createElement("div");nextStep.id="rcNextStep";nextStep.hidden=true;nextStep.className="workspace-toolbar";$("#rcMessage").after(nextStep);
+    function offerNext(zh,en,action){nextStep.replaceChildren();nextStep.hidden=false;const button=document.createElement("button");button.type="button";button.className="primary-button";bindings.text(button,()=>t(zh,en));button.onclick=action;nextStep.append(button)}
+    function openProfile(provider){const form=$("#rcProfileForm");form.closest("details").open=true;const selector=provider.location==="cloud"?"#rcCloudProviders":"#rcLocalProviders";for(const input of $(selector).querySelectorAll("input"))if(input.value===provider.id)input.checked=true;$("#rcMode").value=provider.location==="cloud"?"cloud":"local";if(!$("#rcProfileName").value)$("#rcProfileName").value=provider.name;$("#rcProfileAccepted").checked=false;form.scrollIntoView({block:"start",behavior:"smooth"});$("#rcProfileName").focus({preventScroll:true})}
     const option=(id,name)=>`<option value="${esc(id)}">${esc(name)}</option>`;
     function providerChecks(selector, values) {
       const prior=new Set([...$(selector).querySelectorAll("input:checked")].map(node=>node.value));
       $(selector).innerHTML=values.map(item=>`<label class="check-line"><input type="checkbox" value="${esc(item.id)}" ${prior.has(item.id)?"checked":""}>${esc(item.name)} · ${esc(item.model)} · ${esc(item.last_health)}</label>`).join("") || `<p>${t("尚无对应 Provider","No matching providers")}</p>`;
     }
     function renderProviders() {
-      $("#rcProviderActions").innerHTML=providers.map(item=>`<div class="runtime-provider-action"><span><b>${esc(item.name)}</b> · ${esc(item.model)} · ${esc(item.location)} · ${esc(item.last_health)}<small class="cell-subline">${esc(item.base_url)} · ${esc(item.last_health_at||"–")}</small></span><button type="button" data-rc-health="${esc(item.id)}">${t("检查连接","Check connection")}</button><button type="button" data-rc-toggle="${esc(item.id)}">${item.enabled?t("禁用","Disable"):t("启用","Enable")}</button></div>`).join("");
+      $("#rcProviderActions").innerHTML=providers.map(item=>`<div class="runtime-provider-action"><span><b>${esc(item.name)}</b> · ${esc(item.model)} · ${esc(item.location)} · ${esc(item.last_health)}<small class="cell-subline">${esc(item.base_url)} · ${esc(item.last_health_at||"–")}</small>${item.location==="cloud"&&!(item.metadata?.cost_micros_per_million_tokens>0)?`<small class="cell-subline">${t("尚未设置费用上界，云研究无法启动。","Cloud research cannot start until a positive cost bound is configured.")}</small>`:""}</span><label>${t("每百万词元费用上界（µ）","Cost bound per million tokens (µ)")}<input type="number" min="0" max="10000000000" step="1" data-rc-rate="${esc(item.id)}" value="${esc(item.metadata?.cost_micros_per_million_tokens??0)}"></label><button type="button" data-rc-rate-save="${esc(item.id)}">${t("保存费用上界","Save cost bound")}</button><button type="button" data-rc-health="${esc(item.id)}">${t("检查连接","Check connection")}</button><button type="button" data-rc-toggle="${esc(item.id)}">${item.enabled?t("禁用","Disable"):t("启用","Enable")}</button></div>`).join("");
+      panel.querySelectorAll("[data-rc-rate-save]").forEach(node=>node.onclick=()=>{
+        const provider=providers.find(item=>item.id===node.dataset.rcRateSave);
+        const field=[...panel.querySelectorAll("[data-rc-rate]")].find(item=>item.dataset.rcRate===provider?.id);
+        if(!provider||!field||!field.reportValidity())return;
+        const rate=Number(field.value);
+        if(!field.value||!Number.isSafeInteger(rate)||rate<0)return;
+        if(!window.confirm(t("保存费用上界？引用旧配置的 Profile 将失效，需要创建新版本。此数值用于保守预算估算，不是服务账单。","Save this cost bound? Profiles bound to the old configuration will become stale and require a new version. This value is a conservative estimate, not a service invoice.")))return;
+        mutate(async()=>{await send(`/api/v1/runtime/providers/${encodeURIComponent(provider.id)}`,{cost_micros_per_million_tokens:rate},"PATCH");await refresh();showMessage("费用上界已保存，请创建并选择新的 Profile 版本。","Cost bound saved. Create and select a new profile version.");offerNext("创建新 Profile 版本","Create new profile version",()=>openProfile(provider))},node);
+      });
       panel.querySelectorAll("[data-rc-health]").forEach(node=>node.onclick=()=>{
         const provider=providers.find(item=>item.id===node.dataset.rcHealth);
         if(!provider||!window.confirm(t(`连接 ${provider.base_url} 检查健康？不会调用模型。`,`Check health at ${provider.base_url}? No model prompt is sent.`)))return;
-        mutate(async()=>{const value=await send("/api/v1/runtime/providers/test",{provider_id:provider.id});await refresh();showMessage(`${provider.name}: ${value.status}`)},node);
+        mutate(async()=>{const value=await send("/api/v1/runtime/providers/test",{provider_id:provider.id});await refresh();const detail=value.detail==="tls_certificate_verification_failed"?t("证书链校验失败，请检查本机 CA 与代理配置。","Certificate verification failed. Check the local CA and proxy configuration."):value.http_status===401||value.http_status===403?t("服务拒绝认证，请核对 API Key 和服务权限。","Authentication rejected. Check the API key and service permissions."):value.detail?t("连接失败：","Connection failed: ")+value.detail:"";showMessage(`${provider.name}: ${value.status}${detail?" · "+detail:""}`);if(value.status==="healthy")offerNext("继续创建模型 Profile","Continue to create a model profile",()=>openProfile(provider))},node);
       });
       panel.querySelectorAll("[data-rc-toggle]").forEach(node=>node.onclick=()=>{
         const provider=providers.find(item=>item.id===node.dataset.rcToggle);
@@ -131,7 +143,7 @@
       providerChecks("#rcCloudProviders",providers.filter(item=>item.location==="cloud"));
       providerChecks("#rcIndependentProviders",providers.filter(item=>item.metadata?.supports_independence));
       const selected=$("#rcRouteProfile").value;
-      $("#rcRouteProfile").innerHTML=option("",t("选择 Profile","Select profile"))+profiles.map(item=>option(item.id,`${item.name} · ${item.mode} · ${item.id}${item.provider_configuration_bound===false?t(" · 旧版：未绑定 Provider 快照"," · Legacy: provider snapshot unbound"):""}`)).join("");
+      $("#rcRouteProfile").innerHTML=option("",t("选择 Profile","Select profile"))+profiles.map(item=>option(item.id,`${item.name} · ${item.mode} · ${item.id}${item.provider_configuration_current===false?t(" · 已过期，请新建版本"," · Stale; create a new version"):item.provider_configuration_bound===false?t(" · 旧版：未绑定 Provider 快照"," · Legacy: provider snapshot unbound"):""}`)).join("");
       if(profiles.some(item=>item.id===selected))$("#rcRouteProfile").value=selected;
     }
     function renderRoutes() {
@@ -253,7 +265,7 @@
       } catch(error){if(token===generation){failure=error.message;showMessage(error.message);renderRoutes();$("#rcCalls").textContent=error.message}}
     }
     async function loadCampaigns(token=++generation) {
-      const projects=list(state.engagements);if(!projects.some(item=>item.id===engagementId))engagementId=projects[0]?.id||"";
+      const projects=list(state.engagements);if(projects.some(item=>item.id===state.activeEngagement)&&engagementId!==state.activeEngagement){engagementId=state.activeEngagement;campaignId=""}if(!projects.some(item=>item.id===engagementId))engagementId=projects[0]?.id||"";
       $("#rcEngagement").innerHTML=option("",t("选择项目","Select project"))+projects.map(item=>option(item.id,item.name||item.id)).join("");$("#rcEngagement").value=engagementId;
       const result=engagementId?list(await request(`/api/v1/engagements/${encodeURIComponent(engagementId)}/campaigns`)):[];
       if(token!==generation)return;
@@ -279,7 +291,7 @@
       event.preventDefault();if(!$("#rcProviderAccepted").checked)return;
       const body={name:$("#rcProviderName").value.trim(),location:$("#rcLocation").value,kind:$("#rcKind").value,base_url:$("#rcBase").value.trim(),model:$("#rcModel").value.trim(),api_key:$("#rcKey").value||null,
         metadata:{supports_independence:$("#rcIndependent").checked,cost_micros_per_million_tokens:Number($("#rcRate").value),max_context_tokens:Number($("#rcContext").value),input_token_counting:$("#rcInputCounting").value}};
-      mutate(async()=>{try{await send("/api/v1/runtime/providers",body);event.target.reset();await refresh();showMessage("Provider 已保存；请显式检查连接。","Provider saved. Explicitly check its connection.")}finally{$("#rcKey").value="";body.api_key=null}},$("#rcProviderSave"));
+      mutate(async()=>{try{const saved=await send("/api/v1/runtime/providers",body);event.target.reset();await refresh();showMessage("Provider 已保存；请显式检查连接。","Provider saved. Explicitly check its connection.");offerNext("检查刚保存的模型连接","Check the saved model connection",()=>{const control=[...panel.querySelectorAll("[data-rc-health]")].find(node=>node.dataset.rcHealth===saved.id);if(control)control.click()})}finally{$("#rcKey").value="";body.api_key=null}},$("#rcProviderSave"));
     };
     $("#rcProfileForm").onsubmit=event=>{
       event.preventDefault();if(!$("#rcProfileAccepted").checked)return;
@@ -287,7 +299,7 @@
       const body={name:$("#rcProfileName").value.trim(),mode:$("#rcMode").value,config:{local_provider_ids:ids("#rcLocalProviders"),cloud_provider_ids:ids("#rcCloudProviders"),independent_provider_ids:ids("#rcIndependentProviders"),allow_fallback:$("#rcFallback").checked,cloud_complexity_threshold:Number($("#rcThreshold").value),max_tokens_per_call:Number($("#rcMaxTokens").value),max_cost_micros:Number($("#rcMaxCost").value),max_concurrent_calls:Number($("#rcCallConcurrency").value),max_tokens_per_hour:Number($("#rcHourlyTokens").value),max_runtime_ms_per_call:Number($("#rcCallRuntime").value)}};
       const selectedIds=new Set([...body.config.local_provider_ids,...body.config.cloud_provider_ids,...body.config.independent_provider_ids]);
       body.config.provider_config_hashes=Object.fromEntries(providers.filter(item=>selectedIds.has(item.id)).map(item=>[item.id,item.configuration_sha256]));
-      mutate(async()=>{const value=await send("/api/v1/runtime/config",body,"PUT");await refresh();$("#rcRouteProfile").value=value.id;$("#rcProfileAccepted").checked=false;showMessage(`Profile ${value.id} ${t("已保存。","saved.")}`)},$("#rcProfileSave"));
+      mutate(async()=>{const value=await send("/api/v1/runtime/config",body,"PUT");await refresh();$("#rcRouteProfile").value=value.id;$("#rcProfileAccepted").checked=false;state.activeProfile=value.id;showMessage(`Profile ${value.id} ${t("已保存。","saved.")}`);offerNext("继续配置研究组","Continue to configure a research team",openTeams)},$("#rcProfileSave"));
     };
     $("#rcRouteForm").onsubmit=event=>{
       event.preventDefault();mutate(async()=>{const value=await send("/api/v1/runtime/routes",{profile_id:$("#rcRouteProfile").value,task_type:$("#rcTaskType").value,sensitivity:$("#rcSensitivity").value,complexity:Number($("#rcComplexity").value),estimated_tokens:Number($("#rcEstimate").value),budget_remaining_micros:Number($("#rcRouteBudget").value),requires_independence:$("#rcRouteIndependent").checked});$("#rcRouteResult").textContent=JSON.stringify(value,null,2);await loadRoutes();showMessage("路由决策已记录；模型调用次数未增加。","Route decision recorded; model call count did not increase.")},$("#rcRouteCheck"));
@@ -298,7 +310,7 @@
       mutate(async()=>{await send(`/api/v1/continuous-research/campaigns/${encodeURIComponent(campaignId)}`,body,"PUT");await loadPolicy();showMessage("策略版本已保存。","Policy version saved.")},$("#rcPolicySave"));
     };
     $("#rcTick").onclick=()=>{if(!campaignId||!window.confirm(t("检查当前图谱变化并按预算新增持久任务？","Check graph changes and queue tasks within the budget?")))return;mutate(async()=>{const value=await send(`/api/v1/continuous-research/campaigns/${encodeURIComponent(campaignId)}/tick`,{});$("#rcTickResult").textContent=JSON.stringify(value,null,2);await loadPolicy()},$("#rcTick"))};
-    $("#rcEngagement").onchange=event=>{engagementId=event.target.value;campaignId="";loadCampaigns().catch(error=>showMessage(error.message))};
+    $("#rcEngagement").onchange=event=>{engagementId=event.target.value;state.activeEngagement=engagementId;campaignId="";loadCampaigns().catch(error=>showMessage(error.message))};
     $("#rcCampaign").onchange=event=>{campaignId=event.target.value;loadPolicy()};
     $("#rcRefresh").onclick=refresh;$("#rcMoreRoutes").onclick=()=>loadRoutes(true).catch(error=>showMessage(error.message));
     for(const [formId,acceptedId] of [["rcProviderForm","rcProviderAccepted"],["rcProfileForm","rcProfileAccepted"],["rcPolicyForm","rcPolicyAccepted"]]){

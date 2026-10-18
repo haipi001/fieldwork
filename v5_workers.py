@@ -12,7 +12,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from v5_graph import _bridge_edge, _bridge_node
 from v5_orchestration import (
@@ -485,12 +485,17 @@ def local_worker_tick(limit: int = 2, population_id: str | None = None):
                     unknown = bool(call and db.execute("SELECT 1 FROM runtime_calls WHERE id=? AND state='unknown'", (call["id"],)).fetchone())
                     blocked_budget = isinstance(error, HTTPException) and any(word in str(error.detail) for word in ("budget", "unresolved model call", "concurrency"))
                     rejected = isinstance(error, ModelOutputRejected)
+                    diagnostic = ({'model_output_reason': error.reason_code, 'model_finish_reason': error.finish_reason}
+                                  if rejected else {})
+                    if isinstance(error, ValidationError) and call and db.execute("SELECT 1 FROM runtime_calls WHERE id=? AND state='settled'", (call['id'],)).fetchone():
+                        rejected = True
+                        diagnostic['model_output_reason'] = 'schema_mismatch'
                     status = "paused" if unknown or blocked_budget or rejected else ("queued" if current["attempt"] < current["max_attempts"] else "failed")
                     code = "model_usage_unknown" if unknown else "model_output_invalid_usage_settled" if rejected else "model_budget_blocked" if blocked_budget else "local_worker_failed"
                     db.execute(
                         "UPDATE agent_tasks SET status=?,lease_owner=NULL,lease_expires_at=NULL,"
                         "heartbeat_at=NULL,error_json=?,updated_at=? WHERE id=?",
-                        (status, _dump({"code": code, "error_type": type(error).__name__,
+                        (status, _dump({"code": code, "error_type": type(error).__name__, **diagnostic,
                                        **({'settlement_error_type': settlement_error} if settlement_error else {})}),
                          _now(), task["id"]),
                     )

@@ -3,7 +3,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlparse
-import json,os,secrets,sys,tempfile
+import json,os,secrets,sys,tempfile,time
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
 from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
@@ -35,13 +35,25 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
     for source,target in [(path_nodes[0],path_nodes[1]),(path_nodes[1],path_nodes[-1])]:
         assert client.post('/api/v1/research/edges',json={'campaign_id':campaign['id'],'source_id':source,'target_id':target,'relation_type':'related_to'}).status_code==201
     errors=[]
+    import monitor_startup
+    login_directory=root/'fake-home/Library';login_directory.mkdir(parents=True)
+    login_label='com.fieldwork.monitor.ui-'+__import__('hashlib').sha256(str(root).encode()).hexdigest()[:12]
+    stack.enter_context(patch.object(monitor_startup,'_location',lambda:(login_label,login_directory/'LaunchAgents'/(login_label+'.plist'))))
+    login_state={'registered':False}
+    from types import SimpleNamespace
+    def login_command(*args):
+        if args[0]=='print':return SimpleNamespace(returncode=0 if login_state['registered'] else 113,stderr=b'' if login_state['registered'] else b'Could not find service')
+        if args[0]=='bootstrap':login_state['registered']=True
+        if args[0]=='bootout':login_state['registered']=False
+        return SimpleNamespace(returncode=0,stderr=b'')
+    stack.enter_context(patch.object(monitor_startup,'_command',login_command))
     delayed={'checkpoint':False,'campaign_path':None,'routes':[],'monitor_state':None}
     def route_request(route):
         req=route.request;p=urlparse(req.url);assert p.hostname=='127.0.0.1',req.url
         if p.path=='/api/v1/workspace/monitor-process' and delayed['monitor_state'] is not None:
             state=delayed['monitor_state']
             if state=='unavailable':route.fulfill(status=503,json={'detail':'Isolated unavailable-state fixture'})
-            else:route.fulfill(json={'state':state,'running':state!='stopped','pid':123,'version':'fixture','last_tick':1,'error':None})
+            else:route.fulfill(json={'state':state,'running':state!='stopped','pid':123,'version':'fixture','last_tick':1,'error':'OSError' if state=='backoff' else None,'failures':3 if state=='backoff' else 0,'retry_after':time.time()+30 if state=='backoff' else None})
             return
         if delayed['campaign_path']==p.path:
             delayed['routes'].append(route);return
@@ -332,16 +344,27 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
         assert '未授权' in extension.locator('[data-w-pack-check]').inner_text()
         page.locator('[data-view="sentinel"]').click()
         monitor=page.locator('#workspace-sentinel')
-        for service_state in ('stopped','starting','current','degraded','unavailable'):
+        for service_state in ('stopped','starting','current','backoff','degraded','unavailable'):
             delayed['monitor_state']=service_state
             monitor.locator('[data-w-action="refresh"]').click()
             page.locator('[data-w-monitor-service][data-state="'+service_state+'"]').wait_for()
             assert monitor.locator('[data-w-monitor-service]').inner_text().strip()
+            if service_state=='backoff':
+                content=monitor.locator('[data-w-monitor-service]').inner_text()
+                assert '等待重试' in content and '连续失败' in content and '下次重试' in content and 'OSError' in content
         delayed['monitor_state']=None
         monitor.locator('[data-w-action="refresh"]').click()
         page.locator('[data-w-monitor-service][data-state="stopped"]').wait_for()
         with final_core.connect() as db:
             assert db.execute("SELECT COUNT(*) FROM agent_monitors WHERE status='active'").fetchone()[0]==0
+        login_form=monitor.locator('[data-w-monitor-login]')
+        login_form.locator('[name=enabled]').check();login_form.locator('[name=confirmed]').check();login_form.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-monitor-startup]')?.textContent.includes('登录任务已配置并注册')")
+        assert login_state['registered'] is True
+        login_form=monitor.locator('[data-w-monitor-login]')
+        login_form.locator('[name=enabled]').uncheck();login_form.locator('[name=confirmed]').check();login_form.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-monitor-startup]')?.textContent.includes('尚未启用登录启动')")
+        assert login_state['registered'] is False
         import monitor_process_control
         monitor_process_control._write('managed.json',{'service_id':'b'*32,'state':'starting'})
         monitor.locator('[data-w-action="refresh"]').click()
@@ -408,6 +431,7 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
         assert 'orchestrator' in events.locator('table').inner_text()
         page.locator('[data-view="evidence"]').click()
         evidence=page.locator('#workspace-evidence')
+        evidence.locator('[name="project"]').select_option('')
         evidence.locator('[name="q"]').fill(evidence_item['id']);evidence.locator('[name="q"]').press('Tab')
         evidence.locator('[name="artifact_kind"]').fill(evidence_item['type']);evidence.locator('[name="artifact_kind"]').press('Tab')
         page.wait_for_function("id=>document.querySelector('#workspace-evidence table')?.textContent.includes(id)",arg=evidence_item['id'])
@@ -417,6 +441,7 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
         assert '未重新校验' in evidence.locator('[data-w-message]').inner_text()
         page.locator('[data-view="incidents"]').click()
         investigation=page.locator('#workspace-incidents')
+        investigation.locator('[name="project"]').select_option('')
         investigation.locator('[name="q"]').fill(investigation_id);investigation.locator('[name="q"]').press('Tab')
         page.wait_for_function("id=>document.querySelector('#workspace-incidents table')?.textContent.includes(id)",arg=investigation_id)
         investigation.locator('[data-w-action="investigate-0"]').click()

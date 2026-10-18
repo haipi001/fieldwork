@@ -172,7 +172,10 @@ def test_profile_binds_provider_configuration_and_rejects_stale_review(client):
     second = profile(client, "local", local=[local["id"]])
     assert second["id"] != first["id"] and second["immutable_hash"] != first["immutable_hash"]
     assert route(client, second["id"])["model"] == "new-model"
-    assert client.get(f"/api/v1/runtime/profiles/{first['id']}").json() == first
+    reread = client.get(f"/api/v1/runtime/profiles/{first['id']}").json()
+    dynamic = {'provider_configuration_current', 'provider_configuration_status', 'changed_provider_ids'}
+    assert {key:value for key,value in reread.items() if key not in dynamic} == {key:value for key,value in first.items() if key not in dynamic}
+    assert reread['provider_configuration_current'] is False
 
 
 def test_usage_is_idempotent_immutable_and_future_routes_observe_campaign_budget(client):

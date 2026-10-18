@@ -11,7 +11,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 import v5_workers as w
 import v5_runtime as r
@@ -199,6 +199,7 @@ def _complete(task, call, decision, output, input_tokens, output_tokens, runtime
             raise HTTPException(422, 'research questions must be bounded nonempty strings')
         attrs = {'task_id': task['id'], 'group_id': task['group_id'], 'role': task['role'],
                  'decision_id': decision['id'], 'call_id': call['id'], 'canonical_result_eligible': False,
+                 'producer_task_id': task['id'], 'producer_runner_ref': RUNNER_ID,
                  'research_input_hashes': w._load(current['context_capsule_json'], {})['research_input_hashes'],
                  'scope_snapshot_id': w._load(current['context_capsule_json'], {}).get('scope_snapshot_id'),
                  'policy_id': w._load(current['context_capsule_json'], {}).get('policy_id')}
@@ -292,6 +293,11 @@ def _execute(task):
                 # Explicit restart/review required; no automatic model retry on rejected output.
                 from v5_model_transport import ModelTransportError
                 diagnostic = {'transport_code': error.code} if isinstance(error, ModelTransportError) else {}
+                if isinstance(error, ModelOutputRejected):
+                    diagnostic.update(model_output_reason=error.reason_code, model_finish_reason=error.finish_reason)
+                elif isinstance(error, ValidationError) and call and db.execute("SELECT 1 FROM runtime_calls WHERE id=? AND state='settled'", (call['id'],)).fetchone():
+                    code = 'model_output_invalid_usage_settled'
+                    diagnostic['model_output_reason'] = 'schema_mismatch'
                 if settlement_error:
                     diagnostic['settlement_error_type'] = settlement_error
                 db.execute("UPDATE agent_tasks SET status='paused',lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,"
@@ -405,3 +411,48 @@ def stop_workers():
         db.execute("UPDATE runner_registry_v5 SET status='offline',updated_at=? WHERE id=?", (now, RUNNER_ID))
     for job in jobs:
         job.join(timeout=2)
+
+
+@router.get('/tasks/{task_id}/draft')
+def read_research_draft(task_id: str):
+    """Read saved draft lineage; never rerun a model or attest verification."""
+    from v5_graph import _node
+    with w._core().connect() as db:
+        db.execute('BEGIN')
+        task = db.execute('SELECT * FROM agent_tasks WHERE id=?', (task_id,)).fetchone()
+        if not task:
+            raise HTTPException(404, 'research task not found')
+        result = w._load(task['result_json'], {})
+        if not isinstance(result, dict) or result.get('status') != 'research_draft':
+            raise HTTPException(409, 'task has no saved research draft')
+        capsule = w._load(task['context_capsule_json'], {})
+        hashes = capsule.get('research_input_hashes', {}) if isinstance(capsule, dict) else None
+        if not isinstance(hashes, dict) or len(hashes) > 20 or any(not isinstance(k, str) or not isinstance(v, str) for k,v in hashes.items()):
+            raise HTTPException(409, 'saved research input references are invalid')
+        drafts = []
+        for field, kind, limit, prefix in [('claim_ids','claim',5,'claim'),('open_question_ids','open_question',10,'question')]:
+            ids = result.get(field, [])
+            if not isinstance(ids, list) or len(ids) > limit or any(not isinstance(value,str) for value in ids) or len(set(ids)) != len(ids):
+                raise HTTPException(409, 'saved research draft references are invalid')
+            for index, node_id in enumerate(ids):
+                row = db.execute('SELECT * FROM research_nodes WHERE id=?', (node_id,)).fetchone()
+                if (not row or row['campaign_id'] != task['campaign_id'] or row['run_id'] != task['run_id']
+                        or row['node_type'] != kind or row['source_type'] != 'team_research'
+                        or row['source_ref'] != f'{task_id}:{prefix}:{index}'):
+                    raise HTTPException(409, 'saved research draft provenance is missing or changed')
+                attrs = w._load(row['attributes_json'], {})
+                if not isinstance(attrs,dict) or attrs.get('task_id') != task_id:
+                    raise HTTPException(409, 'saved research draft provenance is invalid')
+                drafts.append(_node(row))
+        inputs = []
+        for node_id, digest in hashes.items():
+            row = db.execute('SELECT * FROM research_nodes WHERE id=?', (node_id,)).fetchone()
+            if not row or row['campaign_id'] != task['campaign_id']:
+                inputs.append({'id':node_id,'material_status':'missing'})
+            else:
+                current = w._node_digest(row) == digest and row['status'] not in {'archived','retired','invalidated'}
+                inputs.append({**_node(row),'material_status':'current' if current else 'changed'})
+        return {'task_id':task_id,'campaign_id':task['campaign_id'],'run_id':task['run_id'],
+                'summary':result.get('summary',''),'drafts':drafts,'inputs':inputs,
+                'inputs_current':all(item['material_status']=='current' for item in inputs),
+                'independently_verified':False,'canonical_result_eligible':False}

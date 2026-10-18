@@ -45,9 +45,10 @@ with path.open('wb') as stream:
     plistlib.dump(metadata, stream, sort_keys=False)
 PY
 
-swiftc "$PROJECT_ROOT/macos/FieldworkApp.swift" \
+cp "$PROJECT_ROOT/macos/FieldworkApp.swift" "$BUILD_ROOT/main.swift"
+swiftc "$BUILD_ROOT/main.swift" "$PROJECT_ROOT/macos/LocalAlertNotifications.swift" \
   -target arm64-apple-macos13.0 \
-  -framework Cocoa -framework Security -framework WebKit \
+  -framework Cocoa -framework Security -framework WebKit -framework UserNotifications \
   -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 swiftc "$PROJECT_ROOT/macos/FieldworkKeychain.swift" \

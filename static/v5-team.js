@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  window.createFieldworkTeam = ({state, esc, list, request, post, toast}) => {
+  window.createFieldworkTeam = ({state, esc, list, request, post, toast, newResearch, openScope, openExecution, createCampaign, configureModel}) => {
     const $ = selector => document.querySelector(selector);
     const t = (zh, en) => document.documentElement.lang.startsWith("en") ? en : zh;
     const bindings = window.FieldworkLocale.bindings();
@@ -11,7 +11,7 @@
     let campaigns = [], runs = [], groups = [], tasks = [], nextCursor = "";
     let error = "", loading = false, busy = false, requestToken = 0;
     let preview = null, previewPayload = null, requestId = "";
-    let previewToken = 0;
+    let previewToken = 0, previewRequest = 0, previewTimer = null, preparingTeam=false,dialogToken=0,watchingGroup="";
 
     const option = (id, label) => `<option value="${esc(id)}">${esc(label)}</option>`;
     const stateName = value => ({
@@ -20,14 +20,17 @@
       succeeded:t("已完成","Succeeded"), failed:t("失败","Failed"),
       cancelled:t("已取消","Cancelled"), active:t("活动中","Active")
     }[value] || value || "–");
-    const errorName = code => ({model_output_invalid_usage_settled:t("输出 JSON 无效；已知用量已结算，请检查后重试","Invalid output JSON; known usage settled, review before retry"),model_usage_unknown:t("用量未知，预算仍保留","Usage unknown; budget remains reserved"),model_budget_blocked:t("预算不足或调用名额已满","Budget or call capacity exhausted"),research_context_too_large:t("固定研究材料过大","Frozen research input is too large"),research_input_stale:t("材料已变化，请创建新队伍","Inputs changed; create a new team"),research_worker_rejected:t("输出或执行未通过校验","Output or execution failed validation"),research_worker_stopped:t("研究执行已停止","Research execution stopped")}[code]||code||"–");
+    const errorName = code => ({model_output_invalid_usage_settled:t("模型输出未通过校验；已知用量已结算，请检查后重试","Model output failed validation; known usage settled, review before retry"),model_usage_unknown:t("用量未知，预算仍保留","Usage unknown; budget remains reserved"),model_budget_blocked:t("预算不足或调用名额已满","Budget or call capacity exhausted"),research_context_too_large:t("固定研究材料过大","Frozen research input is too large"),research_input_stale:t("材料已变化，请创建新队伍","Inputs changed; create a new team"),research_worker_rejected:t("输出或执行未通过校验","Output or execution failed validation"),research_worker_stopped:t("研究执行已停止","Research execution stopped")}[code]||code||"–");
+    const outputReason = code => ({output_truncated:t("生成达到输出上限，结果被截断","Generation reached its output limit; response truncated"),content_filtered:t("模型服务过滤了输出","Model service filtered the output"),non_text_content:t("模型未返回文本内容","Model returned no text content"),non_object_json:t("输出是 JSON，但不是任务要求的对象","Output is JSON but not the required object"),invalid_json:t("输出不是完整有效的 JSON","Output is not complete valid JSON"),invalid_json_constant:t("JSON 含不允许的数值常量","JSON contains a disallowed numeric constant"),json_too_deep:t("JSON 嵌套超过解析限制","JSON exceeds the nesting limit"),missing_output:t("模型响应缺少有效内容字段","Model response is missing a valid content field"),schema_mismatch:t("JSON 字段或类型不符合任务约定","JSON fields or types do not match the task contract")}[code]||"");
     const transportName = code => ({tls_verification_failed:t("模型服务证书校验失败","Model service certificate verification failed"),dns_resolution_failed:t("模型服务地址解析失败","Model service DNS resolution failed"),network_timeout:t("模型服务连接或读取超时","Model service connection or read timed out"),cloud_address_forbidden:t("模型服务解析到了非公开地址","Model service resolved to a nonpublic address"),http_status_401:t("模型服务拒绝凭据（HTTP 401）","Model service rejected credentials (HTTP 401)"),http_status_403:t("模型服务拒绝访问（HTTP 403）","Model service denied access (HTTP 403)"),http_status_429:t("模型服务限流（HTTP 429）","Model service rate limited the request (HTTP 429)")}[code] || (/^http_status_[1-5][0-9]{2}$/.test(code || "") ? t("模型服务返回 HTTP ","Model service returned HTTP ") + code.slice(12) : code ? t("模型传输未通过校验","Model transport failed validation") : ""));
     const empty = (title, detail) => `<div class="empty-state"><b>${esc(title)}</b><p>${esc(detail)}</p></div>`;
     function reset() {
       requestToken++;
+      clearTimeout(previewTimer);
       previewToken++;
       $("#teamDialog").close();
       engagementId = campaignId = runId = groupId = "";
+      watchingGroup="";
       campaigns = runs = groups = tasks = [];
       nextCursor = error = "";
       preview = previewPayload = null;
@@ -55,6 +58,7 @@
         <label>${t("研究项目","Research project")}<select id="teamEngagement">${option("",t("选择项目","Select project"))}${available.map(item => option(item.id,item.name || item.normalized_target || item.id)).join("")}</select></label>
         <label>${t("研究 Campaign","Research campaign")}<select id="teamCampaign">${option("",t("选择 Campaign","Select campaign"))}${campaigns.map(item => option(item.id,item.name || item.id)).join("")}</select></label>
         <label>${t("绑定 Run","Bound run")}<select id="teamRun">${option("",t("选择真实 Run","Select a real run"))}${eligibleRuns().map(item => option(item.id,`${item.id} · ${stateName(item.status)}`)).join("")}</select></label>
+        <button id="teamConfigureModel" type="button">${t("配置研究模型","Configure research model")}</button>
         <button id="teamRefresh" type="button" ${loading ? "disabled" : ""}>${t("刷新","Refresh")}</button>
         <button id="teamCreate" type="button" class="primary-button" ${canCreate ? "" : "disabled"}>${t("创建研究组","Create research team")}</button>
       </div>`;
@@ -87,12 +91,13 @@
             ${item.status !== "cancelled" ? `<button type="button" data-team-action="cancel" data-team-id="${esc(item.id)}">${t("取消组","Cancel team")}</button>` : ""}
           </div></article>`;
       }).join("");
-      const taskRows = shown.map(item => `<tr><td><strong>${esc(item.objective)}</strong><small class="cell-subline mono">${esc(item.id)}</small>${item.result?.status === "research_draft" ? `<p>${esc(item.result.summary)}</p><small class="cell-subline">${t("未验证草稿","Unverified draft")} · ${t("假设","Hypotheses")} ${list(item.result.claim_ids).length} · ${t("待研究问题","Open questions")} ${list(item.result.open_question_ids).length}</small><button type="button" data-inspect='${esc(JSON.stringify(item))}'>${t("查看记录与引用","Inspect record and references")}</button>` : ""}</td>
+      const taskRows = shown.map(item => `<tr><td><strong>${esc(item.objective)}</strong><small class="cell-subline mono">${esc(item.id)}</small>${item.result?.status === "research_draft" ? `<p>${esc(item.result.summary)}</p><small class="cell-subline">${t("未验证草稿","Unverified draft")} · ${t("假设","Hypotheses")} ${list(item.result.claim_ids).length} · ${t("待研究问题","Open questions")} ${list(item.result.open_question_ids).length}</small><button type="button" data-inspect='${esc(JSON.stringify(item))}'>${t("查看记录与引用","Inspect record and references")}</button><button type="button" data-team-draft="${esc(item.id)}">${t("审阅草稿与原始材料","Review draft and source material")}</button>` : ""}</td>
         <td>${esc(item.role)}</td><td><span class="state ${esc(item.status)}">${esc(stateName(item.status))}</span></td>
         <td>${esc(item.lease_owner || t("未领取","Unleased"))}<small class="cell-subline">${t("到期","Expires")}: ${esc(item.lease_expires_at || "–")}</small><small class="cell-subline">${t("尝试","Attempts")}: ${esc(item.attempt ?? 0)} / ${esc(item.max_attempts ?? 0)}</small></td>
         <td>${esc(item.usage?.cost_micros ?? 0)} / ${esc(item.budget?.max_cost_micros ?? "–")} µ<small class="cell-subline">${t("输入 / 输出词元","Input / output tokens")}: ${esc(item.usage?.input_tokens ?? 0)} / ${esc(item.usage?.output_tokens ?? 0)}</small><small class="cell-subline">${t("已记录累计时长","Recorded total time")}: ${esc(item.usage?.runtime_ms ?? 0)} / ${esc(item.budget?.max_runtime_ms ?? "–")} ms${item.model_runtime?.held_ms ? ` · ${t("未确认时长保留","Unconfirmed time held")} ${esc(item.model_runtime.held_ms)} ms` : ""}</small></td>
-        <td>${esc(errorName(item.error?.code || item.error?.error_type))}<small class="cell-subline">${esc(transportName(item.error?.transport_code) || item.error?.message || item.error?.detail || "")}</small></td></tr>`).join("");
-      host.innerHTML = `${selectors}<p class="trust-note">${esc(precondition)}</p>
+        <td>${esc(errorName(item.error?.code || item.error?.error_type))}<small class="cell-subline">${esc(outputReason(item.error?.model_output_reason) || transportName(item.error?.transport_code) || item.error?.message || item.error?.detail || "")}</small>${item.error?.model_output_reason?`<small class="cell-subline">${t("不会自动重试；请核对模型配置和预算后明确重试。","No automatic retry. Review model configuration and budget before explicitly retrying.")}</small>`:""}</td></tr>`).join("");
+      const nextStep=!loading&&!error?(!available.length?[t("新建研究项目","Create a research project"),newResearch]:!project?.confirmed_at||project.status!=="ready"?[t("核对当前项目授权","Review this project's scope"),()=>openScope(engagementId)]:!campaigns.length?[t("建立研究 Campaign","Create research campaign"),()=>createCampaign(engagementId)]:!run?[t("检查并启动 Run","Review and start a run"),()=>openExecution(engagementId)]:null):null;
+      host.innerHTML = `${selectors}<p class="trust-note">${esc(precondition)}</p>${nextStep?`<button type="button" id="teamNextStep" class="primary-button">${esc(nextStep[0])}</button>`:""}
         ${error ? `<p class="team-error" role="alert">${esc(error)}</p>` : ""}
         ${loading ? `<p role="status">${t("正在读取研究组与任务…","Loading research teams and tasks…")}</p>` : ""}
         ${selected ? `<div class="team-summary"><span>${t("研究组","Research groups")}: ${selectedGroups.length}${selectedGroups.length === 500 ? "+" : ""}</span>
@@ -104,14 +109,33 @@
               : error ? empty(t("任务读取失败","Tasks unavailable"),t("请刷新重试。","Refresh to retry.")) : loading ? "" : nextCursor ? empty(t("已加载页中没有该组任务","No matching tasks in loaded pages"),t("继续加载后续任务页。","Load subsequent task pages.")) : empty(t("没有已记录的逻辑任务","No recorded logical tasks"),t("这里不使用 Run 或 Runner 数量填充 Agent 清单。","Run and runner counts are not used as agent inventory."))}
             ${nextCursor ? `<button type="button" id="teamMoreTasks">${t("继续加载任务","Load more tasks")}</button>` : ""}</article>` : ""}
       `;
+      host.querySelectorAll("[data-team-draft]").forEach(button=>button.onclick=async()=>{
+        const taskId=button.dataset.teamDraft, token=requestToken, campaign=campaignId;
+        button.disabled=true;
+        let review=host.querySelector('#teamDraftReview');
+        if(!review){review=document.createElement('article');review.id='teamDraftReview';review.className='panel';host.append(review)}
+        review.textContent=t("正在读取草稿材料…","Loading draft material…");
+        review.dataset.task=taskId;
+        try{
+          const data=await request(`/api/v1/workers/research/tasks/${encodeURIComponent(taskId)}/draft`);
+          if(token!==requestToken||campaign!==campaignId||!review.isConnected||review.dataset.task!==taskId)return;
+          if(data.campaign_id!==campaign)throw new Error(t("研究项目上下文不一致","Research campaign context mismatch"));
+          const nodes=list(data.drafts),inputs=list(data.inputs);
+          review.innerHTML=`<h3>${t("研究草稿审阅","Research draft review")}</h3><p>${esc(data.summary)}</p><p class="trust-note">${t("尚未独立复验，不能作为确认发现。","Not independently verified; cannot be treated as a confirmed finding.")}</p><p>${t("Run","Run")}: ${esc(data.run_id)} · ${data.inputs_current?t("原始材料当前一致","Source material currently matches"):t("原始材料缺失或已变化，请重新研究","Source material is missing or changed; research again")}</p><h4>${t("假设与待研究问题","Hypotheses and open questions")}</h4>${nodes.map(node=>`<details><summary>${esc(node.title)}</summary><p>${esc(node.body)}</p><pre>${esc(JSON.stringify(node.attributes,null,2))}</pre></details>`).join("")||`<p>${t("没有保存的假设或问题","No saved hypotheses or questions")}</p>`}<h4>${t("原始证据与反证","Source evidence and counterevidence")}</h4>${inputs.map(node=>`<details><summary>${esc(node.title||node.id)} · ${esc(node.node_type||"")} · ${esc(node.material_status)}</summary><p>${esc(node.body||"")}</p><small>${esc(node.id)}</small></details>`).join("")}`;
+          review.scrollIntoView({block:'start',behavior:'smooth'});
+        }catch(error){if(review.isConnected&&review.dataset.task===taskId)review.textContent=error.message}
+        finally{if(button.isConnected)button.disabled=false}
+      });
+      if($("#teamNextStep"))$("#teamNextStep").onclick=nextStep[1];
       $("#teamEngagement").value = engagementId;
       $("#teamCampaign").value = campaignId;
       $("#teamRun").value = runId;
-      $("#teamEngagement").onchange = event => { engagementId = event.target.value; campaignId = runId = groupId = ""; refresh(); };
+      $("#teamEngagement").onchange = event => { engagementId = event.target.value; state.activeEngagement=engagementId; campaignId = runId = groupId = ""; refresh(); };
       $("#teamCampaign").onchange = event => { campaignId = event.target.value; groupId = ""; refreshCampaign(); };
       $("#teamRun").onchange = event => { runId = event.target.value; render(); };
       $("#teamRefresh").onclick = refresh;
       $("#teamCreate").onclick = openDialog;
+      $("#teamConfigureModel").onclick=configureModel;
       $("#teamAllTasks") && ($("#teamAllTasks").onclick = () => { groupId = ""; render(); });
       $("#teamMoreTasks") && ($("#teamMoreTasks").onclick = loadMore);
       host.querySelectorAll("[data-team-limit]").forEach(form=>form.onsubmit=async event=>{event.preventDefault();const group=groups.find(item=>item.id===form.dataset.teamLimit),button=form.querySelector('button'),status=form.querySelector('[role=status]');button.disabled=true;try{const response=await fetch(`/api/v1/workspace/groups/${encodeURIComponent(group.id)}/concurrency`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_concurrency:Number(form.elements.concurrency.value),expected_updated_at:group.updated_at})});const data=await response.json();if(!response.ok)throw new Error(data.detail||response.status);await refreshCampaign();toast(t("并发上限已更新","Concurrency limit updated"))}catch(error){status.textContent=error.message}finally{button.disabled=false}});
@@ -144,6 +168,7 @@
       host.querySelectorAll("[data-team-action]").forEach(button => button.onclick = () => act(button.dataset.teamId, button.dataset.teamAction));
     }
     async function refresh() {
+      if(state.activeEngagement&&list(state.engagements).some(item=>item.id===state.activeEngagement)&&engagementId!==state.activeEngagement){engagementId=state.activeEngagement;campaignId=runId=groupId=""}
       const token = ++requestToken;
       loading = true; error = ""; campaigns = runs = groups = tasks = []; nextCursor = "";
       render();
@@ -155,8 +180,8 @@
         ]);
         if (token !== requestToken) return;
         campaigns = list(campaignResult); runs = list(allRuns);
-        if (!campaigns.some(item => item.id === campaignId)) campaignId = campaigns[0]?.id || "";
-        if (!eligibleRuns().some(item => item.id === runId)) runId = eligibleRuns()[0]?.id || "";
+        if (!campaigns.some(item => item.id === campaignId)) campaignId = campaigns.find(item=>item.status==="active")?.id || campaigns[0]?.id || "";
+        if (!eligibleRuns().some(item => item.id === runId)) runId = eligibleRuns().find(item=>item.id===state.activeRun)?.id || eligibleRuns()[0]?.id || "";
         await refreshCampaign(token);
       } catch (failure) { if (token === requestToken) error = failure.message; }
       finally { if (token === requestToken) { loading = false; render(); } }
@@ -174,6 +199,7 @@
         if (token !== requestToken) return;
         groups = list(groupResult); tasks = list(taskResult);state.remote.orchestration={ok:true,data:runnerResult};
         nextCursor = taskResult.page?.next_cursor || "";
+        if(watchingGroup){const watched=groups.find(item=>item.id===watchingGroup),loaded=tasks.filter(item=>item.group_id===watchingGroup);if(!watched||watched.status!=="active"||loaded.length>=Number(watched.usage?.task_count||0)&&!loaded.some(item=>["queued","leased","running"].includes(item.status)))watchingGroup=""}
         if (!groups.some(item => item.id === groupId)) groupId = "";
       } catch (failure) { if (token === requestToken) error = failure.message; }
       finally { if (token === requestToken) { loading = false; render(); } }
@@ -190,13 +216,14 @@
       finally { if (token === requestToken) { loading = false; render(); } }
     }
     function invalidatePreview() {
+      clearTimeout(previewTimer);
       previewToken++;
       preview = previewPayload = null;
       $("#teamCommit").disabled = true;
       $("#teamAccepted").checked = false;
       bindings.forget($("#teamPreviewResult"));
       $("#teamPreviewResult").innerHTML = "";
-      message("配置已变化，请重新预览。","Configuration changed. Preview again.");
+      message("配置已变化，正在更新预检。","Configuration changed. Updating preflight.");
     }
     function payload() {
       const roles = [["researcher","#teamResearchers"],["explorer","#teamExplorers"],["specialist","#teamSpecialists"]]
@@ -209,14 +236,16 @@
         runtime_profile_id:$("#teamProfile").value || null
       };
     }
-    function openDialog() {
+    async function openDialog() {
+      const opening=++dialogToken;preparingTeam=true;
       const project = list(state.engagements).find(item => item.id === engagementId);
-      if (!project?.confirmed_at || project.status !== "ready" || !campaignId || !runId) return;
-      $("#teamForm").reset();
+      if (!project?.confirmed_at || project.status !== "ready" || !campaignId || !runId){preparingTeam=false;return}
+      $("#teamForm").reset();$("#teamAdvanced").open=false;
       $("#teamObjective").value = campaigns.find(item => item.id === campaignId)?.objective || "";
       const profiles = list(state.remote.runtimeConfig?.data?.profiles);
       $("#teamProfile").innerHTML = option("",t("不指定","Not selected")) +
-        profiles.map(item => option(item.id,`${item.name} · ${item.mode}`)).join("");
+        profiles.map(item => `<option value="${esc(item.id)}" ${item.provider_configuration_current===false?"disabled":""}>${esc(`${item.name} · ${item.mode}${item.provider_configuration_current===false?t(" · 已过期，请新建版本"," · Stale; create a new version"):""}`)}</option>`).join("");
+      if(profiles.some(item=>item.id===state.activeProfile&&item.provider_configuration_current!==false))$("#teamProfile").value=state.activeProfile;
       requestId = crypto.randomUUID(); preview = previewPayload = null;
       previewToken++;
       $("#teamPreviewResult").innerHTML = "";
@@ -224,11 +253,16 @@
       message("", "");
       $("#teamCommit").disabled = true;
       $("#teamDialog").showModal();
+      message("正在匹配已有 AI 与预算…","Matching existing AI and budget…");
+      try{const prepared=await request(`/api/v1/engagements/${encodeURIComponent(engagementId)}/assisted-plan${state.activeProfile?`?preferred_profile_id=${encodeURIComponent(state.activeProfile)}`:""}`);if(opening!==dialogToken||!$("#teamDialog").open)return;if(prepared.ai.enabled&&!$("#teamProfile").value){if(![...$("#teamProfile").options].some(item=>item.value===prepared.ai.profile_id))$("#teamProfile").insertAdjacentHTML("beforeend",option(prepared.ai.profile_id,prepared.ai.name));$("#teamProfile").value=prepared.ai.profile_id;if(prepared.team_defaults){const defaults=prepared.team_defaults;$("#teamConcurrency").value=defaults.max_concurrency;$("#teamCost").value=defaults.max_cost_micros;$("#teamTaskTokens").value=defaults.max_tokens_per_task;$("#teamTaskRuntime").value=defaults.max_runtime_ms_per_task}}}
+      catch{message("模型自动匹配不可用，队伍可先排队；可在高级设置中选择已配置模型。","Automatic model matching unavailable. Queue a team or select a configured model in advanced settings.")}
+      finally{if(opening===dialogToken){preparingTeam=false;if($("#teamDialog").open)previewTeam(true)}}
     }
-    async function previewTeam() {
+    async function previewTeam(automatic=false) {
+      clearTimeout(previewTimer);if(preparingTeam)return;
       for (const id of ["#teamObjective","#teamResearchers","#teamExplorers","#teamSpecialists",
                         "#teamConcurrency","#teamCost","#teamProfile","#teamTaskTokens","#teamTaskRuntime"]) {
-        if (!$(id).reportValidity()) return;
+        if (!(automatic===true?$(id).checkValidity():$(id).reportValidity())) return;
       }
       const body = payload();
       if (body.allow_cloud_context && !body.runtime_profile_id) {
@@ -236,11 +270,13 @@
         return;
       }
       const token = ++previewToken;
+      const requestNumber=++previewRequest;
       const count = body.roles.reduce((sum, item) => sum + item.count, 0);
       if (count < 1 || count > 100 || body.max_concurrency > count) {
         message("任务数需为 1–100，且并发不得超过任务数。","Use 1–100 tasks; concurrency cannot exceed task count.");
         return;
       }
+      preview=previewPayload=null;$("#teamAccepted").checked=false;$("#teamCommit").disabled=true;
       $("#teamPreview").disabled = true;
       message("正在核对当前授权…","Checking current authority…");
       try {
@@ -248,21 +284,24 @@
         if (token !== previewToken || !$("#teamDialog").open) return;
         preview = result; previewPayload = body;
         bindings.html($("#teamPreviewResult"), () => `<p><b>${t("当前计划","Current plan")}</b> · ${esc(result.task_count)} ${t("个逻辑任务","logical tasks")}</p>
-          <p>Run ${esc(result.run_id)} · Scope ${esc(result.scope_snapshot_id)} · Policy ${esc(result.policy_id)}</p>
+          <details><summary>${t("系统配置与预算详情","Prepared configuration and budget")}</summary><p>Run ${esc(result.run_id)} · Scope ${esc(result.scope_snapshot_id)} · Policy ${esc(result.policy_id)}</p>
           <p>${t("并发上限","Concurrency limit")} ${esc(result.max_concurrency)} · ${t("成本上限","Cost limit")} ${esc(result.max_cost_micros)} µ</p>
-          <p>${t("公开材料云发送许可","Public context cloud permission")}: ${result.cloud_context_approved?t("已确认","Confirmed"):t("未许可，强制本机","Not allowed; local only")}</p><p>${t("每任务词元","Tokens per task")} ${esc(result.max_tokens_per_task)} · ${t("累计模型时长预算","Total model time budget")} ${esc(result.max_runtime_ms_per_task)} ms · ${t("固定图谱输入","Frozen graph inputs")} ${Object.keys(result.research_input_hashes||{}).length}</p><p>${t("仅创建队列；之后可按 Profile 和公开材料外发权限分析已有图谱。本次不发送目标请求。","Only queues tasks. Explicitly invoke the profile within public-context permission later. No target request is sent.")}</p>`);
-        message("核对后勾选确认并创建。","Review the plan, then confirm creation.");
+          <p>${t("公开材料云发送许可","Public context cloud permission")}: ${result.cloud_context_approved?t("已确认","Confirmed"):t("未许可，强制本机","Not allowed; local only")}</p><p>${t("每任务词元","Tokens per task")} ${esc(result.max_tokens_per_task)} · ${t("累计模型时长预算","Total model time budget")} ${esc(result.max_runtime_ms_per_task)} ms · ${t("固定图谱输入","Frozen graph inputs")} ${Object.keys(result.research_input_hashes||{}).length}</p><p>${t("本次准备不发送目标请求。分析使用固定图谱材料、所选模型和已核对预算；不会自动确认漏洞。","Preparation sends no target requests. Analysis uses frozen graph inputs, the selected model and the reviewed budget; it does not confirm vulnerabilities automatically.")}</p></details>`);
+        const analyze=!!body.runtime_profile_id&&$("#teamAutoAnalyze").checked;
+        bindings.text($("#teamCommit"),()=>analyze?t("创建并开始 AI 分析","Create and start AI analysis"):t("创建队伍并排队","Create team and queue tasks"));
+        message(analyze?"核对后确认，系统将创建队伍并按所选模型分析已有图谱。":"核对后确认创建。没有可用模型时只排队，不模拟分析。",analyze?"Confirm to create the team and analyze recorded graph with the selected model.":"Confirm to queue the team. Without a usable model, no analysis is simulated.");
         $("#teamCommit").disabled = false;
       } catch (failure) {
         if (token !== previewToken) return;
         invalidatePreview();
         bindings.text($("#teamMessage"), () => failure.message === "cloud context requires a selected profile and explicitly public graph inputs"
           ? t("云端分析需要模型 Profile，且所有固定图谱材料必须明确标记为公开并通过敏感字段检查。","Cloud analysis requires a model Profile and all frozen graph inputs explicitly public and free of sensitive fields.") : failure.message);
-      } finally { $("#teamPreview").disabled = false; }
+      } finally { if(requestNumber===previewRequest)$("#teamPreview").disabled = false; }
     }
     async function commitTeam(event) {
       event.preventDefault();
-      if (!preview || !previewPayload || !$("#teamAccepted").checked) return;
+      if (!preview || !previewPayload || JSON.stringify(payload())!==JSON.stringify(previewPayload) || !$("#teamAccepted").checked) return;
+      const analyze=!!previewPayload.runtime_profile_id&&$("#teamAutoAnalyze").checked;
       const button = $("#teamCommit"); button.disabled = true;
       message("正在原子创建研究组与任务…","Creating the team and tasks atomically…");
       try {
@@ -271,19 +310,20 @@
         });
         $("#teamDialog").close(); groupId = created.group.id;
         await refreshCampaign();
-        toast(t("研究组与任务已入队；等待研究执行节点","Team and tasks queued; awaiting a research runner"));
+        if(analyze)await startResearch(created.group.id,true);else toast(t("研究组与任务已入队；等待研究执行节点","Team and tasks queued; awaiting a research runner"));
       } catch (failure) {
         bindings.text($("#teamMessage"), () => failure.message);
         button.disabled = false;
       }
     }
-    async function startResearch(id) {
+    async function startResearch(id,consented=false) {
       if(busy)return;
-      if(!window.confirm(t("按组的 Profile 与已确认公开材料权限调用模型？输出仅为研究草稿，不向目标发请求。","Invoke this team's profile within its confirmed public-context permission? Outputs are research drafts; no target request is sent.")))return;
+      if(!consented&&!window.confirm(t("按组的 Profile 与已确认公开材料权限调用模型？输出仅为研究草稿，不向目标发请求。","Invoke this team's profile within its confirmed public-context permission? Outputs are research drafts; no target request is sent.")))return;
       busy=true;render();
       try {
         const value=await post(`/api/v1/workers/research/groups/${encodeURIComponent(id)}/start`,{});
-        toast(t(value.status==="already_running"?"研究组正在运行。":"图谱分析已启动，请刷新查看真实任务进度。",value.status==="already_running"?"Research team is already running.":"Graph analysis started. Refresh to inspect actual task progress."));
+        watchingGroup=id;
+        toast(t(value.status==="already_running"?"研究组正在运行。":"图谱分析已启动，任务结果将自动更新。",value.status==="already_running"?"Research team is already running.":"Graph analysis started. Task results will update automatically."));
         await refreshCampaign();
       } catch(failure){error=failure.message;render()}
       finally{busy=false;render()}
@@ -301,9 +341,12 @@
       finally { busy = false; }
     }
     $("#teamClose").onclick = $("#teamCancel").onclick = () => $("#teamDialog").close();
-    $("#teamForm").addEventListener("input", event => { if (event.target.id !== "teamAccepted") invalidatePreview(); });
+    $("#teamForm").addEventListener("input", event => { if (event.target.id !== "teamAccepted"){invalidatePreview();previewTimer=setTimeout(()=>{if($("#teamDialog").open)previewTeam(true)},500)} });
+    $("#teamDialog").addEventListener("close",()=>{clearTimeout(previewTimer);previewToken++;dialogToken++;preparingTeam=false});
     $("#teamPreview").onclick = previewTeam;
     $("#teamForm").onsubmit = commitTeam;
+    const poll=setInterval(()=>{if(watchingGroup&&!document.hidden&&$("#agents").classList.contains("active")&&state.agentTab==="inventory"&&!busy&&!loading&&!$("#teamDialog").open&&!document.activeElement?.matches("input,textarea,select"))refreshCampaign()},5000);
+    window.addEventListener("pagehide",()=>clearInterval(poll));
     return {render, refresh, reset};
   };
 })();

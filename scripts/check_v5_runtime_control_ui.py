@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 import tempfile
@@ -92,7 +93,7 @@ def run():
             def route_request(route):
                 request=route.request;parsed=urlparse(request.url);path=parsed.path
                 assert parsed.hostname=="127.0.0.1"
-                if path=="/v5":route.fulfill(path=str(ROOT/"templates/v5.html"),content_type="text/html")
+                if path=="/v5":route.fulfill(body=re.sub(r"\{\{ asset_url\('([^']+)'\) \}\}", r"/static/\1", (ROOT / "templates/v5.html").read_text()), content_type="text/html")
                 elif path.startswith("/static/"):route.fulfill(path=str(ROOT/path.lstrip("/")))
                 elif (path in {"/api/v1/engagements", "/api/v1/v6/runtime-summary", "/api/v1/v6/eval-runs", "/api/v1/v6/policy-decisions", "/api/v1/v6/model-usage-reconciliations"} or path.startswith("/api/v1/orchestration/")
                       or path.startswith('/api/v1/v6/runs/') and path.endswith('/evidence-lineage')
@@ -198,10 +199,17 @@ def run():
                 page.wait_for_function("document.querySelectorAll('[data-rc-health]').length === 1")
                 assert page.locator("#rcKey").input_value()==""
                 assert counts["health"]==0
-                page.locator("[data-rc-health]").click()
+                page.locator("#rcNextStep button").filter(has_text="检查刚保存的模型连接").click()
                 page.wait_for_function("document.querySelector('#rcProviderActions').textContent.includes('healthy')")
+                page.locator("#rcNextStep button").filter(has_text="继续创建模型 Profile").click()
+                page.locator("[data-rc-rate]").fill("1200000")
+                page.locator("[data-rc-rate-save]").click()
+                page.wait_for_function("document.querySelector('#rcMessage').textContent.includes('费用上界已保存')")
+                assert page.locator("[data-rc-rate]").input_value()=="1200000"
+
                 assert counts=={"health":1,"model":0}
-                page.locator("#rcProfileForm").locator("..").locator("summary").click()
+                page.locator("#rcNextStep button").filter(has_text="创建新 Profile 版本").click()
+                assert page.locator("#rcLocalProviders input").is_checked()
                 page.locator("#rcProfileName").fill("Frozen UI offline profile")
                 page.locator("#rcMode").select_option("offline")
                 page.locator("#rcLocalProviders input").check()
@@ -217,6 +225,11 @@ def run():
                 assert saved["profiles"][0]["config"]["max_concurrent_calls"]==2
                 assert saved["profiles"][0]["config"]["max_tokens_per_hour"]==64000
                 assert saved["profiles"][0]["config"]["max_runtime_ms_per_call"]==20000
+                page.locator("#rcNextStep button").filter(has_text="继续配置研究组").wait_for()
+                page.locator("#rcNextStep button").click()
+                assert page.locator(".view.active").get_attribute("id") == "agents"
+                page.locator('[data-view="runtime"]').click()
+                page.wait_for_function("document.querySelectorAll('[data-rc-health]').length===1")
                 assert page.locator("#rcCalls").inner_text()
                 page.locator("#rcRouteForm").locator("..").locator("summary").click()
                 page.locator("#rcSensitivity").select_option("secret")
@@ -307,6 +320,10 @@ def run():
                 assert page.locator('[data-reconciliation-integrity]').count()==0
                 flags['fail_reviews']=False;page.locator('#rcRefresh').click()
                 page.wait_for_selector('[data-reconciliation-integrity="missing_or_changed"]')
+                page.locator("[data-rc-rate]").fill("1300000")
+                page.locator("[data-rc-rate-save]").click()
+                page.wait_for_function("document.querySelector('#runtimeRegistry').textContent.includes('Provider changed')")
+                page.wait_for_function("document.querySelector('#rcRouteProfile').textContent.includes('Stale')")
                 output=ROOT/"build/acceptance/v5-runtime-ui";output.mkdir(parents=True,exist_ok=True)
                 for language in ("en","zh-CN"):
                     page.set_viewport_size({"width":1440,"height":1000})

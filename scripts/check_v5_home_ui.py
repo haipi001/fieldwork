@@ -12,7 +12,8 @@ with sync_playwright() as p:
     page.goto("http://127.0.0.1:8011/v5#campaign")
     page.wait_for_function("document.querySelector('#homeMetrics').children.length === 6", timeout=30000)
     page.wait_for_function("!document.querySelector('#homeGraph').innerText.includes('读取图谱中')", timeout=30000)
-    assert page.locator("#homeOverview .home-grid > article").count() == 10
+    assert page.locator("#homeOverview .home-grid > article").count() == 9
+    assert page.locator("#homeOverview > .home-focus").count() == 1
     for theme in ("dark", "light"):
         page.evaluate("theme => document.documentElement.dataset.theme = theme", theme)
         for width in (400, 800, 1024, 1280, 1440):

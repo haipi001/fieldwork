@@ -137,6 +137,8 @@ def tick(audit_id, limit=200):
         artifact_id, _ = audit.artifact(db, parent['run_id'], 'agent_monitor_window', result)
         db.execute('INSERT INTO agent_monitor_windows VALUES(?,?,?,?)', (wid, audit_id, artifact_id, now))
         db.executemany('INSERT INTO agent_monitor_window_events VALUES(?,?)', [(e['id'], wid) for e in events])
+        import monitor_alerts
+        monitor_alerts.dispatch(db, result)
     return {'id': wid, 'event_count': len(events), 'signal_count': len(signals), 'status': result['status']}
 
 

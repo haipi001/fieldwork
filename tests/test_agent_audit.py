@@ -842,3 +842,20 @@ def test_signed_collector_rejects_tampering_replay_rollback_and_revocation(clien
     revoked = signed_body(private, collector, other, fixture['imports'][0], sequence=2, nonce='abcdef0123456789')
     assert client.post(f'/api/v1/agent-audit/audits/{other}/imports', json=revoked).status_code == 409
     assert client.get('/api/v1/agent-audit/collectors').json()[0]['status'] == 'revoked'
+
+
+def test_agent_audit_details_show_domain_contract_without_web_scanners(client):
+    result=client.post('/api/v1/agent-audit/demo').json()
+    details=client.get(f"/api/v1/runs/{result['run_id']}/details")
+    assert details.status_code==200,details.text
+    value=details.json();items={item['id']:item for item in value['test_items']}
+    assert set(items)=={'agent-materials','agent-reconciliation'}
+    assert all(item['status']=='completed' for item in items.values())
+    stages={item['id']:item for item in value['stages']}
+    # The demo fixture already contains its explicitly synthetic verified result.
+    assert stages['verification']['status']=='completed'
+    assert client.get(f"/api/v1/runs/{result['run_id']}").json()['synthetic']
+    with core.connect() as db:
+        db.execute('DELETE FROM agent_reconciliations WHERE run_id=?',(result['run_id'],))
+    refreshed=client.get(f"/api/v1/runs/{result['run_id']}/details").json()
+    assert next(item for item in refreshed['test_items'] if item['id']=='agent-reconciliation')['status']=='not_tested'

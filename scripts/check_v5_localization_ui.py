@@ -69,6 +69,7 @@ def run():
                                 untranslated.append([view, found])
             # A language switch must not reset an in-progress draft or send writes.
             page.evaluate("document.querySelector('[data-view=campaign]').click();document.querySelector('#newResearch').click()")
+            page.locator('#researchAdvanced summary').click()
             page.locator('#researchName').fill('我的项目 <原文>')
             page.locator('#researchTarget').fill('https://authorized.example/path')
             page.evaluate("document.querySelector('#languageToggle').click()")

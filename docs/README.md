@@ -30,3 +30,5 @@
 - [原始规格包](../FINAL/)：保留内部清单与校验结构。
 
 文档路径随当前分支解析；最新功能实现位于 `codex/v6-final-control-plane`。历史资料中的版本和安装状态仅对应记录时点。
+
+- [Web3 合约自动导入与本地编译](guides/web3-auto-import.md)

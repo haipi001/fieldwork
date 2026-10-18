@@ -48,7 +48,9 @@
     else { input.type = "checkbox"; label.className = "check-line"; }
     label.append(input); fields.append(label);
   }
-  let current = null, busy = false, healthy = false;
+  let current = null, busy = false, healthy = false, policyRequired = false;
+  const next=document.createElement("button");next.id="monitorNextStep";next.type="button";next.hidden=true;analysis.after(next);
+  function nextStep(){next.hidden=!healthy||!current;next.disabled=busy;text(next,()=>policyRequired?t("配置监控策略","Configure monitoring policy"):t("查看当前监控记录","View current monitor records"));next.onclick=()=>{if(policyRequired){editor.open=true;if(policyAuditId!==current?.id)readPolicy()}else window.FieldworkOpenMonitorRecords?.(current.id)}}
   async function request(path, method = "GET", body) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20000);
@@ -66,6 +68,7 @@
     refresh.disabled = busy;
     policyRead.disabled = busy || !healthy || !current;
     policyForm.querySelector('[type="submit"]').disabled = busy || !healthy || !current || current.id !== policyAuditId;
+    nextStep();
   }
   async function read() {
     const audits = await request("audits");
@@ -74,7 +77,8 @@
     if (live.length > 1) throw window.FieldworkLocale.error("发现多个活动监控，请检查后台状态","Multiple live monitors found; check backend state");
     current = live.length ? await request(`audits/${encodeURIComponent(live[0].id)}`) : null;
     if (current && (!current.monitor || !["active", "paused"].includes(current.monitor.status))) throw window.FieldworkLocale.error("监控状态已变化，请刷新","Monitor state changed; refresh to continue");
-    healthy = true;
+    if(current?.id!==policyAuditId){policyForm.hidden=true;policyAuditId=policyVersion=null;editor.querySelector("#monitorPolicyConfirm").checked=false}
+    healthy = true;policyRequired=false;
     const monitor = current?.monitor;
     text(status, () => {
       const names = {current: t("采集运行中", "Collecting"), delayed: t("采集延迟", "Collection delayed"), degraded: t("采集覆盖降级", "Collection coverage degraded"), paused: t("已暂停", "Paused"), active: t("采集已启用", "Collection enabled")};
@@ -84,7 +88,7 @@
     if (current) {
       try {
         const data = await request(`monitor/${encodeURIComponent(current.id)}/windows`);
-        const latest = data.windows[0];
+        const latest = data.windows[0];policyRequired=latest?.status==="policy_required"&&!policyVersion;
         text(analysis, () => data.recovery ? t(`增量分析重试中：${data.recovery.last_error}；待分析 ${data.pending_events} 个事件。采集状态单独显示。`, `Incremental analysis retrying: ${data.recovery.last_error}; ${data.pending_events} pending events. Collection status is shown separately.`) : latest ? t(`最近窗口：${latest.event_count} 个事件 · ${latest.status === "policy_required" ? "缺少策略，无法判定违规" : `${latest.signals.length} 条策略线索`} · 待分析 ${data.pending_events} 个事件。尚未独立复验，不是已确认漏洞。`, `Latest window: ${latest.event_count} events · ${latest.status === "policy_required" ? "Policy missing; violations cannot be determined" : `${latest.signals.length} policy signals`} · ${data.pending_events} pending events. Not independently verified; not confirmed vulnerabilities.`) : t(`等待增量分析 · 待分析 ${data.pending_events} 个事件。`, `Awaiting incremental analysis · ${data.pending_events} pending events.`));
       } catch { text(analysis, () => t("增量分析状态不可用；不能据此判断没有异常。", "Analysis status unavailable; this does not establish that activity is safe.")); }
     }
@@ -114,12 +118,12 @@
   toggle.onclick = () => act(current?.monitor.status === "active" ? "pause" : current?.monitor.status === "paused" ? "resume" : "start");
   scan.onclick = () => act("scan");
   refresh.onclick = load;
-  policyRead.onclick = async () => {
+  async function readPolicy() {
     if (busy || !healthy || !current) return;
     busy = true; controls(); policyForm.hidden = true; text(policyMessage, () => t("正在读取…", "Reading…"));
     try {
       const data = await request(`monitor/${encodeURIComponent(current.id)}/policy`);
-      policyAuditId = current.id; policyVersion = data.id;
+      policyAuditId = current.id; policyVersion = data.id;if(data.id)policyRequired=false;
       for (const name of Object.keys(lists)) policyForm.elements[name].value = (data.policy?.[name] || []).join("\n");
       for (const name of Object.keys(flags)) policyForm.elements[name].checked = !!data.policy?.[name];
       policyForm.elements.max_privilege.value = data.policy?.max_privilege || "user";
@@ -127,7 +131,9 @@
       policyForm.hidden = false; text(policyMessage, () => data.id ? t(`当前版本：${data.id}`, `Current version: ${data.id}`) : t("尚未配置；请检查全部规则后保存。", "Not configured; review every rule before saving."));
     } catch (error) { text(policyMessage, () => t(`策略读取失败：${error.message}`, `Policy read failed: ${error.message}`)); }
     finally { busy = false; controls(); }
-  };
+  }
+  policyRead.onclick=readPolicy;
+  editor.addEventListener("toggle",()=>{if(editor.open&&!busy&&healthy&&current&&policyAuditId!==current.id)readPolicy()});
   policyForm.onsubmit = async event => {
     event.preventDefault();
     if (busy || !healthy || !current || current.id !== policyAuditId || !editor.querySelector('#monitorPolicyConfirm').checked) return;
@@ -138,7 +144,7 @@
     busy = true; controls();
     try {
       const data = await request(`monitor/${encodeURIComponent(policyAuditId)}/policy`, "POST", {policy, expected_id: policyVersion, confirmed: true});
-      policyVersion = data.id;
+      policyVersion = data.id;policyRequired=false;
       text(policyMessage, () => t("策略已保存，仅对后续新入库事件生效；未启动主动扫描。", "Policy saved for newly ingested events only; no active scan was started."));
     } catch (error) {
       policyAuditId = null;

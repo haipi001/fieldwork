@@ -56,6 +56,7 @@ class StartInput(BaseModel):
     after_candidate_id: str | None = Field(default=None,max_length=100)
     continue_from: str | None = Field(default=None,max_length=100)
     auto_continue: bool = False
+    automation_parent: str | None = Field(default=None,max_length=100)
     automation_round: int = Field(default=1, ge=1, le=MAX_AUTOMATION_ROUNDS)
 
 
@@ -594,7 +595,7 @@ def next_automation_input(job_id, data, result):
     current_round = int(data.get('automation_round', 1))
     if current_round >= MAX_AUTOMATION_ROUNDS:
         return None
-    common = {'execute_ready': True, 'read_pages': False, 'auto_continue': True,
+    common = {'execute_ready': True, 'read_pages': False, 'auto_continue': True, 'automation_parent':job_id,
               'automation_round': current_round + 1}
     if result.get('pending_verifications'):
         return StartInput(**common, continue_from=job_id,
@@ -629,6 +630,13 @@ def create_job(run_id, body, initial_only=False, expected_fingerprint=None):
     digest = fingerprint({'continuation':body.continue_from,'run_id':run_id,'candidate_id':body.candidate_id,'after_candidate_id':body.after_candidate_id,'execute_ready':body.execute_ready,'read_pages':body.read_pages,'auto_continue':body.auto_continue,'automation_round':body.automation_round}) if body.continue_from else fingerprint(data)
     with f.connect() as db:
         db.execute('BEGIN IMMEDIATE')
+        if body.automation_parent:
+            parent=db.execute('SELECT * FROM guided_research_jobs WHERE id=?',(body.automation_parent,)).fetchone()
+            parent_result=f.load(parent['result'],{}) if parent else {}
+            if (not parent or parent['run_id']!=run_id or parent['cancel_requested'] or
+                not parent_result.get('auto_continue') or body.automation_round!=parent_result.get('automation_round',1)+1):
+                raise HTTPException(409,'连续流程已停止或接力记录不匹配')
+
         if initial_only:
             existing = db.execute('SELECT * FROM guided_research_jobs WHERE run_id=? ORDER BY created_at DESC,id DESC LIMIT 1', (run_id,)).fetchone()
             if existing:
@@ -739,3 +747,42 @@ def start_completed_followups(limit=4):
             # Capacity conflicts retain launch intent and retry on the next tick.
             continue
     return results
+
+
+@router.get('/runs/{run_id}/guided-result')
+def guided_result(run_id: str):
+    """Run-scoped result summary; neither promotes nor infers a verdict."""
+    f = core()
+    with f.connect() as db:
+        db.execute('BEGIN')
+        run = db.execute('SELECT id,engagement_id,status FROM analysis_runs WHERE id=?',(run_id,)).fetchone()
+        if not run:
+            raise HTTPException(404,'运行不存在')
+        states = {row[0]:row[1] for row in db.execute('SELECT status,COUNT(*) FROM candidate_findings WHERE run_id=? GROUP BY status',(run_id,))}
+        verified = db.execute('''SELECT COUNT(*) FROM canonical_findings f JOIN candidate_findings c ON c.id=f.candidate_id
+            WHERE c.run_id=? AND f.status='verified' AND f.engagement_id=?''',(run_id,run['engagement_id'])).fetchone()[0]
+        artifacts = db.execute('SELECT COUNT(*) FROM artifacts WHERE run_id=?',(run_id,)).fetchone()[0]
+        jobs = {row[0]:row[1] for row in db.execute('SELECT status,COUNT(*) FROM guided_research_jobs WHERE run_id=? GROUP BY status',(run_id,))}
+        pending = sum(n for status,n in states.items() if status not in ('verified','rejected','archived'))
+    lines = ['# 研究结果 / Research results',f'Run: {run_id}',f'Project: {run["engagement_id"]}',
+             f'确认发现 / Verified findings: {verified}',f'待确认候选 / Pending candidates: {pending}',
+             f'证据产物 / Evidence artifacts: {artifacts}',
+             '候选状态 / Candidate states: '+json.dumps(states,ensure_ascii=False),
+             '自动处理记录 / Automation history: '+json.dumps(jobs,ensure_ascii=False),
+             '以上仅统计本次运行；待确认候选需要按证据、业务规则、身份或验证能力继续处理。',
+             'Counts apply only to this run. Pending candidates require evidence, business rules, identities or verification capability.',
+             '没有确认发现不能推断目标安全；历史机器回执仍需当前输入与授权校验。',
+             'No confirmed findings do not establish that the target is safe. Historical receipts require current input and scope validation.']
+    return {'run_id':run_id,'engagement_id':run['engagement_id'],'verified':verified,'pending':pending,
+            'artifacts':artifacts,'candidate_states':states,'job_states':jobs,'content':'\n\n'.join(lines)}
+
+
+@router.post('/runs/{run_id}/guided-research/cancel')
+def cancel_run_automation(run_id: str):
+    with core().connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if not db.execute('SELECT 1 FROM analysis_runs WHERE id=?',(run_id,)).fetchone():
+            raise HTTPException(404,'运行不存在')
+        db.execute('UPDATE guided_research_jobs SET cancel_requested=1,updated_at=? WHERE run_id=?',
+                   (core().utcnow(),run_id))
+    return latest_job(run_id,batch_only=True)

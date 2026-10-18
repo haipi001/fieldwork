@@ -1,5 +1,6 @@
 """Exercise real V5 UI with isolated monitor fixtures; no local telemetry writes."""
 from pathlib import Path
+import re
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
@@ -34,7 +35,7 @@ def run():
                 state["status"] = "paused" if action == "pause" else "active"
             route.fulfill(json=detail("live"))
         elif path == "/v5":
-            route.fulfill(path=str(ROOT / "templates/v5.html"), content_type="text/html")
+            route.fulfill(body=re.sub(r"\{\{ asset_url\('([^']+)'\) \}\}", r"/static/\1", (ROOT / "templates/v5.html").read_text()), content_type="text/html")
         elif path.startswith("/static/"):
             route.fulfill(path=str(ROOT / path.lstrip("/")))
         elif path == "/api/v1/agent-audit/audits":
@@ -81,8 +82,10 @@ def run():
         page.locator("#monitorScan").click()
         page.wait_for_function("document.querySelector('#monitorMessage').textContent.includes('这不是漏洞确认结果')")
         assert writes == ["/api/v1/agent-audit/monitor/start", *[f"/api/v1/agent-audit/monitor/live/{a}" for a in ("pause", "resume", "scan")]]
-        page.locator('#monitorControl summary').click()
-        page.locator('#monitorPolicyRead').click()
+        before_policy_read=list(writes)
+        page.locator("#monitorNextStep").click()
+        page.locator("#monitorPolicyForm").wait_for(state="visible")
+        assert writes == before_policy_read
         page.locator('#monitorPolicyForm').wait_for(state='visible')
         page.locator('#monitorPolicyForm [name="allowed_network_hosts"]').fill('example.test')
         page.locator('#monitorPolicyForm [name="internet_access"]').check()

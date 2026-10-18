@@ -101,6 +101,11 @@ def _evm_address(value: str) -> str:
 
 
 def _rpc_endpoint(value: str) -> str:
+    from web3_contract_import import validate_rpc, ImportFailure
+    try:
+        validate_rpc(value.strip())
+    except ImportFailure as error:
+        raise HTTPException(422, error.message)
     parsed = urlparse(value.strip())
     if parsed.username or parsed.password:
         raise HTTPException(422, "RPC URL 不能包含内嵌凭据")
@@ -124,8 +129,7 @@ def _rpc_call(endpoint: str, method: str, params: list[Any]) -> Any:
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
         raise HTTPException(409, f"RPC 只读检查失败：{type(error).__name__}") from error
     if payload.get("error"):
-        message = str(payload["error"].get("message", "RPC error"))[:300]
-        raise HTTPException(409, f"RPC 只读检查失败：{message}")
+        raise HTTPException(409, "RPC 只读检查返回错误，请检查节点配置")
     return payload.get("result")
 
 
@@ -159,6 +163,9 @@ def deployment_artifacts(root: Path) -> list[dict[str, Any]]:
             "artifact": str(path.relative_to(root)),
             "runtime_bytecode_sha256": hashlib.sha256(code).hexdigest(),
             "runtime_bytecode_bytes": len(code),
+            "runtime_bytecode": "0x" + code.hex(),
+            "immutable_references": data.get("deployedBytecode", {}).get("immutableReferences", {}),
+            "link_references": data.get("deployedBytecode", {}).get("linkReferences", {}),
             "compiler_version": compiler.get("version"),
             "optimizer_enabled": optimizer.get("enabled"),
             "optimizer_runs": optimizer.get("runs"),
@@ -554,7 +561,11 @@ def align_deployment(body: DeploymentAlignmentInput):
     comparison_address = implementation or address
     chain_code = _hex_bytes(_rpc_call(endpoint, "eth_getCode", [comparison_address, block_tag])) if implementation else target_code
     chain_hash = hashlib.sha256(chain_code).hexdigest()
-    matches = [item for item in artifacts if item["runtime_bytecode_sha256"] == chain_hash]
+    from web3_contract_import import match_runtime
+    comparisons = [{"contract": item["contract"], **match_runtime(
+        item["runtime_bytecode"], "0x" + chain_code.hex(), item["immutable_references"], item["link_references"]
+    )} for item in artifacts]
+    matches = [item for item, comparison in zip(artifacts, comparisons) if comparison["status"] == "exact_match"]
     selected = matches[0] if matches else (artifacts[0] if len(artifacts) == 1 else None)
     chain_ok = body.expected_chain_id is None or body.expected_chain_id == chain_id
     bytecode_ok = bool(matches)
@@ -589,6 +600,7 @@ def align_deployment(body: DeploymentAlignmentInput):
         "local_runtime_sha256": selected["runtime_bytecode_sha256"] if selected else None,
         "chain_runtime_sha256": chain_hash,
         "runtime_bytecode_match": bytecode_ok,
+        "bytecode_comparisons": comparisons,
         "blockers": blockers,
     }
     snapshot = final_core.create_program_snapshot(final_core.ProgramSnapshotInput(

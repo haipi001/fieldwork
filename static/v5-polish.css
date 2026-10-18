@@ -1,6 +1,6 @@
 /* Shared native-app finish: quieter surfaces, clearer actions and readable density. */
 .team-toolbar,.team-role-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end}
-.team-toolbar{grid-template-columns:minmax(150px,1.4fr) minmax(150px,1.4fr) minmax(150px,1.4fr) auto auto;margin:12px 0}
+.team-toolbar{grid-template-columns:minmax(150px,1.4fr) minmax(150px,1.4fr) minmax(150px,1.4fr) auto auto auto;margin:12px 0}
 .team-toolbar label,.team-role-grid label{display:grid;gap:6px;color:var(--muted);font-size:12px}
 .team-toolbar select,.team-role-grid select,.team-role-grid input{width:100%;min-width:0}
 .team-summary{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}

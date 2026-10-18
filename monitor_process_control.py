@@ -60,6 +60,8 @@ def status():
 
 
 def start():
+    import monitor_startup
+    if monitor_startup.configured():return monitor_startup.start_registered()
     with service.process_lock('management.lock',blocking=False):
         current=status()
         if current.get('launch_failed'):

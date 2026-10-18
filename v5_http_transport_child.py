@@ -40,8 +40,14 @@ def main():
         for k, v in headers.items()
     ):
         raise ValueError('unsupported headers')
+    tls_context = ssl.create_default_context()
+    if payload.get('trusted_ca_pem') is not None:
+        issuer = payload['trusted_ca_pem']
+        if parsed.scheme != 'https' or not isinstance(issuer, str) or len(issuer.encode()) > 16384:
+            raise ValueError('invalid scoped TLS issuer')
+        tls_context.load_verify_locations(cadata=issuer)
     if parsed.scheme == 'https':
-        connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=8, context=ssl.create_default_context())
+        connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=8, context=tls_context)
     else:
         connection = http.client.HTTPConnection(parsed.hostname, port, timeout=8)
     inherited = socket.socket(fileno=payload['socket_fd'])
@@ -58,13 +64,17 @@ def main():
         raise ValueError('worker can create unauthorized network connections')
     # No reconnect or DNS resolution is available in this worker. TLS still verifies
     # the original hostname and uses it for SNI over the one inherited connection.
-    connection.sock = ssl.create_default_context().wrap_socket(inherited, server_hostname=parsed.hostname) if parsed.scheme == 'https' else inherited
+    connection.sock = tls_context.wrap_socket(inherited, server_hostname=parsed.hostname) if parsed.scheme == 'https' else inherited
     try:
         path = parsed.path or '/'
         if parsed.query:
             path += '?' + parsed.query
         connection.request('GET', path, headers=headers)
         response = connection.getresponse()
+        response_headers = response.getheaders()
+        if payload.get('raw_headers'):
+            if len(response_headers) > 64 or sum(len(k) + len(v) for k, v in response_headers) > 8192:
+                raise ValueError('response headers exceed limit')
         body = response.read(65537)
         if len(body) > 65536:
             raise ValueError('response exceeds limit')
@@ -84,6 +94,8 @@ def main():
                   'status': response.status, 'body': base64.b64encode(body).decode('ascii'),
                   'scalar_sha256': scalars,
                   'headers': {k: v for k, v in response.getheaders() if k.lower() in {'content-type', 'location', 'etag'}}}
+        if payload.get('raw_headers'):
+            result['raw_headers'] = response_headers
         print(json.dumps(result), flush=True)
     finally:
         connection.close()

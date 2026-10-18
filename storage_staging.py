@@ -3,12 +3,14 @@
 Cooperative locks and repeated reads detect changes, not arbitrary external
 writers. A staged copy is not approved for activation until offline acceptance.
 """
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
 import stat
+import sqlite3
 
 from storage_access import storage_access
 from storage_migration import _open_directory, _plain_directory
@@ -119,12 +121,47 @@ def _write_json(directory, name, value):
     os.fsync(directory)
 
 
+@contextmanager
+def _database_gate(source):
+    database = source / 'src_control.db'
+    if not database.exists():
+        if database.is_symlink():
+            raise ValueError('invalid_source_database')
+        yield
+        return
+    before = database.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError('invalid_source_database')
+    # Refuse recovery files before SQLite can perform automatic recovery.
+    for suffix in ('-wal', '-journal', '-shm'):
+        sidecar = source / ('src_control.db' + suffix)
+        if sidecar.is_symlink() or (sidecar.exists() and sidecar.stat().st_size):
+            raise ValueError('source_database_recovery_files_present')
+    connection = sqlite3.connect(database.as_uri() + '?mode=rw', uri=True, timeout=0)
+    try:
+        connection.execute('BEGIN EXCLUSIVE')
+        connection.execute('PRAGMA query_only=ON')
+        if (database.stat().st_dev, database.stat().st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError('source_database_changed')
+        # Do not checkpoint or discard recovery state as part of copying.
+        for suffix in ('-wal', '-journal', '-shm'):
+            sidecar = source / ('src_control.db' + suffix)
+            if sidecar.is_symlink() or (sidecar.exists() and sidecar.stat().st_size):
+                raise ValueError('source_database_recovery_files_present')
+        if connection.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            raise ValueError('source_database_integrity_failed')
+        yield
+    finally:
+        connection.rollback()
+        connection.close()
+
+
 def stage(source, destination):
     source = _plain_directory(source)
     destination = validate_directory(str(destination))
     if source == destination or source.is_relative_to(destination) or destination.is_relative_to(source):
         raise ValueError('overlapping_data_directories')
-    with storage_access(source, maintenance=True), storage_access(destination, maintenance=True):
+    with storage_access(source, maintenance=True), storage_access(destination, maintenance=True), _database_gate(source):
         source_fd, target_fd = _open_directory(source), None
         try:
             target_fd = _open_directory(destination)
@@ -159,9 +196,14 @@ def stage(source, destination):
                     os.close(data_fd)
                 if baseline != _walk(source_fd):
                     raise ValueError('source_changed')
+                from storage_reference_audit import audit_database, audit_json_files
+                staged_database = destination / name / 'data' / 'src_control.db'
+                reference_audit = audit_database(staged_database, source) if staged_database.is_file() else None
+                file_reference_audit = audit_json_files(destination / name / 'data', final_files, source)
                 result = {'format': 'fieldwork-migration-stage-v1', 'state': 'files_verified_not_activated',
                           'files': _content(final_files), 'logical_bytes': sum(item.get('size', 0) for item in final_files),
-                          'reference_relocation': relocation,
+                          'reference_relocation': relocation, 'remaining_database_references': reference_audit,
+                          'remaining_json_file_references': file_reference_audit,
                           'configuration_changed': False, 'activation_allowed': False,
                           'all_writers_stopped_verified': False,
                           'excluded': [LOCK], 'metadata_scope': 'file_bytes_and_owner_execute_bit'}

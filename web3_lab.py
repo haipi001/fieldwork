@@ -31,13 +31,15 @@ def start_rpc_fork(engagement_id: str, rpc_url: str, block_number: int | None = 
     args = [anvil, "--host", "127.0.0.1", "--port", str(port), "--fork-url", rpc_url, "--silent"]
     if block_number is not None:
         args.extend(["--fork-block-number", str(block_number)])
-    if chain_id is not None:
-        args.extend(["--chain-id", str(chain_id)])
     fork = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
         wait_ready(port, fork)
         resolved_chain = int(rpc(port, "eth_chainId"), 16)
         block = int(rpc(port, "eth_blockNumber"), 16)
+        if chain_id is not None and resolved_chain != chain_id:
+            raise RuntimeError('Fork Chain ID 与已确认部署对齐不一致')
+        if block_number is not None and block != block_number:
+            raise RuntimeError('Fork 区块与已确认部署对齐不一致')
     except Exception as error:
         stop_process(fork)
         raise HTTPException(409, f"RPC Fork 启动失败：{error}") from error

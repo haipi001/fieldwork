@@ -141,7 +141,7 @@ def inventory(refresh: bool = False) -> list[dict]:
         return [dict(item) for item in values]
 
 
-def execute(capability_id: str, args: list[str], cwd: Path, timeout: int = 120) -> ToolResultEnvelope:
+def execute(capability_id: str, args: list[str], cwd: Path, timeout: int = 120, *, broker_port: int | None = None, broker_ca_pem: bytes | None = None) -> ToolResultEnvelope:
     if capability_id not in SPECS:
         raise ValueError("unknown capability")
     capability = detect(capability_id)
@@ -151,7 +151,10 @@ def execute(capability_id: str, args: list[str], cwd: Path, timeout: int = 120) 
         raise ValueError("cwd must be an existing directory")
     try:
         output_limit = 1_000_000 if capability_id in {"slither", "echidna", "medusa"} else 12000
-        result = run_isolated([capability.executable, *args], cwd, timeout=timeout, output_limit=output_limit)
+        options = {'broker_port': broker_port} if broker_port is not None else {}
+        if broker_ca_pem is not None:
+            options['broker_ca_pem'] = broker_ca_pem
+        result = run_isolated([capability.executable, *args], cwd, timeout=timeout, output_limit=output_limit, **options)
         if result.status == "timeout":
             return ToolResultEnvelope(capability_id, "timeout", None, result.stdout, result.stderr or "execution timed out")
         # Slither returns 255 when detectors report findings; that is a

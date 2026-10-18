@@ -1,5 +1,6 @@
 """Isolated V5 rule review and opt-in replay UI; no live service or scans."""
 from pathlib import Path
+import re
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
@@ -28,6 +29,9 @@ def run():
 
     def serve(route):
         request, path = route.request, urlparse(route.request.url).path
+        # Scope confirmation now performs a read-only preflight POST.
+        if request.method=='POST' and path=='/api/v1/engagements/project-fixture/execution-plan':
+            route.fulfill(json={'ready':False,'blockers':[{'message':'Isolated preflight only'}]});return
         if request.method != 'GET':
             payload = request.post_data_json or {}
             writes.append((request.method, path, payload))
@@ -61,7 +65,7 @@ def run():
                 route.fulfill(json={'id':'finding-fixture','status':'verified_fixed'})
             else:
                 raise AssertionError(f'Unexpected write: {path}')
-        elif path == '/v5': route.fulfill(path=str(ROOT / 'templates/v5.html'), content_type='text/html')
+        elif path == '/v5': route.fulfill(body=re.sub(r"\{\{ asset_url\('([^']+)'\) \}\}",r'/static/\1',(ROOT/'templates/v5.html').read_text()), content_type='text/html')
         elif path.startswith('/static/'): route.fulfill(path=str(ROOT / path.lstrip('/')))
         elif path == '/api/v1/engagements': route.fulfill(json=[project])
         elif path == '/api/v1/engagements/project-fixture': route.fulfill(json=project)
@@ -111,6 +115,9 @@ def run():
         page.locator('#scopeForm [type=submit]').click()
         page.wait_for_function("!document.querySelector('#scopeDialog').open")
         assert len(writes) == 2
+        page.locator('#executionDialog [data-close-dialog]').first.wait_for()
+        assert page.locator('#executionCommit').is_disabled()
+        page.locator('#executionDialog [data-close-dialog]').first.click()
         page.locator('#workflowRun').select_option('run-fixture')
         page.locator('#workflowRead').click()
         page.locator('[data-workflow-plan]').click()
@@ -179,6 +186,21 @@ def run():
         page.locator('dialog').filter(has=page.get_by_text('Targeted fix confirmed',exact=True)).get_by_role('button',name='Close',exact=True).click()
         page.get_by_text('Targeted fix confirmed: finding-fixture',exact=True).wait_for()
         assert len(writes)==7
+        for boundary,label in [('permitted','Frozen business rules permit sharing; this batch did not establish unauthorized access'),
+                               ('unknown','Read behavior reproduced; the business authorization boundary is not established'),
+                               ('denied','Read behavior reproduced and denied by frozen rules; independent confirmation and impact evidence are still required')]:
+            job['result']['items'][0]['auto_verification']={'status':'reproduced','business_boundary':{'status':boundary}}
+            page.locator('#workflowRead').click()
+            page.get_by_text(label,exact=False).wait_for()
+            assert page.locator('[data-workflow-promote]').count()==0
+            assert len(writes)==7
+        job['result']['items'][0]['auto_verification']['business_boundary']['status']='permitted'
+        page.locator('#workflowRead').click()
+        page.get_by_text('Frozen business rules permit sharing; this batch did not establish unauthorized access',exact=False).wait_for()
+        page.locator('#languageToggle').click()
+        page.get_by_text('冻结业务规则允许共享，本轮未建立越权证明',exact=False).wait_for()
+        assert len(writes)==7
+        page.locator('#languageToggle').click()
         page.evaluate("window.FieldworkReviewScope('project-fixture')")
         page.get_by_text('This scope is frozen.',exact=False).wait_for()
         assert page.locator('[data-field="target"]').is_disabled()

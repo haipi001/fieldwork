@@ -1,13 +1,19 @@
 """Decode untrusted model output without losing valid reported consumption."""
 import json
 
+REJECTION_REASONS = frozenset({"invalid_json", "output_truncated", "content_filtered", "non_text_content",
+    "non_object_json", "invalid_json_constant", "json_too_deep", "missing_output"})
+FINISH_REASONS = ("stop", "length", "tool_calls", "content_filter", "function_call", "load", "unload")
+
 
 class ModelOutputRejected(ValueError):
-    def __init__(self, input_tokens, output_tokens, runtime_ms):
+    def __init__(self, input_tokens, output_tokens, runtime_ms, reason_code="invalid_json", finish_reason=None):
         super().__init__('model output invalid; valid usage is available')
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.runtime_ms = runtime_ms
+        self.reason_code = reason_code if isinstance(reason_code, str) and reason_code in REJECTION_REASONS else "invalid_json"
+        self.finish_reason = finish_reason if isinstance(finish_reason, str) and finish_reason in FINISH_REASONS else None
 
 
 def decode_response(raw, kind, runtime_ms):
@@ -21,22 +27,35 @@ def decode_response(raw, kind, runtime_ms):
         incoming, outgoing = (usage.get('prompt_tokens'), usage.get('completion_tokens')) if isinstance(usage, dict) else (None, None)
     if any(type(value) is not int or value < 0 or value > 2**63-1 for value in (incoming, outgoing)):
         raise ValueError('model usage invalid or unavailable')
-    invalid, output = False, None
+    reason, output, finish = None, None, None
     try:
-        content = (envelope['message']['content'] if kind == 'ollama'
-                   else envelope['choices'][0]['message']['content'])
-        if not isinstance(content, str):
-            invalid = True
+        choice = envelope['message'] if kind == 'ollama' else envelope['choices'][0]
+        reported_finish = envelope.get('done_reason') if kind == 'ollama' else choice.get('finish_reason')
+        finish = reported_finish if reported_finish in FINISH_REASONS else None
+        content = choice['content'] if kind == 'ollama' else choice['message']['content']
+        if finish == 'length':
+            reason = 'output_truncated'
+        elif finish == 'content_filter':
+            reason = 'content_filtered'
+        elif not isinstance(content, str):
+            reason = 'non_text_content'
         else:
             def invalid_constant(_):
                 raise ValueError('nonfinite model output')
             output = json.loads(content, parse_constant=invalid_constant)
-            invalid = not isinstance(output, dict)
-    except (ValueError, TypeError, KeyError, IndexError, RecursionError):
-        invalid = True
-    # Raise outside the parser's except block: no raw response in exception context.
-    if invalid:
-        raise ModelOutputRejected(incoming, outgoing, runtime_ms)
+            if not isinstance(output, dict):
+                reason = 'non_object_json'
+    except json.JSONDecodeError:
+        reason = 'invalid_json'
+    except RecursionError:
+        reason = 'json_too_deep'
+    except ValueError:
+        reason = 'invalid_json_constant'
+    except (TypeError, KeyError, IndexError, AttributeError):
+        reason = 'missing_output'
+    # Raise outside the parser's except block: never retain content or parser context.
+    if reason:
+        raise ModelOutputRejected(incoming, outgoing, runtime_ms, reason, finish)
     return output, incoming, outgoing
 
 

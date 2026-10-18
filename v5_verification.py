@@ -6,7 +6,6 @@ import ipaddress
 import json
 import os
 import sqlite3
-import stat
 import subprocess
 import sys
 import tempfile
@@ -317,6 +316,44 @@ def _create_request_transaction(db: sqlite3.Connection, claim: sqlite3.Row, body
     attributes = _load(claim["attributes_json"], {})
     producer_task_id = attributes.get("producer_task_id") if isinstance(attributes.get("producer_task_id"), str) else None
     producer_runner = attributes.get("producer_runner_ref") if isinstance(attributes.get("producer_runner_ref"), str) else None
+    if claim["source_type"] == "team_research":
+        # Historical team claims used task_id before producer_* was recorded.
+        source_task_id = attributes.get("task_id")
+        producer = db.execute("SELECT * FROM agent_tasks WHERE id=?", (source_task_id,)).fetchone() if isinstance(source_task_id,str) else None
+        result = _load(producer["result_json"], {}) if producer else {}
+        ids = result.get("claim_ids", []) if isinstance(result,dict) else []
+        if (not producer or producer["campaign_id"] != claim["campaign_id"] or producer["run_id"] != claim["run_id"]
+                or not isinstance(ids,list) or claim["id"] not in ids
+                or claim["source_ref"] != f"{source_task_id}:claim:{ids.index(claim['id'])}"
+                or (producer_task_id and producer_task_id != source_task_id)):
+            raise HTTPException(409, "team claim producer provenance is missing or changed")
+        producer_task_id = source_task_id
+        call_id = result.get("call_id")
+        call = db.execute("SELECT runner_id FROM runtime_calls WHERE id=? AND task_id=?", (call_id,source_task_id)).fetchone() if isinstance(call_id,str) else None
+        if not call or (producer_runner and producer_runner != call["runner_id"]):
+            raise HTTPException(409, "team claim producer call provenance is missing or changed")
+        producer_runner = call["runner_id"]
+        capsule = _load(producer["context_capsule_json"], {})
+        frozen = capsule.get("research_input_hashes") if isinstance(capsule,dict) else None
+        if not isinstance(frozen,dict) or len(frozen)>20:
+            raise HTTPException(409, "team claim frozen inputs are unavailable")
+        from v5_workers import _node_digest as research_input_digest
+        frozen_counters = set()
+        for node_id, digest in frozen.items():
+            node = db.execute("SELECT * FROM research_nodes WHERE id=?", (node_id,)).fetchone()
+            if (not node or node["campaign_id"] != claim["campaign_id"] or research_input_digest(node) != digest
+                    or node["status"] in {"archived","retired","invalidated"}):
+                raise HTTPException(409, "team claim inputs changed; research again before verification")
+            if node["node_type"] == "counterevidence":
+                frozen_counters.add(node_id)
+        required = set(frozen_counters)
+        for field in ("evidence_ids", "counterevidence_ids"):
+            values = attributes.get(field, [])
+            if not isinstance(values,list) or any(not isinstance(value,str) for value in values):
+                raise HTTPException(409, "team claim evidence references are invalid")
+            required.update(values)
+        if not required or not required.issubset(frozen) or not required.issubset(body.evidence_ids):
+            raise HTTPException(409, "team verification must include the claim evidence and counterevidence")
     if producer_task_id and body.verifier_group_id:
         producer = db.execute("SELECT group_id FROM agent_tasks WHERE id=?", (producer_task_id,)).fetchone()
         if producer and producer["group_id"] and producer["group_id"] == body.verifier_group_id:
@@ -366,9 +403,12 @@ def get_request(request_id: str):
     with f.connect() as db:
         row = db.execute("SELECT * FROM verification_requests_v5 WHERE id=?", (request_id,)).fetchone()
         task = db.execute("SELECT * FROM agent_tasks WHERE id=?", (row["verifier_task_id"],)).fetchone() if row else None
+        receipt = db.execute("SELECT r.id FROM verification_receipts_v5 r JOIN verification_receipt_bindings_v5 b "
+                             "ON b.receipt_id=r.id WHERE b.request_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT 1",
+                             (request_id,)).fetchone() if row else None
     if not row:
         raise HTTPException(404, "verification request not found")
-    return _request_value(row, task)
+    return {**_request_value(row, task), "latest_receipt_id": receipt["id"] if receipt else None}
 
 
 def _validate_result(result: VerificationResult) -> None:
@@ -549,26 +589,19 @@ def _loopback_contract_allowed(db: sqlite3.Connection, request: sqlite3.Row) -> 
 
 def _read_trivy_artifact(path_text: str, expected_sha256: str) -> dict[str, Any] | None:
     import traditional_tools
+    from proof_materials import read_proof_file
 
-    path = Path(path_text)
-    root = traditional_tools.ARTIFACT_ROOT.resolve()
-    if (not path.is_absolute() or path.is_symlink() or not path.resolve().is_relative_to(root)
-            or not isinstance(expected_sha256, str) or len(expected_sha256) != 64):
-        return None
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(descriptor, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 256_000:
-                return None
-            raw = stream.read(256_001)
-    except (OSError, ValueError):
-        return None
-    if len(raw) > 256_000 or hashlib.sha256(raw).hexdigest() != expected_sha256:
-        return None
-    try:
+        path = Path(path_text)
+        root = Path(traditional_tools.ARTIFACT_ROOT)
+        if (not root.is_absolute() or not path.is_absolute() or not path.is_relative_to(root)
+                or not isinstance(expected_sha256, str) or len(expected_sha256) != 64):
+            return None
+        raw = read_proof_file(path, 256_000)
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            return None
         value = json.loads(raw)
-    except (TypeError, ValueError):
+    except (OSError, TypeError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -633,7 +666,11 @@ def _package_replay_input(db: sqlite3.Connection, request: sqlite3.Row) -> dict[
     if not isinstance(items, list) or len(items) > 200:
         return None
     for item in items:
-        if not isinstance(item, dict) or item.get("observation_type") != "code.dependency_vulnerability":
+        if not isinstance(item, dict) or not isinstance(item.get('observation_type'), str):
+            return None
+        if item.get("observation_type") == "code.dependency_inventory_incomplete":
+            return None
+        if not isinstance(item, dict) or item.get("observation_type") not in {"code.dependency_vulnerability", "code.dependency_inventory"}:
             continue
         data = item.get("structured", {})
         identifier = data.get("PkgIdentifier", {}) if isinstance(data, dict) else {}

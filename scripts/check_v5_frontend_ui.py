@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -40,7 +41,7 @@ def isolated_page(browser, **kwargs):
         path = urlparse(route.request.url).path
         assert route.request.method == "GET", f"Unexpected write: {path}"
         if path == "/v5":
-            route.fulfill(path=str(root / "templates/v5.html"), content_type="text/html")
+            route.fulfill(body=re.sub(r"\{\{ asset_url\('([^']+)'\) \}\}", r"/static/\1", (root / "templates/v5.html").read_text()), content_type="text/html")
         elif path.startswith("/static/"):
             route.fulfill(path=str(root / path.lstrip("/")))
         elif path in ("/api/v1/engagements", "/api/v1/task-center", "/api/v1/capabilities", "/api/v1/agent-audit/audits"):
@@ -123,6 +124,7 @@ def assert_inspector_modal_with_isolated_api(browser) -> None:
         "normalized_target": "https://authorized.example",
     }]))
     page.goto(f"{BASE}/v5#campaign", wait_until="domcontentloaded")
+    page.locator("#homeHistory").click()
     page.locator(".home-archive summary").click()
     page.locator("#engagementList .data-row").first.click()
     assert page.locator("#detailInspector").get_attribute("aria-hidden") == "false"
@@ -158,6 +160,7 @@ def assert_research_creation_with_isolated_api(browser) -> None:
     confirmed: list[bool] = []
     plans: list[dict] = []
     starts: list[dict] = []
+    pending_plans = []
 
     def engagements(route) -> None:
         if route.request.method == "POST":
@@ -186,6 +189,9 @@ def assert_research_creation_with_isolated_api(browser) -> None:
 
     def execution_plan(route) -> None:
         plans.append(route.request.post_data_json)
+        if len(plans) == 3:
+            pending_plans.append(route)
+            return
         route.fulfill(json={
             "target": "https://authorized.example",
             "ready": len(plans) > 1,
@@ -219,31 +225,39 @@ def assert_research_creation_with_isolated_api(browser) -> None:
     page.goto(f"{BASE}/v5#campaign", wait_until="domcontentloaded")
     page.locator("#newResearch").click()
     assert page.locator("#researchDialog").evaluate("(el) => el.open")
+    page.locator("#researchAdvanced summary").click()
     page.locator("#researchName").fill("隔离前端验收")
     page.locator("#researchTarget").fill("https://authorized.example")
     page.locator("#researchScopeNotes").fill("仅对隔离测试目标进行授权校验")
-    page.locator("#researchAuthorized").check()
     page.locator('#researchForm [type="submit"]').click()
     page.get_by_text("研究草稿已创建，尚未授权执行").wait_for()
     assert len(submitted) == 1
     assert submitted[0]["name"] == "隔离前端验收"
     assert submitted[0]["target"] == "https://authorized.example"
     assert submitted[0]["scope"]["authorization_notes"] == "仅对隔离测试目标进行授权校验"
-    assert page.locator("#detailInspector").get_attribute("class").find("open") >= 0
-    page.locator('#detailInspector [data-campaign-action="scope"]').click()
+    assert not confirmed and not starts
     page.wait_for_function("document.querySelector('#scopeDialog').open")
     assert page.locator("#scopeSummary").get_by_text("https://authorized.example").count() >= 1
     page.locator("#scopeAccepted").check()
     page.locator('#scopeForm [type="submit"]').click()
-    page.get_by_text("ScopeSnapshot 已确认；执行前还需检查计划").wait_for()
-    assert len(confirmed) == 1
-    page.locator('#homePlan').click()
     page.wait_for_function("document.querySelector('#executionDialog').open")
+    assert len(confirmed) == 1
     page.locator("#executionPlan").get_by_text("隔离验收中禁止启动真实扫描").wait_for()
     assert len(plans) == 1
     assert plans[0]["execution_mode"] == "real"
     assert page.locator("#executionCommit").is_disabled()
     assert not starts
+    page.locator("#executionPreview").click()
+    page.wait_for_function("!document.querySelector('#executionCommit').disabled")
+    page.locator("#executionAccepted").check()
+    page.locator("#executionProfile").select_option("standard")
+    page.wait_for_timeout(100)
+    assert pending_plans
+    assert not page.locator("#executionAccepted").is_checked()
+    page.locator("#executionSource").fill("/isolated/source")
+    pending_plans[0].fulfill(json={"ready": True, "target": "https://authorized.example"})
+    page.wait_for_timeout(100)
+    assert page.locator("#executionCommit").is_disabled()
     page.locator("#executionPreview").click()
     page.wait_for_function("!document.querySelector('#executionCommit').disabled")
     page.locator("#executionAccepted").check()

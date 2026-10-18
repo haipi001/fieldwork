@@ -487,13 +487,16 @@ def scan_active_monitors():
 
 async def monitor_worker():
     from storage_access import storage_call
+    failures = 0
     while True:
         try:
             if not agent_monitor_service.status()['running']:
                 await asyncio.to_thread(storage_call, core.LOCAL_DATA_ROOT.resolve(), scan_active_monitors)
+            failures = 0
         except Exception as error:
+            failures = min(failures + 1, 1_000_000)
             logging.getLogger(__name__).error('Monitor scheduler failed: %s', type(error).__name__)
-        await asyncio.sleep(2)
+        await asyncio.sleep(agent_monitor_service.retry_delay(failures))
 
 
 @router.get('/monitor/service')

@@ -36,17 +36,21 @@ def test_bad_content_retains_only_valid_usage_without_exception_body(content):
 @pytest.mark.parametrize('worker', ['team', 'structured'])
 @pytest.mark.parametrize('kind', ['llama_cpp', 'ollama'])
 @pytest.mark.parametrize('settlement_fails', [False, True])
-def test_real_http_invalid_output_settles_known_usage_and_never_replays(client, monkeypatch, worker, kind, settlement_fails):
+@pytest.mark.parametrize('invalid_kind',['syntax','schema','truncated'])
+def test_real_http_invalid_output_settles_known_usage_and_never_replays(client, monkeypatch, worker, kind, settlement_fails,invalid_kind):
     hits = []
     marker = 'fixture-private-output-must-not-persist'
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             self.rfile.read(int(self.headers['Content-Length']))
             hits.append(self.path)
-            content = '{"summary":"' + marker
+            content = '{"summary":"' + marker if invalid_kind=='syntax' else json.dumps({'summary':17,'private_marker':marker})
             result = ({'message': {'content': content}, 'prompt_eval_count': 17, 'eval_count': 12}
                       if kind == 'ollama' else {'choices': [{'message': {'content': content}}],
                       'usage': {'prompt_tokens': 17, 'completion_tokens': 12}})
+            if invalid_kind=='truncated':
+                if kind=='ollama':result['done_reason']='length'
+                else:result['choices'][0]['finish_reason']='length'
             raw = json.dumps(result).encode()
             self.send_response(200); self.send_header('Content-Length', str(len(raw))); self.end_headers()
             self.wfile.write(raw)
@@ -85,11 +89,12 @@ def test_real_http_invalid_output_settles_known_usage_and_never_replays(client, 
             if settlement_fails:
                 assert call['state'] == 'unknown'
                 assert state['error']['code'] == 'model_usage_unknown'
-                assert state['error']['settlement_error_type'] == 'RuntimeError'
+                if invalid_kind!='schema':assert state['error']['settlement_error_type'] == 'RuntimeError'
                 assert db.execute('SELECT COUNT(*) FROM runtime_usage').fetchone()[0] == 0
             else:
                 assert call['state'] == 'settled'
                 assert state['error']['code'] == 'model_output_invalid_usage_settled'
+                assert state['error']['model_output_reason']=={'syntax':'invalid_json','schema':'schema_mismatch','truncated':'output_truncated'}[invalid_kind]
                 assert state['usage']['input_tokens'] == 17 and state['usage']['output_tokens'] == 12
                 assert db.execute('SELECT COUNT(*) FROM runtime_usage').fetchone()[0] == 1
                 assert db.execute('SELECT COUNT(*) FROM runtime_call_timings').fetchone()[0] == 1
@@ -99,3 +104,31 @@ def test_real_http_invalid_output_settles_known_usage_and_never_replays(client, 
             assert marker not in json.dumps(events) + json.dumps(state)
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('content,finish,reason',[
+    ('{}','length','output_truncated'),('{}','content_filter','content_filtered'),
+    ('[]','stop','non_object_json'),(None,'stop','non_text_content'),
+    ('{"x":NaN}','stop','invalid_json_constant'),('{','stop','invalid_json')])
+def test_safe_rejection_reason_contains_no_provider_content(content,finish,reason):
+    raw=json.dumps({'usage':{'prompt_tokens':7,'completion_tokens':3},'choices':[{'finish_reason':finish,'message':{'content':content}}]}).encode()
+    with pytest.raises(ModelOutputRejected) as failure:decode_response(raw,'llama_cpp',1)
+    error=failure.value
+    assert error.reason_code==reason and error.finish_reason==finish
+    assert error.__context__ is None
+    assert not hasattr(error,'content') and not hasattr(error,'raw')
+
+
+def test_untrusted_finish_reason_is_never_retained():
+    marker='provider-secret-marker'
+    raw=json.dumps({'usage':{'prompt_tokens':7,'completion_tokens':3},'choices':[{'finish_reason':marker,'message':{'content':'['}}]}).encode()
+    with pytest.raises(ModelOutputRejected) as failure:decode_response(raw,'llama_cpp',1)
+    assert failure.value.finish_reason is None
+    assert marker not in repr(vars(failure.value))
+
+
+@pytest.mark.parametrize('reason,finish',[('provider-private-value','provider-private-value'),(['private'],{'private':True})])
+def test_diagnostic_constructor_only_retains_fixed_codes(reason,finish):
+    error=ModelOutputRejected(2,3,4,reason,finish)
+    assert error.reason_code=='invalid_json' and error.finish_reason is None
+    assert 'private' not in repr(vars(error))

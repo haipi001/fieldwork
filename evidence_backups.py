@@ -263,6 +263,10 @@ def restore_plan(database,backup_root,backup_id):
             blockers.append('active_monitor_process')
     except (OSError,ValueError,RuntimeError):
         blockers.append('monitor_process_state_unknown')
+    import monitor_startup
+    try:
+        if monitor_startup.configured():blockers.append('monitor_login_configured')
+    except OSError:blockers.append('monitor_startup_state_unknown')
     with tempfile.TemporaryDirectory(prefix='restore-plan-') as directory:
         restored=Path(directory)/'restored.db'
         with zipfile.ZipFile(Path(backup_root)/(backup_id+'.zip')) as archive:

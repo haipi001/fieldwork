@@ -251,7 +251,7 @@ def test_cidr_import_collapses_ranges_and_authorizes_only_member_ips(client):
     outside = client.post("/api/v1/policy/check", json={
         "engagement_id": engagement["id"], "target": "https://198.51.100.42/status", "action": "read"})
     assert inside.json()["allowed"] is True
-    assert outside.json() == {"allowed": False, "reason": "out_of_scope", "target": "https://198.51.100.42"}
+    assert outside.json() == {"allowed": False, "reason": "out_of_scope", "target": "https://198.51.100.42/status"}
 
 
 def test_target_package_rejects_unknown_or_changed_root(client):
@@ -2728,7 +2728,7 @@ def test_clean_static_scans_are_normalized_as_clean_not_unparsed():
     assert gitleaks[0]["observation_type"] == "code.secret_scan_clean"
 
 
-def test_real_traditional_tool_endpoint_persists_artifact_and_observations(client, monkeypatch):
+def test_scanner_fixture_persists_observations_without_claiming_actual_transport(client, monkeypatch):
     created = client.post("/api/v1/engagements", json={
         "name": "Local adapter", "target": "http://127.0.0.1:8765", "mode": "traditional",
         "scope": {"allow_private_ips": True},
@@ -2743,7 +2743,9 @@ def test_real_traditional_tool_endpoint_persists_artifact_and_observations(clien
     result = client.post(f"/api/v1/traditional/runs/{run_id}/tools/run", json={"capability": "nuclei"})
     assert result.status_code == 200, result.text
     data = result.json()
-    assert data["tool_result"]["status"] == "completed" and data["observation_count"] == 1
+    assert data["tool_result"]["status"] == "failed" and data["observation_count"] == 1
+    assert data['tool_result']['network_transport']['responses'] == 0
+    assert 'no_observed_response' in data['tool_result']['stderr_summary']
     with sqlite3.connect(final_core.DB) as db:
         assert db.execute("SELECT source_capability FROM observations WHERE id=?", (data["observation_ids"][0],)).fetchone()[0] == "nuclei"
         assert db.execute("SELECT kind FROM artifacts WHERE id=?", (data["artifact_id"],)).fetchone()[0] == "traditional.tool.nuclei"
@@ -2981,6 +2983,15 @@ def test_real_http_replay_oracle_with_negative_control(client, changed_principal
         assert saved_report.json()['report_fields']['impact']['evidence_ids'] == [positive_id]
         finding = client.get(f'/api/v1/findings/{finding_id}').json()
         assert finding['verification']['receipt_id'] == receipt_id
+        run_report = client.get(f'/api/v1/runs/{run_id}/summary-report')
+        assert run_report.status_code == 200
+        report_value = run_report.json()
+        assert len(report_value['stages']) == 8
+        assert any(item['id'] == finding_id for item in report_value['verified_findings'])
+        assert receipt_id in report_value['content']
+        assert finding_id in report_value['content']
+        assert '## 八阶段实际状态' in report_value['content']
+        assert report_value['counts']['verified'] == 1
         preview = client.post(f'/api/v1/findings/{finding_id}/reports/hackerone/preview')
         assert preview.status_code == 200 and preview.json()['completeness']['ready']
         assert not ({'prerequisites', 'impact.affected_users', 'impact.conditions', 'impact.evidence_ids',
@@ -3594,3 +3605,112 @@ def test_web3_property_job_can_be_cancelled_between_forge_rounds(client, monkeyp
     with final_core.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM verification_attempts WHERE candidate_id=?", (candidate["id"],)).fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM artifacts WHERE run_id=? AND kind='web3.property_replay'", (run_id,)).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("coverage,expected", [
+    ([], "not_tested"),
+    ([("nuclei", "tested", "completed")], "partial"),
+    ([("nuclei", "tested", "completed"), ("native-agent", "tested", "read_only_completed")], "completed"),
+    ([("nuclei", "failed", "tool_error")], "failed"),
+])
+def test_terminal_run_stage_requires_actual_tool_coverage(client, coverage, expected):
+    engagement = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()['id']
+    client.post(f'/api/v1/runs/{run_id}/stop')
+    for capability, state, reason in coverage:
+        traditional_tools.record_coverage(run_id, f'capability:{capability}', state, reason, [])
+    with final_core.connect() as db:
+        db.execute("UPDATE analysis_runs SET status='completed',synthetic=0 WHERE id=?", (run_id,))
+    details = client.get(f'/api/v1/runs/{run_id}/details').json()
+    stages = {stage['id']: stage for stage in details['stages']}
+    assert stages['analysis']['status'] == expected
+    assert stages['surface']['status'] == 'not_tested'
+    assert stages['verification']['status'] == 'not_tested'
+
+
+def test_task_center_does_not_claim_all_stages_for_unverified_real_run(client):
+    engagement = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()['id']
+    client.post(f'/api/v1/runs/{run_id}/stop')
+    with final_core.connect() as db:
+        db.execute("UPDATE analysis_runs SET status='completed',synthetic=0 WHERE id=?", (run_id,))
+    center = client.get('/api/v1/task-center').json()
+    item = next(item for item in center['items'] if item['id'] == run_id)
+    assert 'analysis' in item['remaining_stages']
+    assert 'verification' in item['remaining_stages']
+    assert 'impact' in item['remaining_stages']
+
+
+def test_run_summary_discloses_synthetic_execution_and_all_stage_states(client):
+    engagement = create_ready(client)
+    run_id = client.post(f"/api/v1/engagements/{engagement['id']}/start").json()['id']
+    client.post(f'/api/v1/runs/{run_id}/stop')
+    result = client.get(f'/api/v1/runs/{run_id}/summary-report').json()
+    assert '安全演示（合成数据）' in result['content']
+    assert '执行模式：真实扫描' not in result['content']
+    assert len(result['stages']) == 8
+    assert result['verified_findings'] == []
+    assert '[not_tested]' in result['content']
+
+
+@pytest.mark.parametrize('record', ['none', 'artifact_only', 'observation'])
+def test_processing_stage_requires_normalized_records(client, record):
+    from tests.test_v5_team_plan import _setup
+    engagement, _, run_id = _setup(client)
+    with final_core.connect() as db:
+        db.execute("UPDATE analysis_runs SET status='failed',synthetic=0 WHERE id=?", (run_id,))
+        if record == 'artifact_only':
+            db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)',
+                       ('raw-only',run_id,'tool.stderr','/fixture/raw',None,'text/plain',1,final_core.utcnow()))
+        elif record == 'observation':
+            db.execute('INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                       ('normalized',run_id,engagement['id'],'traditional','fixture','fixture','normalized result',1.0,'fixture',None,final_core.utcnow()))
+    details=client.get(f'/api/v1/runs/{run_id}/details').json()
+    processing=next(item for item in details['stages'] if item['id']=='processing')
+    assert processing['status']==('completed' if record=='observation' else 'not_tested')
+    if record != 'observation':
+        item=next(item for item in client.get('/api/v1/task-center').json()['items'] if item['id']==run_id)
+        assert 'processing' in item['remaining_stages']
+
+
+@pytest.mark.parametrize('fork_evidence',['none','event_only','bound_record'])
+def test_contract_execution_details_use_web3_contract_and_bound_fork(client,fork_evidence):
+    engagement=create_ready(client,mode='web3',target='0x'+'12'*20)
+    run_id='contract-domain-run'
+    with final_core.connect() as db:
+        db.execute('INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   (run_id,engagement['id'],'web3',engagement['current_scope_snapshot_id'],engagement['current_policy_id'],'completed','verification',0,None,None,None,None,final_core.utcnow()))
+        db.execute('INSERT INTO run_configs_v2 VALUES(?,?,?)',(run_id,final_core.dump({'execution_mode':'real'}),final_core.utcnow()))
+        if fork_evidence=='bound_record':
+            db.execute('INSERT INTO web3_forks VALUES(?,?,?,?,?,?,?,?)',('contract-fork',engagement['id'],1,'remote',42,'stopped',0,final_core.utcnow()))
+    if fork_evidence!='none':
+        final_core.add_event(run_id,'surface','web3.fork.ready','fixture',{'fork_id':'contract-fork'})
+    details=client.get(f'/api/v1/runs/{run_id}/details').json()
+    items={item['id']:item for item in details['test_items']}
+    assert not {'subfinder','httpx','katana','nuclei','native-agent'} & set(items)
+    assert {'forge-build','forge-test','slither','web3-fork'} <= set(items)
+    assert items['web3-fork']['status']==('completed' if fork_evidence=='bound_record' else 'not_tested')
+    assert all(item['status']=='not_tested' for item in items.values() if item['stage']=='analysis')
+    assert next(item for item in details['stages'] if item['id']=='verification')['status']=='not_tested'
+
+
+def test_historical_verified_without_proof_does_not_complete_current_stages(client):
+    from tests.test_v5_team_plan import _setup
+    engagement,_,run_id=_setup(client)
+    with final_core.connect() as db:
+        db.execute("UPDATE analysis_runs SET status='completed',synthetic=0 WHERE id=?",(run_id,))
+        db.execute('INSERT INTO candidate_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                   ('legacy-candidate',run_id,engagement['id'],'traditional','Legacy','fixture','https://team.example.test','historical','verified','[]',final_core.utcnow(),final_core.utcnow()))
+        db.execute('INSERT INTO canonical_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   ('legacy-finding','legacy-candidate',engagement['id'],'traditional','Legacy','fixture','medium','https://team.example.test','{}','{}','{}','[]','verified',final_core.utcnow(),final_core.utcnow()))
+    response=client.get(f'/api/v1/runs/{run_id}/details')
+    assert response.status_code==200,response.text
+    value=response.json();stages={item['id']:item for item in value['stages']}
+    assert value['proof_status']['recorded_verified']==1
+    assert value['proof_status']['proof_checked']==0
+    assert value['proof_status']['review_required']==1
+    assert value['proof_status']['items'][0]['candidate_id']=='legacy-candidate'
+    assert stages['verification']['status']=='human_review'
+    assert stages['impact']['status']=='not_applicable'
+    with final_core.connect() as db:
+        assert db.execute("SELECT status FROM canonical_findings WHERE id='legacy-finding'").fetchone()[0]=='verified'

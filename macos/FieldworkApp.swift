@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var startupRecovery = StartupRecovery()
     private var window: NSWindow!
     private var webView: WKWebView!
+    private var localAlerts: LocalAlertNotifications?
     private var serverProcess: Process?
     private var serverLifetime: Pipe?
     private var startupRetryAllowed = false
@@ -52,7 +53,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        let alerts = LocalAlertNotifications(baseURL: URL(string: "http://127.0.0.1:\(serverPort)")!, token: sessionToken, instance: desktopInstance, version: expectedVersion, serverAlive: { [weak self] in self?.serverProcess?.isRunning == true })
+        configuration.userContentController.add(alerts, name: "fieldworkNotifications")
+        localAlerts = alerts
         webView = WKWebView(frame: .zero, configuration: configuration)
+        alerts.webView = webView
         webView.navigationDelegate = self
         webView.uiDelegate = self
 
@@ -160,11 +165,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = ["-P", "-m", "desktop_server", "--port", String(serverPort)]
+        process.arguments = ["-I", "-c", "import sys,runpy;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('desktop_server',run_name='__main__')", projectRoot, "--port", String(serverPort)]
         // Resolve modules explicitly; Python must not probe a Documents cwd at startup.
         process.currentDirectoryURL = URL(fileURLWithPath: "/")
         var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONPATH"] = projectRoot
+        environment.removeValue(forKey: "PYTHONPATH")
         environment["FIELDWORK_SESSION_TOKEN"] = sessionToken
         environment["FIELDWORK_DESKTOP_INSTANCE"] = desktopInstance
         environment["FIELDWORK_PORT"] = String(serverPort)
@@ -207,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.startupRecovery.cancel()
                     self.startupRetryAllowed = false
                     self.webView.load(URLRequest(url: self.appURL))
+                    self.localAlerts?.start()
                     return
                 case .rejectForeign:
                     self.startupRecovery.cancel()
@@ -359,6 +365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func applicationWillTerminate(_ notification: Notification) {
         startupRecovery.cancel()
+        localAlerts?.stop()
         serverLifetime?.fileHandleForWriting.closeFile()
         if let process = serverProcess, process.isRunning {
             process.terminate()

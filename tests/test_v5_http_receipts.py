@@ -179,6 +179,8 @@ def test_reviewed_v5_result_promotes_idempotently_and_exports_bound_proof(client
         assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0] == 1
     attachments = core.build_proof_attachments(*core.finding_report_inputs(identifier))
     assert 'v5-verification.json' in str(attachments)
+    current=client.get(f'/api/v1/runs/{run}/details').json()
+    assert current['proof_status']['proof_checked']==1
     assert len(controlled_server[0][1]) == 13
     with core.connect() as db:
         if change == 'observation':
@@ -199,6 +201,9 @@ def test_reviewed_v5_result_promotes_idempotently_and_exports_bound_proof(client
     from fastapi import HTTPException
     with pytest.raises(HTTPException):
         core.build_proof_attachments(*core.finding_report_inputs(identifier))
+    stale=client.get(f'/api/v1/runs/{run}/details').json()
+    assert stale['proof_status']['proof_checked']==0
+    assert stale['proof_status']['review_required']==1
 
 
 @pytest.mark.parametrize('changed_principal', [None,'owner_id','other_id'])

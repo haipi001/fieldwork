@@ -110,3 +110,53 @@ def test_saved_stage_reverification_rejects_changes(tmp_path, change):
     else: (root/'FAILED.json').write_text('{}')
     with pytest.raises(ValueError, match='staged_files_changed|failed_stage'):
         staging.verify_stage(root)
+
+
+def test_verify_command_rejects_changed_stage_and_conflicting_arguments(tmp_path):
+    import subprocess
+    import sys
+    source, destination = directories(tmp_path)
+    result = staging.stage(source, destination)
+    command = [sys.executable, 'scripts/stage_storage_migration.py', '--verify', result['stage_directory']]
+    checked = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert checked.returncode == 0, checked.stderr
+    assert json.loads(checked.stdout)['verified'] is True
+    conflict = subprocess.run(command + [str(source)], capture_output=True, text=True, timeout=10)
+    assert conflict.returncode == 2
+    (Path(result['stage_directory'])/'data/nested/evidence.bin').write_bytes(b'changed')
+    rejected = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert rejected.returncode != 0 and 'staged_files_changed' in rejected.stderr
+
+
+def test_external_sqlite_write_transaction_blocks_copy(tmp_path):
+    import sqlite3
+    source, destination = directories(tmp_path)
+    with sqlite3.connect(source/'src_control.db') as db:
+        db.execute('CREATE TABLE fixture(value TEXT)')
+    writer=sqlite3.connect(source/'src_control.db')
+    try:
+        writer.execute('BEGIN IMMEDIATE')
+        with pytest.raises(sqlite3.OperationalError, match='locked'):
+            staging.stage(source,destination)
+        assert not list(destination.glob('migration-stage-*'))
+    finally:
+        writer.rollback();writer.close()
+    assert staging.stage(source,destination)['state']=='files_verified_not_activated'
+
+
+def test_nonempty_wal_is_preserved_and_blocks_copy(tmp_path):
+    import sqlite3
+    source,destination=directories(tmp_path)
+    connection=sqlite3.connect(source/'src_control.db')
+    try:
+        connection.execute('PRAGMA journal_mode=WAL')
+        connection.execute('CREATE TABLE fixture(value TEXT)');connection.commit()
+        wal=source/'src_control.db-wal'
+        assert wal.stat().st_size > 0
+        raw=wal.read_bytes()
+        with pytest.raises(ValueError,match='source_database_recovery_files_present'):
+            staging.stage(source,destination)
+        assert wal.read_bytes()==raw
+        assert not list(destination.glob('migration-stage-*'))
+    finally:
+        connection.close()

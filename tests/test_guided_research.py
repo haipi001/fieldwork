@@ -185,3 +185,30 @@ def test_automatic_flow_moves_to_next_candidate_page_and_stops_at_bound():
     body=guided.next_automation_input('guided-parent',{'auto_continue':True,'automation_round':2},{'pending_verifications':0,'next_cursor':'candidate-200'})
     assert body.after_candidate_id=='candidate-200' and body.continue_from is None
     assert guided.next_automation_input('guided-parent',{'auto_continue':True,'automation_round':guided.MAX_AUTOMATION_ROUNDS},{'pending_verifications':1}) is None
+
+
+def test_result_summary_is_run_scoped_and_does_not_promote(client):
+    run,c=candidate(client)
+    other,_=candidate(client)
+    job=wait(client,client.post(f"/api/v1/runs/{run['id']}/guided-research",json={'auto_continue':True}).json())
+    response=client.get(f"/api/v1/runs/{run['id']}/guided-result")
+    assert response.status_code==200,response.text
+    value=response.json()
+    assert value['verified']==0 and value['pending']==1
+    assert sum(value['candidate_states'].values())==1
+    assert value['job_states']=={'awaiting_input':1}
+    assert other['id'] not in value['content']
+    assert 'No confirmed findings' in value['content']
+    assert client.get('/api/v1/runs/absent/guided-result').status_code==404
+
+
+def test_stop_run_blocks_automatic_followup_after_terminal_batch(client,monkeypatch):
+    run,c=candidate(client)
+    job=wait(client,client.post(f"/api/v1/runs/{run['id']}/guided-research",json={'auto_continue':True}).json())
+    assert client.post(f"/api/v1/runs/{run['id']}/guided-research/cancel").status_code==200
+    monkeypatch.setattr(guided,'dispatch',lambda *args:pytest.fail('cancelled parent must not dispatch'))
+    response=client.post(f"/api/v1/runs/{run['id']}/guided-research",json={
+        'auto_continue':True,'automation_parent':job['id'],'automation_round':2})
+    assert response.status_code==409,response.text
+    with final_core.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM guided_research_jobs WHERE run_id=?',(run['id'],)).fetchone()[0]==1

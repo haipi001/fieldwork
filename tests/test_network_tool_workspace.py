@@ -9,6 +9,11 @@ import traditional_tools
 @pytest.mark.parametrize('capability', ['httpx', 'katana', 'nuclei', 'subfinder'])
 @pytest.mark.parametrize('raises', [False, True])
 def test_network_tools_use_empty_private_workspace_and_clean_it(monkeypatch, tmp_path, capability, raises):
+    # The mocked Run still reads its frozen Nuclei configuration. Keep that
+    # lookup isolated from the developer's default research database.
+    monkeypatch.setattr(final_core, 'DB', tmp_path / 'workspace-test.db')
+    with final_core.connect() as db:
+        db.execute('CREATE TABLE run_configs_v2 (run_id TEXT PRIMARY KEY, config TEXT)')
     source = tmp_path / 'source'
     source.mkdir()
     (source / 'private-data.txt').write_text('fixture-private-material')

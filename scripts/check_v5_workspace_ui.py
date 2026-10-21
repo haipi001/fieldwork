@@ -199,6 +199,215 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 2')
         page.set_viewport_size({'width':1440,'height':1000})
         page.locator('[data-agent-tab="attack"]').click()
+        attack=page.locator('[data-w-attack-form]')
+        attack.locator('[name="agent_id"]').fill(memory_agent)
+        attack.locator('[name="max_cases"]').fill('3')
+        attack.locator('button').click()
+        page.locator('[data-w-attack-save]').wait_for(state='visible')
+        page.wait_for_function("document.querySelector('[data-w-attack-save]')?.disabled===false")
+        assert '等待可执行适配器' in page.locator('[data-w-attack-preview]').inner_text()
+        attack.locator('[name="max_cases"]').fill('4')
+        assert page.locator('[data-w-attack-save]').is_disabled()
+        attack.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-save]')?.disabled===false")
+        page.locator('[data-w-attack-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('申请已保存')")
+        with final_core.connect() as db:
+            attack_row=db.execute("SELECT * FROM agent_attack_tests_v5 WHERE mode='reviewed_request'").fetchone()
+            assert attack_row['status']=='awaiting_adapter' and json.loads(attack_row['result_json'])['max_cases']==4
+            assert db.execute('SELECT count(*) FROM runtime_calls').fetchone()[0]==0
+        page.locator('[data-w-attack-history] details summary').click()
+        page.locator('[data-w-action="cancel-attack-0"]').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-history]')?.textContent.includes('cancelled')")
+        with final_core.connect() as db:
+            assert db.execute('SELECT status FROM agent_attack_tests_v5 WHERE id=?',(attack_row['id'],)).fetchone()[0]=='cancelled'
+        attack=page.locator('[data-w-attack-form]')
+        attack.locator('[name="agent_id"]').fill(memory_agent)
+        adapter=page.locator('[data-w-adapter]');adapter.locator('summary').click()
+        adapter.locator('[data-w-adapter-read]').click()
+        page.wait_for_function("document.querySelector('[data-w-adapter-current]')?.textContent.includes('configuration_sha256')")
+        adapter_fixture_source=b"import json,sys,pathlib\nvalue=json.loads(sys.stdin.readline())\nif value.get('protocol')=='fieldwork.local-agent-tools-jsonl.v1':\n print(json.dumps({'type':'tool_call','id':'public','name':'fixture.read','arguments':{'resource':'fixture://public'}}),flush=True)\n reply=json.loads(sys.stdin.readline())\n print(json.dumps({'type':'final','response':reply['result']['receipt']}),flush=True)\n raise SystemExit(0)\npath=value.get('memory',{}).get('file_path')\nif path:\n p=pathlib.Path(path)\n memory=json.loads(p.read_text())\n memory['notes'].append('benign UI note')\n p.write_text(json.dumps(memory))\nprint(json.dumps({'response':'local fixture'}))\n"
+        adapter.locator('[name="source_file"]').set_input_files({'name':'local-reviewed-fixture.py','mimeType':'text/x-python','buffer':adapter_fixture_source})
+        adapter.locator('[name="enabled"]').check()
+        adapter.locator('[data-w-adapter-form] button').click()
+        page.wait_for_function("document.querySelector('[data-w-adapter-save]')?.disabled===false")
+        assert 'source_code' not in adapter.locator('[data-w-adapter-preview]').inner_text()
+        adapter.locator('[data-w-adapter-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('适配器配置已保存')")
+        with final_core.connect() as db:
+            from agent_attack_adapters import current as adapter_current
+            configured=adapter_current(db,memory_agent)
+            assert configured['enabled'] and configured['row']['sha256']
+            assert db.execute('SELECT count(*) FROM runtime_calls').fetchone()[0]==0
+        active_form=page.locator('[data-w-attack-form]')
+        active_form.locator('[name="agent_id"]').fill(memory_agent)
+        active_form.locator('[name="max_cases"]').fill('2')
+        active_form.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-save]')?.disabled===false")
+        page.locator('[data-w-attack-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('申请已保存')")
+        detail=page.locator('[data-w-attack-history] > details').first
+        detail.locator(':scope > summary').click()
+        dispatch_form=detail.locator('[data-w-dispatch]')
+        dispatch_form.locator('[name="engagement_id"]').select_option(demo.json()['id'])
+        dispatch_form.locator('[name="authorization_note"]').fill('Explicit isolated UI fixture source approval')
+        dispatch_form.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-dispatch-start]')?.disabled===false")
+        dispatch_form.locator('[name="timeout_seconds"]').fill('1')
+        assert detail.locator('[data-w-dispatch-start]').is_disabled()
+        dispatch_form.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-dispatch-start]')?.disabled===false")
+        detail.locator('[data-w-dispatch-start]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('本地观察已记录')")
+        with final_core.connect() as db:
+            executed=db.execute("SELECT * FROM agent_attack_tests_v5 WHERE status='observed'").fetchone()
+            assert executed is not None
+            execution=json.loads(executed['result_json'])['execution']
+            assert execution['case_count']==2 and execution['artifact_id']
+            assert db.execute('SELECT tool_calls_used FROM run_budgets_v2 WHERE run_id=?',(execution['run_id'],)).fetchone()[0]==2
+            assert db.execute('SELECT count(*) FROM runtime_calls').fetchone()[0]==0
+        detail=page.locator('[data-w-attack-history] > details').first
+        detail.locator(':scope > summary').click()
+        detail.locator('[data-w-action="attack-evidence-0"]').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-evidence]')?.textContent.includes('integrity_verified')")
+        assert execution['run_id'] in detail.locator('[data-w-attack-evidence]').inner_text()
+        assert page.locator('#agents').evaluate("element=>element.classList.contains('active')")
+        memory_form=page.locator('[data-w-attack-form]')
+        memory_form.locator('[name="agent_id"]').fill(memory_agent)
+        memory_form.locator('[name="category"]').select_option('memory')
+        memory_form.locator('[name="max_cases"]').fill('2')
+        memory_form.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-save]')?.disabled===false")
+        page.locator('[data-w-attack-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('申请已保存')")
+        memory_detail=page.locator('[data-w-attack-history] > details').first
+        memory_detail.locator(':scope > summary').click()
+        memory_dispatch=memory_detail.locator('[data-w-dispatch]')
+        memory_dispatch.locator('[name="engagement_id"]').select_option(demo.json()['id'])
+        memory_dispatch.locator('[name="timeout_seconds"]').fill('1')
+        memory_dispatch.locator('[name="authorization_note"]').fill('Explicit isolated memory fixture approval')
+        memory_dispatch.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-dispatch-start]')?.disabled===false")
+        memory_detail.locator('[data-w-dispatch-start]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('本地观察已记录')")
+        with final_core.connect() as db:
+            row=db.execute("SELECT * FROM agent_attack_tests_v5 WHERE scenario_id='memory' AND status='observed'").fetchone()
+            memory_execution=json.loads(row['result_json'])['execution']
+            assert memory_execution['case_count']==2 and memory_execution['observation']['attack_specific_memory_mutation'] is False
+        memory_detail=page.locator('[data-w-attack-history] > details').first
+        memory_detail.locator(':scope > summary').click()
+        memory_detail.locator('[data-w-action="attack-evidence-0"]').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-evidence]')?.textContent.includes('memory_observation')")
+        assert memory_execution['run_id'] in memory_detail.locator('[data-w-attack-evidence]').inner_text()
+        tool_form=page.locator('[data-w-attack-form]')
+        tool_form.locator('[name="agent_id"]').fill(memory_agent)
+        tool_form.locator('[name="category"]').select_option('tool')
+        tool_form.locator('[name="max_cases"]').fill('2')
+        tool_form.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-save]')?.disabled===false")
+        page.locator('[data-w-attack-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('申请已保存')")
+        tool_detail=page.locator('[data-w-attack-history] > details').first
+        tool_detail.locator(':scope > summary').click()
+        tool_dispatch=tool_detail.locator('[data-w-dispatch]')
+        tool_dispatch.locator('[name="engagement_id"]').select_option(demo.json()['id'])
+        tool_dispatch.locator('[name="timeout_seconds"]').fill('1')
+        tool_dispatch.locator('[name="authorization_note"]').fill('Explicit synthetic tool broker fixture approval')
+        tool_dispatch.locator('button').click()
+        page.wait_for_function("document.querySelector('[data-w-dispatch-start]')?.disabled===false")
+        assert 'fixture://public' in tool_detail.locator('[data-w-dispatch-plan]').inner_text()
+        tool_detail.locator('[data-w-dispatch-start]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('本地观察已记录')")
+        with final_core.connect() as db:
+            row=db.execute("SELECT * FROM agent_attack_tests_v5 WHERE scenario_id='tool' AND status='observed'").fetchone()
+            tool_execution=json.loads(row['result_json'])['execution']
+            assert tool_execution['case_count']==2 and tool_execution['observation']['attack_specific_forbidden_tool_request'] is False
+        tool_detail=page.locator('[data-w-attack-history] > details').first
+        tool_detail.locator(':scope > summary').click()
+        tool_detail.locator('[data-w-action="tool-checkpoints-0"]').click()
+        page.wait_for_function("document.querySelector('[data-w-tool-checkpoints]')?.textContent.includes('known_request_count')")
+        assert tool_execution['run_id'] in tool_detail.locator('[data-w-tool-checkpoints]').inner_text()
+        with final_core.connect() as db:
+            row=db.execute("SELECT result_json FROM agent_attack_tests_v5 WHERE scenario_id='tool' AND status='observed'").fetchone()
+            checkpoints=json.loads(row[0])['execution']['tool_checkpoints']
+            assert len(checkpoints)==2 and all(record['response_delivery']=='written_to_pipe' for record in checkpoints)
+        tool_detail.locator('[data-w-action="attack-evidence-0"]').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-evidence]')?.textContent.includes('tool_observation')")
+        assert tool_execution['run_id'] in tool_detail.locator('[data-w-attack-evidence]').inner_text()
+        tool_detail.locator('[data-w-action="attack-review-0"]').click()
+        page.wait_for_function("document.querySelector('[data-w-attack-review]')?.textContent.includes('synthetic_observation_consistency_only')")
+        review_text=tool_detail.locator('[data-w-attack-review]').inner_text()
+        assert tool_execution['run_id'] in review_text
+        assert '限定范围内未观察到信号' in review_text or 'No signal observed in the supported scope' in review_text
+        tool_detail.locator('[data-w-attack-review] details > summary').click()
+        assert 'not_observed_in_supported_scope' in tool_detail.locator('[data-w-attack-review]').inner_text()
+
+        page.set_viewport_size({'width':430,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 2')
+        page.set_viewport_size({'width':1440,'height':1000})
+        page.locator('[data-w-attack-form] [name="agent_id"]').fill(memory_agent)
+        adapter=page.locator('[data-w-adapter]');adapter.locator('summary').click()
+        adapter.locator('[data-w-adapter-read]').click()
+        page.wait_for_function("document.querySelector('[data-w-adapter-current]')?.textContent.includes('configuration_sha256')")
+        adapter.locator('[name="enabled"]').uncheck()
+        adapter.locator('[data-w-adapter-form] button').click()
+        page.wait_for_function("document.querySelector('[data-w-adapter-save]')?.disabled===false")
+        adapter.locator('[data-w-adapter-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('适配器配置已保存')")
+        with final_core.connect() as db:
+            assert not adapter_current(db,memory_agent)['enabled']
+        # Maintenance only: replace source, reject a stale restore, then restore disabled.
+        with final_core.connect() as db:
+            maintenance_before={table:db.execute('SELECT count(*) FROM '+table).fetchone()[0] for table in ('analysis_runs','agent_attack_tests_v5','runtime_calls')}
+            original_adapter=adapter_current(db,memory_agent);original_sha=original_adapter['row']['sha256']
+        page.locator('[data-w-attack-form] [name="agent_id"]').fill(memory_agent)
+        adapter=page.locator('[data-w-adapter]');adapter.locator('summary').click()
+        adapter.locator('[data-w-action="adapter-versions"]').click()
+        adapter.locator('[data-w-adapter-versions] tbody tr').wait_for()
+        assert adapter.locator('[data-w-adapter-versions] tbody tr').count()==1
+        replacement=adapter_fixture_source+b'# second stored source revision\n'
+        adapter.locator('[name="source_file"]').set_input_files({'name':'source-revision-2.py','mimeType':'text/x-python','buffer':replacement})
+        adapter.locator('[name="enabled"]').check()
+        adapter.locator('[data-w-adapter-form] button').click()
+        page.wait_for_function("document.querySelector('[data-w-adapter-save]')?.disabled===false")
+        adapter.locator('[data-w-adapter-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('适配器配置已保存')")
+        page.locator('[data-w-attack-form] [name="agent_id"]').fill(memory_agent)
+        adapter=page.locator('[data-w-adapter]');adapter.locator('summary').click()
+        adapter.locator('[data-w-action="adapter-versions"]').click()
+        page.wait_for_function("document.querySelectorAll('[data-w-adapter-versions] tbody tr').length===2")
+        old_version=adapter.locator('[data-w-adapter-versions] tbody tr').filter(has_text=original_sha)
+        old_version.locator('button').click()
+        adapter.locator('[data-w-restore-reviewed]').wait_for()
+        assert adapter.locator('[data-w-restore-save]').is_disabled()
+        assert '\nvalue=' in adapter.locator('[data-w-adapter-restore] pre').inner_text()
+        page.set_viewport_size({'width':430,'height':900})
+        if not page.evaluate('document.documentElement.scrollWidth <= innerWidth + 2'):
+            page.screenshot(path=str(ROOT/'build/adapter-history-overflow.png'),full_page=True)
+            print(page.locator('#agentsContent').locator('*').evaluate_all("items=>items.filter(e=>e.getClientRects().length&&e.getBoundingClientRect().right>innerWidth+2).map(e=>({tag:e.tagName,cls:e.className,text:e.textContent.slice(0,100),width:e.getBoundingClientRect().width})).slice(-15)"),flush=True)
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 2')
+        page.set_viewport_size({'width':1440,'height':1000})
+        from tests.test_agent_attack_adapters import register as register_adapter
+        with final_core.connect() as db:changed=adapter_current(db,memory_agent)
+        assert register_adapter(client,'/api/v1/workspace/agent-attack-requests/adapters/'+memory_agent,replacement.decode(),True,changed['configuration_sha256']).status_code==200
+        adapter.locator('[data-w-restore-reviewed]').check();adapter.locator('[data-w-restore-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('Adapter changed; reload before restoring a version')")
+        adapter.locator('[data-w-action="adapter-versions"]').click()
+        page.wait_for_function("document.querySelectorAll('[data-w-adapter-versions] tbody tr').length===2")
+        old_version.locator('button').click();adapter.locator('[data-w-restore-reviewed]').wait_for()
+        page.locator('[data-w-attack-form] [name="agent_id"]').fill('changed-agent-context')
+        assert adapter.locator('[data-w-restore-save]').count()==0
+        page.locator('[data-w-attack-form] [name="agent_id"]').fill(memory_agent)
+        adapter.locator('[data-w-action="adapter-versions"]').click()
+        page.wait_for_function("document.querySelectorAll('[data-w-adapter-versions] tbody tr').length===2")
+        old_version.locator('button').click();adapter.locator('[data-w-restore-reviewed]').wait_for()
+        adapter.locator('[data-w-restore-reviewed]').check();adapter.locator('[data-w-restore-save]').click()
+        page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('源码版本已恢复为未启用')")
+        with final_core.connect() as db:
+            restored_adapter=adapter_current(db,memory_agent)
+            assert restored_adapter['row']['sha256']==original_sha and not restored_adapter['enabled']
+            assert len(restored_adapter['history'])==2
+            assert maintenance_before=={table:db.execute('SELECT count(*) FROM '+table).fetchone()[0] for table in maintenance_before}
         check=page.locator('[data-w-policy-check]');check.locator('[name="engagement_id"]').select_option(eng['id']);check.locator('button').click()
         page.wait_for_function("document.querySelector('#agentsContent [data-w-message]')?.textContent.includes('本地策略回归通过')")
         assert '12' in page.locator('[data-w-policy-result] table').inner_text()
@@ -206,6 +415,15 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
         with final_core.connect() as db:
             assert db.execute('SELECT COUNT(*) FROM eval_runs_v6').fetchone()[0]==1
         page.screenshot(path=str(ROOT/'build/policy-check-ui.png'),full_page=True)
+        page.locator('[data-agent-tab="mcp"]').click()
+        load_adapter=page.locator('[data-w-component-load]');load_adapter.locator('..').locator(':scope > summary').click()
+        load_adapter.locator('[name="component_id"]').fill(restored_adapter['row']['id']);load_adapter.locator('button').click()
+        page.locator('[data-w-action="component-adapter-source"]').wait_for()
+        assert 'source_code' not in page.locator('[data-w-component-detail]').inner_text()
+        page.locator('[data-w-action="component-adapter-source"]').click()
+        page.wait_for_function("document.querySelector('[data-w-component-source] pre')?.textContent.includes('import json,sys,pathlib')")
+        assert adapter_fixture_source.decode().strip() in page.locator('[data-w-component-source] pre').inner_text()
+
         page.locator('[data-view="tasks"]').click();host=page.locator('#workspace-tasks')
         other_project=host.locator('[name="project"] option').evaluate_all('(items)=>items.map(item=>item.value)').copy()
         other_project=next(value for value in other_project if value and value!=eng['id'])
@@ -327,7 +545,7 @@ with tempfile.TemporaryDirectory(prefix='fieldwork-workspace-ui-') as directory,
         revise_component.locator('button').click()
         page.wait_for_function("document.querySelector('#workspace-extensions [data-w-message]')?.textContent.includes('声明已修订')")
         load_component.locator('button').click()
-        page.wait_for_function("document.querySelector('[data-w-component-detail]')?.textContent.includes('previous_version')")
+        page.wait_for_function("document.querySelector('#workspace-extensions [data-w-component-detail]')?.textContent.includes('previous_version')")
         assert 'fixture:browser-old' in extension.locator('[data-w-component-detail]').inner_text()
         for i in range(51):
             assert client.post('/api/v1/workspace/components',json={'agent_id':revision_agent,'component_type':'library','name':f'Browser inventory filler {i:02}','version':'1','source':f'fixture:inventory:{i}'}).status_code==201

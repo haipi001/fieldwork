@@ -181,3 +181,28 @@ def test_team_lists_real_usage_and_stale_authority_blocks_lease(client):
     }
     assert client.post(f"/api/v1/orchestration/tasks/{leased['id']}/heartbeat",
                        json={"runner_id": "team-runner"}).status_code == 409
+
+
+def test_team_inputs_follow_bound_run_and_keep_campaign_shared_inputs(client):
+    import v5_graph
+    engagement,campaign,run=_setup(client)
+    with final_core.connect() as db:
+        db.execute('INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',('team-other-run',engagement['id'],'traditional',engagement['current_scope_snapshot_id'],engagement['current_policy_id'],'completed','report',0,None,None,None,None,final_core.utcnow()))
+        own,_=v5_graph._bridge_node(db,campaign['id'],source_type='fixture',source_ref='own',node_type='observation',title='Own Run',body='',status='observed',run_id=run)
+        other,_=v5_graph._bridge_node(db,campaign['id'],source_type='fixture',source_ref='other',node_type='observation',title='Other Run',body='',status='observed',run_id='team-other-run')
+        shared,_=v5_graph._bridge_node(db,campaign['id'],source_type='fixture',source_ref='shared',node_type='evidence',title='Campaign shared input',body='',status='recorded')
+    preview=client.post('/api/v1/orchestration/groups/team/preview',json=_body(campaign,run,1));assert preview.status_code==200,preview.text
+    assert set(preview.json()['research_input_hashes'])=={own,shared}
+    assert other not in preview.json()['research_input_hashes']
+    assert preview.json()['research_input_selection']['eligible_count']==2
+
+
+def test_team_rejects_counterevidence_overflow_instead_of_silently_omitting_it(client):
+    import v5_graph
+    engagement,campaign,run=_setup(client)
+    with final_core.connect() as db:
+        for index in range(21):
+            v5_graph._bridge_node(db,campaign['id'],source_type='fixture',source_ref=str(index),node_type='counterevidence',title='Recorded counterevidence',body='',status='recorded',run_id=run)
+    response=client.post('/api/v1/orchestration/groups/team/preview',json=_body(campaign,run,1))
+    assert response.status_code==409 and 'counterevidence' in response.json()['detail']
+    with final_core.connect() as db:assert db.execute('SELECT count(*) FROM research_groups').fetchone()[0]==0

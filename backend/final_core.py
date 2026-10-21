@@ -707,6 +707,8 @@ class StartAnalysisInput(BaseModel):
 
 
 class ResearchCampaignInput(BaseModel):
+    source_run_id: str | None = Field(default=None, min_length=1, max_length=80)
+    source_plan_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     name: str = Field(min_length=2, max_length=160)
     objective: str = Field(min_length=8, max_length=4000)
     strategy: Literal["breadth_first", "depth_first", "risk_weighted", "business_logic"] = "business_logic"
@@ -3901,19 +3903,42 @@ def apply_business_workflow_template(campaign_id: str, template_id: str, body: B
 
 @router.post("/engagements/{engagement_id}/campaigns", status_code=201)
 def create_research_campaign(engagement_id: str, body: ResearchCampaignInput):
+    if body.source_run_id:
+        import campaign_materials
+        with campaign_materials.access():
+            return _create_research_campaign(engagement_id, body)
+    return _create_research_campaign(engagement_id, body)
+
+
+def _create_research_campaign(engagement_id: str, body: ResearchCampaignInput):
     engagement = get_engagement(engagement_id)
     if engagement["status"] == "archived":
         raise HTTPException(409, "归档项目不能创建长期研究 Campaign")
+    if bool(body.source_run_id) != bool(body.source_plan_hash):
+        raise HTTPException(422, "Recorded Run selection requires a current material preview")
     campaign_id, timestamp = uid("campaign"), utcnow()
+    imported = None
     with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if body.source_run_id:
+            import campaign_materials
+            material = campaign_materials.plan(db, engagement_id, body.source_run_id)
+            if material['preview_hash'] != body.source_plan_hash:
+                raise HTTPException(409, 'Run materials changed; review the preview again')
         db.execute("INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
             campaign_id, engagement_id, body.name.strip(), body.objective.strip(), "active",
             body.strategy, body.max_iterations, 0, body.horizon_days, body.coverage_target,
             timestamp, timestamp,
         ))
+        if body.source_run_id:
+            imported = campaign_materials.project(db, campaign_id, material)
+            if campaign_materials.plan(db, engagement_id, body.source_run_id)['preview_hash'] != body.source_plan_hash:
+                raise HTTPException(409, 'Run materials changed during import; Campaign was not created')
     with connect() as db:
         row = db.execute("SELECT * FROM research_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    return hydrate_campaign(row)
+    result = hydrate_campaign(row)
+    if imported is not None: result['source_import'] = imported
+    return result
 
 
 @router.get("/engagements/{engagement_id}/campaigns")

@@ -7,7 +7,7 @@ import threading
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from candidate_quality import HTTP_READ_CATEGORIES, INFORMATION_CATEGORIES
@@ -60,7 +60,12 @@ class StartInput(BaseModel):
     automation_round: int = Field(default=1, ge=1, le=MAX_AUTOMATION_ROUNDS)
 
 
-def snapshot(run_id, candidate_id=None, after_candidate_id=None):
+def snapshot(run_id, candidate_id=None, after_candidate_id=None, candidate_ids=None):
+    if candidate_ids is not None:
+        from candidate_selection import bounded_ids
+        try:candidate_ids=bounded_ids(candidate_ids)
+        except ValueError:raise HTTPException(422,'Select one to three distinct candidate IDs') from None
+        if candidate_id or after_candidate_id:raise HTTPException(422,'Explicit selection cannot be combined with a candidate or page cursor')
     f = core()
     with f.connect() as db:
         run = db.execute('SELECT * FROM analysis_runs WHERE id=?', (run_id,)).fetchone()
@@ -81,13 +86,18 @@ def snapshot(run_id, candidate_id=None, after_candidate_id=None):
                          'budget':dict(budget) if budget else None}
         params = [run_id]
         clause = ''
-        if candidate_id:
+        if candidate_ids is not None:
+            clause=' AND id IN (SELECT value FROM json_each(?))'
+            params.append(f.dump(candidate_ids))
+        elif candidate_id:
             clause = ' AND id=?'
             params.append(candidate_id)
         elif after_candidate_id:
             clause = ' AND id>?'
             params.append(after_candidate_id)
         rows = db.execute("SELECT * FROM candidate_findings WHERE run_id=? AND status NOT IN ('archived','graveyard','verified')" + clause + ' ORDER BY id LIMIT ?', (*params, MAX_ITEMS + 1)).fetchall()
+        if candidate_ids is not None and {row['id'] for row in rows}!=set(candidate_ids):
+            raise HTTPException(409,'Selected candidates are missing, completed or do not belong to this Run')
         if candidate_id and not rows:
             raise HTTPException(409, '候选不属于当前运行，或已结束处理')
         total = db.execute("SELECT count(*) FROM candidate_findings WHERE run_id=? AND status NOT IN ('archived','graveyard','verified')"+clause, params).fetchone()[0]
@@ -104,7 +114,7 @@ def snapshot(run_id, candidate_id=None, after_candidate_id=None):
         identities = [dict(x) for x in db.execute('''SELECT i.id,i.label,p.session_status,p.expires_at,p.last_validated_at
             FROM identities i JOIN identity_profiles p ON p.identity_id=i.id
             WHERE i.engagement_id=? ORDER BY i.id''', (run['engagement_id'],))]
-    return {'run_id': run_id, 'candidate_id': candidate_id, 'mode': run['mode'],
+    return {**({'candidate_ids':candidate_ids} if candidate_ids is not None else {}), 'run_id': run_id, 'candidate_id': candidate_id, 'mode': run['mode'],
             'after_candidate_id':after_candidate_id, 'runtime_context':runtime_context,
             'next_cursor':rows[MAX_ITEMS-1]['id'] if len(rows)>MAX_ITEMS else None,
             'candidates': [dict(x) for x in rows[:MAX_ITEMS]], 'observations': observations[:1000],
@@ -160,7 +170,7 @@ class PageLinks(HTMLParser):
             self.links.append({'url': url, 'kind': tag, 'executed': False, 'readable': not bool(urlsplit(value).query)})
 
 
-def material_for(candidate, data):
+def material_for(candidate, data, *, reviewed_replay=False):
     f = core()
     category = candidate['category'].lower()
     linked = set(f.load(candidate['evidence_ids'], []))
@@ -183,7 +193,7 @@ def material_for(candidate, data):
     if category in INFORMATION_CATEGORIES:
         method = 'observation_review'
         gaps.append({'code': 'security_boundary', 'message': '目前属于信息观察，尚无证据证明具体安全边界被违反。', 'action': None})
-    elif candidate['status'] == 'reproduced':
+    elif candidate['status'] == 'reproduced' and not reviewed_replay:
         method = 'impact_review'
         gaps.append({'code':'impact_review','message':'已复现观察行为；继续核对业务权限和实际影响，尚不等于正式漏洞。','action':None})
     elif candidate['mode'] == 'traditional' and category in HTTP_READ_CATEGORIES:
@@ -216,10 +226,11 @@ def material_for(candidate, data):
              'steps': ['核对来源与对象', '检查所需身份或源码', '运行适用的独立正反对照', '根据真实结果解释影响'],
              'impact': None, 'severity': None, 'root_cause': None}
     from guided_http import plan
-    binding = plan(candidate, data['exchanges'], data['identities'])
+    binding = plan(candidate, data['exchanges'], data['identities'], allow_reproduced=True) if reviewed_replay else plan(candidate, data['exchanges'], data['identities'])
     if binding:
         gaps = [gap for gap in gaps if gap['code'] != 'http_binding']
         draft['http_binding'] = binding
+    draft['reviewed_replay_available'] = bool(binding or (candidate['status']=='reproduced' and plan(candidate, data['exchanges'], data['identities'], allow_reproduced=True)))
     return redact_structure({'candidate_id': candidate['id'], 'title': candidate['title'],
         'draft': draft, 'sources': sources[:30], 'source_count': len(sources),
         'missing_evidence_ids': sorted(linked - {x['id'] for x in evidence}),
@@ -262,14 +273,15 @@ def hydrate(row):
 
 
 @router.get('/runs/{run_id}/candidate-workflow')
-def candidate_workflow(run_id: str, after_candidate_id: str | None = None):
+def candidate_workflow(run_id: str, after_candidate_id: str | None = None, candidate_ids:list[str]|None=Query(default=None,min_length=1,max_length=3)):
     """Preview a bounded batch without requests, workers or candidate mutation."""
-    data = snapshot(run_id, after_candidate_id=after_candidate_id)
+    data = snapshot(run_id, after_candidate_id=after_candidate_id,candidate_ids=candidate_ids)
     items = [material_for(candidate, data) for candidate in data['candidates']]
     counts = annotate_workflow(data['candidates'], items)
     with core().connect() as db:
-        latest = db.execute("""SELECT * FROM guided_research_jobs WHERE run_id=?
-            AND json_extract(result,'$.reviewed_execution')=1 ORDER BY created_at DESC,id DESC LIMIT 1""", (run_id,)).fetchone()
+        clause=" AND json_extract(result,'$.requested_candidate_ids')=json(?)" if candidate_ids is not None else ''
+        params=(run_id,core().dump(data['candidate_ids'])) if candidate_ids is not None else (run_id,)
+        latest=db.execute("SELECT * FROM guided_research_jobs WHERE run_id=? AND json_extract(result,'$.reviewed_execution')=1"+clause+" ORDER BY created_at DESC,id DESC LIMIT 1",params).fetchone()
     return {'run_id': run_id, 'counts': counts, 'items': items,
             'next_cursor': data['next_cursor'], 'truncated': data['truncated'],
             'source_fingerprint': fingerprint(data), 'automatic_execution': False,
@@ -288,7 +300,7 @@ def workflow_execution_plan(run_id, candidate_id):
     from guided_http import scalar
     data = snapshot(run_id, candidate_id)
     candidate = data['candidates'][0]
-    item = material_for(candidate, data)
+    item = material_for(candidate, data, reviewed_replay=True)
     annotate_workflow(data['candidates'], [item])
     engagement = core().get_engagement(candidate['engagement_id'])
     rule, rule_reason = select_rule(engagement['scope'], candidate['target'])
@@ -374,6 +386,76 @@ def execute_workflow(run_id: str, candidate_id: str, body: WorkflowExecutionInpu
                       expected_fingerprint=body.source_fingerprint)
 
 
+def _current_batch_receipt(run_id,candidate_id):
+    from v5_verification import get_receipt
+    with core().connect() as db:
+        row=db.execute("""SELECT json_extract(i.value,'$.auto_verification.independent_verification.receipt_id') AS receipt_id
+            FROM guided_research_jobs j,json_each(j.result,'$.items') i WHERE j.run_id=?
+            AND json_extract(i.value,'$.candidate_id')=?
+            AND json_extract(i.value,'$.auto_verification.independent_verification.receipt_id') IS NOT NULL
+            ORDER BY j.created_at DESC,j.id DESC LIMIT 1""",(run_id,candidate_id)).fetchone()
+    if not row:return None
+    try:receipt=get_receipt(row['receipt_id'])
+    except HTTPException:return None
+    if (receipt.get('replay_contract',{}).get('candidate_id')==candidate_id
+        and receipt.get('integrity',{}).get('current_inputs_match') is True
+        and receipt.get('result',{}).get('status') in {'verified','refuted'}):return row['receipt_id']
+    return None
+
+
+def reviewed_batch_plan(run_id,after_candidate_id=None,candidate_ids=None):
+    data=snapshot(run_id,after_candidate_id=after_candidate_id,candidate_ids=candidate_ids)
+    items=[]
+    triage_items=[material_for(candidate,data,reviewed_replay=True) for candidate in data['candidates']]
+    annotate_workflow(data['candidates'],triage_items)
+    duplicates={item['candidate_id'] for item in triage_items if item['triage']['lane']=='duplicate'}
+    for candidate in data['candidates']:
+        plan=workflow_execution_plan(run_id,candidate['id'])
+        current_receipt=_current_batch_receipt(run_id,candidate['id'])
+        if current_receipt:
+            plan['can_execute']=False
+            plan['blockers']=sorted(set(plan['blockers']+['current_receipt']))
+        if candidate['id'] in duplicates:
+            plan['can_execute']=False
+            plan['blockers']=sorted(set(plan['blockers']+['duplicate']))
+        items.append({'candidate_id':candidate['id'],'title':candidate['title'],
+                      'can_execute':plan['can_execute'],'blockers':plan['blockers'],
+                      'scope_snapshot_id':plan['scope_snapshot_id'],'business_rule':plan['business_rule'],
+                      'requests':plan['requests']})
+    # A batch grants no more requests than the frozen remaining Run budget.
+    remaining=max(0,(data['runtime_context'].get('budget') or {}).get('request_limit',0)-(data['runtime_context'].get('budget') or {}).get('requests_used',0))
+    selected=[item['candidate_id'] for item in items if item['can_execute']][:min(3,remaining//10)]
+    if fingerprint(snapshot(run_id,after_candidate_id=after_candidate_id,candidate_ids=data.get('candidate_ids')))!=fingerprint(data):
+        raise HTTPException(409,'Batch materials changed; review again')
+    value={'run_id':run_id,'requested_candidate_ids':data.get('candidate_ids'),'snapshot_fingerprint':fingerprint(data),'items':items,'selected_candidate_ids':selected,
+            'request_limit':len(selected)*10,'remaining_requests':remaining,'can_execute':bool(selected),
+            'remaining_candidates':data['remaining_candidates'],'truncated':data['truncated'],
+            'after_candidate_id':after_candidate_id,'next_cursor':data['next_cursor'],
+            'sends_requests':False,'automatic_promotion':False,'continues_without_review':False}
+    value['source_fingerprint']=fingerprint(value)
+    return value
+
+
+@router.get('/runs/{run_id}/candidate-workflow-batch/execution-plan')
+def preview_reviewed_batch(run_id:str,after_candidate_id:str|None=Query(default=None,max_length=100),candidate_ids:list[str]|None=Query(default=None,min_length=1,max_length=3)):
+    return {key:value for key,value in reviewed_batch_plan(run_id,after_candidate_id,candidate_ids).items() if key!='snapshot_fingerprint'}
+
+
+class ReviewedBatchInput(WorkflowExecutionInput):
+    candidate_ids:list[str]|None=Field(default=None,min_length=1,max_length=3)
+    after_candidate_id:str|None=Field(default=None,max_length=100)
+
+
+@router.post('/runs/{run_id}/candidate-workflow-batch/execute',status_code=202)
+def execute_reviewed_batch(run_id:str,body:ReviewedBatchInput):
+    if not body.authorized:raise HTTPException(422,'Review the batch and confirm authorization first')
+    plan=reviewed_batch_plan(run_id,body.after_candidate_id,body.candidate_ids)
+    if plan['source_fingerprint']!=body.source_fingerprint:raise HTTPException(409,'Batch materials changed; review again')
+    if not plan['can_execute']:raise HTTPException(409,'No candidates can execute within the reviewed batch budget')
+    return create_job(run_id,StartInput(execute_ready=True,after_candidate_id=body.after_candidate_id),expected_fingerprint=plan['snapshot_fingerprint'],
+                      reviewed_candidate_ids=plan['selected_candidate_ids'],candidate_ids=plan['requested_candidate_ids'])
+
+
 @router.get('/guided-research/{job_id}')
 def get_job(job_id: str):
     with core().connect() as db:
@@ -425,6 +507,7 @@ def run_job(job_id, data):
     steps = [{'id': key, 'label': label, 'status': 'pending', 'count': 0} for key,label in STAGES]
     result = {'items': [], 'discovered': [], 'requests_sent': 0, 'verification_executed': False,
               'reviewed_execution': data.get('reviewed_execution', False),
+              'reviewed_candidate_ids':data.get('reviewed_candidate_ids'),'requested_candidate_ids':data.get('candidate_ids'),
               'remaining_candidates': data['remaining_candidates'], 'truncated': data['truncated'],
               'after_candidate_id':data.get('after_candidate_id'), 'next_cursor':data.get('next_cursor'),
               'continue_from':data.get('continue_from'), 'pending_verifications':0,
@@ -459,12 +542,12 @@ def run_job(job_id, data):
                         save(job_id,steps,result,f"正在读取页面，已记录 {sum(r['status']=='recorded' for r in reads)} 个")
                     collect(data['run_id'],result['discovered'],page_checkpoint,
                             lambda:save(job_id,steps,result,'检查页面读取范围与预算'),attempted)
-                    fresh=snapshot(data['run_id'],data.get('candidate_id'),data['after_candidate_id']) if data.get('after_candidate_id') else snapshot(data['run_id'],data.get('candidate_id'))
+                    fresh=snapshot(data['run_id'],data.get('candidate_id'),data.get('after_candidate_id'),data.get('candidate_ids'))
                     data.update(fresh)
 
             elif index == 2:
                 for candidate in data['candidates']:
-                    result['items'].append(material_for(candidate, data))
+                    result['items'].append(material_for(candidate, data, reviewed_replay=True) if data.get('reviewed_execution') else material_for(candidate, data))
                     steps[index]['count'] = len(result['items'])
                     save(job_id, steps, result, f"正在整理 {len(result['items'])}/{len(data['candidates'])} 条候选")
             elif index == 3:
@@ -472,6 +555,9 @@ def run_job(job_id, data):
                 result['triage_counts'] = annotate_workflow(data['candidates'], result['items'])
                 executed = 0
                 for item in result['items']:
+                    if data.get('reviewed_candidate_ids') is not None and item['candidate_id'] not in data['reviewed_candidate_ids']:
+                        item['gaps'].append({'code':'batch_not_selected','message':'本条未在本次已审阅批次中执行，请核对最新计划。','action':None})
+                        continue
                     binding = item['draft'].get('http_binding')
                     if not item['triage']['dispatch_eligible'] or not binding or not data.get('execute_ready'):
                         continue
@@ -480,8 +566,11 @@ def run_job(job_id, data):
                     previous = None
                     with core().connect() as db:
                         histories = db.execute('SELECT result FROM guided_research_jobs WHERE run_id=? AND id!=? ORDER BY created_at DESC LIMIT 100', (data['run_id'],job_id)).fetchall()
-                    for history in histories:
-                        for old in core().load(history['result'],{}).get('items',[]):
+                    for history in ([] if data.get('reviewed_candidate_ids') is not None else histories):
+                        historical=core().load(history['result'],{})
+                        if data.get('reviewed_execution') and not historical.get('reviewed_execution'):
+                            continue
+                        for old in historical.get('items',[]):
                             check = old.get('auto_verification',{})
                             if old['candidate_id']==item['candidate_id'] and check.get('binding_hash')==binding['binding_hash'] and check.get('input_digest')==input_digest:
                                 previous=check
@@ -605,13 +694,17 @@ def next_automation_input(job_id, data, result):
     return None
 
 
-def create_job(run_id, body, initial_only=False, expected_fingerprint=None):
+def create_job(run_id, body, initial_only=False, expected_fingerprint=None, reviewed_candidate_ids=None,candidate_ids=None):
     f = core()
-    data = snapshot(run_id, body.candidate_id, body.after_candidate_id) if body.after_candidate_id else snapshot(run_id, body.candidate_id)
+    data = snapshot(run_id, body.candidate_id, body.after_candidate_id,candidate_ids)
     if expected_fingerprint is not None:
         if fingerprint(data) != expected_fingerprint:
             raise HTTPException(409, '执行计划已变化，请重新核对')
         data['reviewed_execution'] = True
+    if reviewed_candidate_ids is not None:
+        if expected_fingerprint is None or not 1<=len(reviewed_candidate_ids)<=3 or len(set(reviewed_candidate_ids))!=len(reviewed_candidate_ids):
+            raise HTTPException(422,'Invalid reviewed batch selection')
+        data['reviewed_candidate_ids']=list(reviewed_candidate_ids)
     data['execute_ready'] = body.execute_ready
     data['read_pages'] = body.read_pages
     data['auto_continue'] = body.auto_continue
@@ -713,7 +806,8 @@ def resume_after_identity(identity_id):
     resumed = []
     for row in rows:
         result = f.load(row['result'], {})
-        if not result.get('execute_ready'):
+        if (not result.get('execute_ready') or result.get('reviewed_execution')
+            or result.get('requested_candidate_ids') is not None or result.get('reviewed_candidate_ids') is not None):
             continue
         if not any(gap.get('code') in ('identities','http_binding','verification_failed') for item in result.get('items',[]) for gap in item.get('gaps',[])):
             continue

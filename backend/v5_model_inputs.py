@@ -24,7 +24,10 @@ def input_plan(provider, messages, total_tokens, counted=None):
         incoming = len(json.dumps(messages, ensure_ascii=False).encode()) + 256
     else:
         raise ValueError('model input counting strategy unavailable')
-    output = min(4000, total_tokens - incoming, metadata.get('max_context_tokens', 32768) - incoming)
+    output_cap=metadata.get('max_output_tokens',4000)
+    if type(output_cap) is not int or not 1<=output_cap<=100000:
+        raise ValueError('model output token cap is invalid')
+    output = min(output_cap, total_tokens - incoming, metadata.get('max_context_tokens', 32768) - incoming)
     if output < 1:
         raise HTTPException(409, 'model input token budget exhausted before generation')
     return {'strategy': strategy, 'input_tokens': incoming, 'output_max_tokens': output,

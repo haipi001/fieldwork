@@ -62,3 +62,46 @@ def test_draft_review_rejects_corrupt_or_cross_context_references(client,monkeyp
             result['claim_ids']=[claim]*(2 if change=='duplicate' else 6)
             db.execute('UPDATE agent_tasks SET result_json=? WHERE id=?',(json.dumps(result),task['id']))
     assert client.get(f"/api/v1/workers/research/tasks/{task['id']}/draft").status_code==409
+
+
+def test_registered_source_checks_file_bytes_and_run_ownership(client, tmp_path, monkeypatch):
+    import hashlib
+    from research_material_review import source_status
+    campaign, body = team(client, count=1)
+    root = final_core.LOCAL_DATA_ROOT
+    path = root / 'draft-source-integrity-fixture.txt'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'original registered response')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    try:
+        with final_core.connect() as db:
+            # Use the schema's explicit registration columns; this is an isolated test DB.
+            db.execute('INSERT INTO artifacts(id,run_id,kind,uri,sha256,media_type,redacted,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                       ('review-artifact',body['run_id'],'raw',str(path),digest,'text/plain',1,final_core.utcnow()))
+            row = dict(db.execute('SELECT * FROM research_nodes WHERE campaign_id=? LIMIT 1',(campaign['id'],)).fetchone())
+            row.update(source_type='artifact',source_ref='review-artifact',attributes_json=json.dumps({'sha256':digest}))
+            check=lambda rid:source_status(db,row,rid,{'remaining':8_000_000,'checked':{}})
+            assert check(body['run_id'])=='verified'
+            assert check('foreign-run')=='missing'
+            path.write_bytes(b'changed registered response')
+            assert check(body['run_id'])=='changed'
+            path.unlink()
+            assert check(body['run_id'])=='unavailable'
+            path.symlink_to('/etc/hosts')
+            assert check(body['run_id'])=='unavailable'
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_draft_manual_inputs_do_not_claim_registered_sources_verified(client,monkeypatch):
+    task=saved_draft(client,monkeypatch)
+    result=client.get(f"/api/v1/workers/research/tasks/{task['id']}/draft").json()
+    assert result['inputs_current'] is True
+    assert result['registered_sources_verified'] is False
+    assert all(x['source_status']=='unregistered' for x in result['inputs'])
+    with final_core.connect() as db:
+        capsule=json.loads(task['context_capsule_json'])
+        capsule['research_input_hashes']={}
+        db.execute('UPDATE agent_tasks SET context_capsule_json=? WHERE id=?',(json.dumps(capsule),task['id']))
+    empty=client.get(f"/api/v1/workers/research/tasks/{task['id']}/draft").json()
+    assert empty['inputs_current'] is False and empty['registered_sources_verified'] is False

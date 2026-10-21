@@ -193,6 +193,7 @@ def run():
                 page.locator("#rcModel").fill("ui-fixture-model")
                 page.locator("#rcBase").fill(f"http://127.0.0.1:{health.server_port}/v1")
                 page.locator("#rcKey").fill("fixture-key-no-real-credential")
+                page.locator("#rcOutput").fill("8000")
                 page.locator("#rcIndependent").check()
                 page.locator("#rcProviderAccepted").check()
                 page.locator("#rcProviderSave").click()
@@ -207,6 +208,12 @@ def run():
                 page.wait_for_function("document.querySelector('#rcMessage').textContent.includes('费用上界已保存')")
                 assert page.locator("[data-rc-rate]").input_value()=="1200000"
 
+                assert page.locator('[data-rc-output]').input_value()=='8000'
+                page.locator('[data-rc-output]').fill('12000')
+                page.locator('[data-rc-output-save]').click()
+                page.wait_for_function("document.querySelector('#rcMessage').textContent.includes('输出上限已保存')")
+                assert page.locator('[data-rc-output]').input_value()=='12000'
+                assert page.locator('[data-rc-rate]').input_value()=='1200000'
                 assert counts=={"health":1,"model":0}
                 page.locator("#rcNextStep button").filter(has_text="创建新 Profile 版本").click()
                 assert page.locator("#rcLocalProviders input").is_checked()
@@ -256,8 +263,10 @@ def run():
                 page.locator('#rcRefresh').click()
                 page.wait_for_function("document.querySelector('[data-summary-total=tasks]').textContent==='2'")
                 page.locator("#rcProviderName").fill("Unsaved input stays intact")
+                page.locator("[data-rc-output]").fill("12345")
                 page.locator("#languageToggle").click()
                 assert page.locator("#rcProviderName").input_value()=="Unsaved input stays intact"
+                assert page.locator("[data-rc-output]").input_value()=="12345"
                 assert "V5 model configuration" in page.locator("#runtimeControl h2").inner_text()
                 flags["fail_config"]=True;page.locator("#rcRefresh").click()
                 page.wait_for_function("document.querySelector('#rcMessage').textContent.includes('503')")

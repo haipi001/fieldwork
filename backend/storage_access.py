@@ -12,14 +12,42 @@ import stat
 from storage_migration import _open_directory, _plain_directory
 
 
+def open_runtime_lock(parent,directory,name):
+    """Retry only transient lock-file opens inside the same verified directory.
+
+    No absolute-path fallback and no task replay. A replaced directory or a
+    symlink remains an error; callers still verify the file and flock identity.
+    """
+    if name not in {'.storage-access.lock','.agent-attack-execution.lock'}:
+        raise ValueError('unsupported_runtime_lock')
+    pinned=os.fstat(parent)
+    if not stat.S_ISDIR(pinned.st_mode):raise ValueError('runtime_lock_parent_not_directory')
+    def verify():
+        path=_plain_directory(directory)
+        current=path.stat();handle=os.fstat(parent)
+        if (current.st_dev,current.st_ino)!=(pinned.st_dev,pinned.st_ino) or (handle.st_dev,handle.st_ino)!=(pinned.st_dev,pinned.st_ino):
+            raise RuntimeError('storage_directory_changed')
+    for attempt in range(3):
+        verify()
+        try:
+            descriptor=os.open(name,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=parent)
+        except FileNotFoundError:
+            if attempt==2:raise
+            continue
+        try:verify()
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+
 @contextmanager
 def storage_access(directory, *, maintenance=False):
     directory = _plain_directory(Path(directory))
     parent = _open_directory(directory)
     descriptor = None
     try:
-        descriptor = os.open('.storage-access.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
-                             0o600, dir_fd=parent)
+        descriptor = open_runtime_lock(parent,directory,'.storage-access.lock')
         info = os.fstat(descriptor)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077):

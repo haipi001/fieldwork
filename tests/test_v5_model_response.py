@@ -95,6 +95,12 @@ def test_real_http_invalid_output_settles_known_usage_and_never_replays(client, 
                 assert call['state'] == 'settled'
                 assert state['error']['code'] == 'model_output_invalid_usage_settled'
                 assert state['error']['model_output_reason']=={'syntax':'invalid_json','schema':'schema_mismatch','truncated':'output_truncated'}[invalid_kind]
+                if invalid_kind!='schema':
+                    diagnostic=state['error']['model_output_diagnostics']
+                    expected_content='{"summary":"' + marker if invalid_kind=='syntax' else json.dumps({'summary':17,'private_marker':marker})
+                    assert diagnostic['content_bytes']==len(expected_content.encode())
+                    assert len(diagnostic['content_sha256'])==64
+                    if invalid_kind=='syntax':assert diagnostic['json_error_category']=='unterminated_string'
                 assert state['usage']['input_tokens'] == 17 and state['usage']['output_tokens'] == 12
                 assert db.execute('SELECT COUNT(*) FROM runtime_usage').fetchone()[0] == 1
                 assert db.execute('SELECT COUNT(*) FROM runtime_call_timings').fetchone()[0] == 1
@@ -132,3 +138,20 @@ def test_diagnostic_constructor_only_retains_fixed_codes(reason,finish):
     error=ModelOutputRejected(2,3,4,reason,finish)
     assert error.reason_code=='invalid_json' and error.finish_reason is None
     assert 'private' not in repr(vars(error))
+
+
+@pytest.mark.parametrize('content,category',[
+    ('{"x":1} extra','trailing_content'),('{"x":"private-marker','unterminated_string'),
+    ('{"x":"bad\\q"}','invalid_escape'),('{"x":}','expected_value'),
+    ('{no_quotes:1}','expected_property_name'),('{"x":1 "y":2}','expected_delimiter'),
+])
+def test_rejection_diagnostics_never_copy_output_or_parser_messages(content,category):
+    import hashlib
+    raw=json.dumps({'usage':{'prompt_tokens':3,'completion_tokens':4},'choices':[{'message':{'content':content},'finish_reason':'stop'}]}).encode()
+    with pytest.raises(ModelOutputRejected) as failure:decode_response(raw,'llama_cpp',10)
+    error=failure.value
+    assert error.diagnostics['content_sha256']==hashlib.sha256(content.encode()).hexdigest()
+    assert error.diagnostics['content_bytes']==len(content.encode())
+    assert error.diagnostics['json_error_category']==category
+    assert error.diagnostics['json_error_line']>=1 and error.diagnostics['json_error_column']>=1
+    assert 'private-marker' not in repr(vars(error)) and error.__context__ is None

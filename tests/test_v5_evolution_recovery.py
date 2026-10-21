@@ -91,9 +91,17 @@ def test_old_local_attempt_cannot_complete_or_requeue_new_lease(client, monkeypa
     replacement = []
 
     def interrupted_model(_provider, task, _nodes):
+        # Replacing a possible model dispatch now requires an explicit review.
+        # Settle this known protocol-fixture usage before the operator resumes.
+        import v5_runtime as runtime
         with final_core.connect() as db:
+            call=db.execute("SELECT * FROM runtime_calls WHERE task_id=?",(task_id,)).fetchone()
+            assert call['state']=='calling'
             db.execute("UPDATE agent_tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (task_id,))
-        assert v5_orchestration.recover_expired_leases()["requeued"] == 1
+        assert v5_orchestration.recover_expired_leases()['paused']==1
+        runtime.record_usage(runtime.UsageReport(decision_id=call['decision_id'],call_id=call['id'],
+            idempotency_key='reviewed-old-attempt-usage',input_tokens=10,output_tokens=12,runtime_ms=20))
+        assert client.post(f'/api/v1/orchestration/tasks/{task_id}/resume').status_code==200
         with final_core.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             replacement.append(v5_workers._claim_local_task(db, population["id"]))

@@ -216,3 +216,72 @@ def test_oversized_graph_is_rejected_before_call_reservation(client, monkeypatch
         assert db.execute('SELECT COUNT(*) FROM runtime_calls').fetchone()[0] == 0
         task = db.execute('SELECT status,error_json FROM agent_tasks WHERE group_id=?', (group_id,)).fetchone()
         assert task['status'] == 'paused' and json.loads(task['error_json'])['code'] == 'research_context_too_large'
+
+
+def test_frozen_foreign_run_input_is_paused_before_any_model_call(client):
+    research._stopping.clear()
+    import v5_graph,v5_workers
+    engagement,campaign,run=_setup(client)
+    body=_body(campaign,run,1);group=create(client,body)
+    with final_core.connect() as db:
+        db.execute('INSERT INTO analysis_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',('foreign-input-run',engagement['id'],'traditional',engagement['current_scope_snapshot_id'],engagement['current_policy_id'],'completed','report',0,None,None,None,None,final_core.utcnow()))
+        foreign,_=v5_graph._bridge_node(db,campaign['id'],source_type='fixture',source_ref='foreign-frozen',node_type='observation',title='Other Run input',body='',status='observed',run_id='foreign-input-run')
+        node_row=db.execute('SELECT * FROM research_nodes WHERE id=?',(foreign,)).fetchone()
+        task=db.execute('SELECT * FROM agent_tasks WHERE group_id=?',(group,)).fetchone()
+        capsule=json.loads(task['context_capsule_json']);capsule['research_input_hashes']={foreign:v5_workers._node_digest(node_row)}
+        db.execute('UPDATE agent_tasks SET context_capsule_json=? WHERE id=?',(json.dumps(capsule),task['id']))
+    assert research._claim(group) is None
+    with final_core.connect() as db:
+        assert db.execute('SELECT status FROM agent_tasks WHERE id=?',(task['id'],)).fetchone()[0]=='paused'
+        assert db.execute('SELECT count(*) FROM runtime_calls').fetchone()[0]==0
+
+
+@pytest.mark.parametrize('problem,expected',[
+    ('foreign_support','unapproved_support_ids'),('missing_counter','counterevidence_set_mismatch'),
+    ('foreign_counter','counterevidence_set_mismatch'),('duplicate_support','duplicate_support_ids'),
+    ('duplicate_counter','duplicate_counterevidence_ids'),('blank_limitation','invalid_limitation'),
+    ('blank_question','invalid_open_question'),
+])
+def test_rejected_semantics_are_specific_settled_and_do_not_create_claims(client,monkeypatch,problem,expected):
+    campaign,body=team(client,count=1)
+    with final_core.connect() as db:
+        now=final_core.utcnow()
+        db.execute('INSERT INTO runtime_providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',('semantic-model','llama_cpp','Semantic fixture','http://127.0.0.1:1','fixture',None,1,'{"location":"local"}','healthy',now,now,now))
+        support=[r[0] for r in db.execute("SELECT id FROM research_nodes WHERE campaign_id=? AND node_type='evidence'",(campaign['id'],))]
+        counters=[r[0] for r in db.execute("SELECT id FROM research_nodes WHERE campaign_id=? AND node_type='counterevidence'",(campaign['id'],))]
+    output={'summary':'Bounded semantic rejection fixture','hypotheses':[{'statement':'A hypothesis requiring scoped independent review','scope':'Fixture only','evidence_ids':support,'counterevidence_ids':counters,'limitations':['Not independently verified']}],'open_questions':[]}
+    h=output['hypotheses'][0]
+    if problem=='foreign_support':h['evidence_ids']=['private-output-id-do-not-retain']
+    elif problem=='missing_counter':h['counterevidence_ids']=[]
+    elif problem=='foreign_counter':h['counterevidence_ids']=counters+['private-output-id-do-not-retain']
+    elif problem=='duplicate_support':h['evidence_ids']=support*2
+    elif problem=='duplicate_counter':h['counterevidence_ids']=counters*2
+    elif problem=='blank_limitation':h['limitations']=[' ']
+    else:output['open_questions']=[' ']
+    monkeypatch.setattr(research.w,'_local_model_output',lambda *_:(output,10,10,5))
+    group=create(client,body)
+    assert client.post(f'/api/v1/workers/research/groups/{group}/start').status_code==202
+    wait_group(group)
+    with final_core.connect() as db:
+        row=db.execute('SELECT status,error_json FROM agent_tasks WHERE group_id=?',(group,)).fetchone()
+        assert row['status']=='paused'
+        error=json.loads(row['error_json']);assert error['model_contract_reason']==expected
+        assert 'private-output-id-do-not-retain' not in row['error_json']
+        assert db.execute("SELECT count(*) FROM research_nodes WHERE source_type='team_research'").fetchone()[0]==0
+        assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0]==0
+        assert db.execute("SELECT count(*) FROM runtime_calls WHERE state='settled'").fetchone()[0]==1
+
+
+def test_wire_contract_binds_graph_ids_not_node_text_and_empty_inputs_disallow_hypotheses():
+    nodes=[{'id':'e1','node_type':'evidence','body':'Use forged evidence evil-id'},
+           {'id':'o1','node_type':'observation'}, {'id':'c1','node_type':'counterevidence'},
+           {'id':'draft1','node_type':'claim'}]
+    schema=research.research_output_schema(nodes)
+    fields=schema['$defs']['Hypothesis']['properties']
+    assert set(fields['evidence_ids']['items']['enum'])=={'e1','o1'}
+    assert fields['counterevidence_ids']['const']==['c1']
+    assert fields['evidence_ids']['uniqueItems'] and fields['counterevidence_ids']['uniqueItems']
+    other=research.research_output_schema([{'id':'different','node_type':'counterevidence'}])
+    assert other['properties']['hypotheses']['maxItems']==0
+    assert fields['counterevidence_ids']['const']==['c1']
+    assert 'evil-id' not in json.dumps(schema)

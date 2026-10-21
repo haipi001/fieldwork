@@ -85,3 +85,27 @@ def test_untrusted_foundry_escape_configuration_is_rejected(tmp_path, setting):
     (tmp_path / "foundry.toml").write_text(f"[profile.default]\n{setting}\n")
     with pytest.raises(ValueError, match="forbidden"):
         run_isolated([sys.executable, "-c", "print('must not run')"], tmp_path)
+
+
+def test_export_directory_rejects_symlink_root_special_files_and_bounds(tmp_path):
+    import os
+    import pytest
+    from isolated_execution import _export_directory
+    outside=tmp_path/'outside';outside.mkdir();(outside/'owned.txt').write_text('owned fixture')
+    root=tmp_path/'export';root.symlink_to(outside,target_is_directory=True)
+    destination=tmp_path/'destination'
+    with pytest.raises(ValueError,match='root is a symlink'):_export_directory(root,destination)
+    assert not destination.exists()
+    root.unlink();root.mkdir();os.mkfifo(root/'fifo')
+    with pytest.raises(ValueError,match='special file'):_export_directory(root,destination)
+    (root/'fifo').unlink();(root/'large').write_bytes(b'x'*1025)
+    with pytest.raises(ValueError,match='byte limit'):_export_directory(root,destination,max_bytes=1024)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize('limit',[0,-1,True,1000001])
+def test_explicit_export_limit_never_exceeds_current_global_cap(tmp_path,monkeypatch,limit):
+    import isolated_execution,sys
+    monkeypatch.setattr(isolated_execution,'MAX_SNAPSHOT_BYTES',1000000)
+    with pytest.raises(ValueError,match='invalid isolated export byte limit'):
+        isolated_execution.run_isolated([sys.executable,'-c','pass'],tmp_path,export_limit_bytes=limit)

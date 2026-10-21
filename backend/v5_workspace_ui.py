@@ -272,6 +272,9 @@ def component_details(component_id: str):
         row=db.execute('SELECT * FROM agent_supply_components_v5 WHERE id=?',(component_id,)).fetchone()
         if row is None:raise HTTPException(404,'Component not found')
         metadata=component_metadata(row)
+        from agent_attack_adapters import NAME as adapter_name,SOURCE as adapter_source,current as adapter_current,component_public_metadata
+        if row['component_type']=='adapter' and row['name']==adapter_name and row['source']==adapter_source:
+            metadata=component_public_metadata(adapter_current(db,row['agent_id']))
         value=dict(row)
         value['metadata_json']=metadata
         for field in ('permissions_json','capabilities_json'):
@@ -1058,3 +1061,11 @@ def monitor_native_delivery(after: int | None = Query(None, ge=0, le=92233720368
     try:return monitor_alerts.native_delivery(after)
     except (OSError,ValueError,TypeError,KeyError,sqlite3.Error):
         raise HTTPException(409,'Native notification source cannot be verified') from None
+
+# Keep attack-request persistence separate from executable attack adapters.
+from agent_attack_requests import router as attack_request_router
+router.include_router(attack_request_router)
+from agent_attack_adapters import router as attack_adapter_router
+router.include_router(attack_adapter_router)
+from agent_attack_dispatch import router as attack_dispatch_router
+router.include_router(attack_dispatch_router)

@@ -55,6 +55,7 @@ class IsolatedResult:
     stderr: str
     status: str
     isolation: str
+    exports: dict[str, bool] | None = None
 
 
 def _quote_profile(value: str) -> str:
@@ -158,11 +159,25 @@ def validate_project_policy(root: Path) -> None:
     inspect(document)
 
 
-def _export_directory(snapshot: Path, destination: Path) -> None:
+def _export_directory(snapshot: Path, destination: Path, *, max_bytes: int = MAX_SNAPSHOT_BYTES) -> None:
+    if snapshot.is_symlink():
+        raise ValueError("isolated export root is a symlink")
+    if snapshot.exists() and not snapshot.is_dir():
+        raise ValueError("isolated export root is not a directory")
     if not snapshot.is_dir():
         return
-    if any(path.is_symlink() for path in snapshot.rglob("*")):
-        raise ValueError("isolated output contains a symlink")
+    entries=list(snapshot.rglob("*"))
+    if len(entries)>MAX_SNAPSHOT_FILES:
+        raise ValueError("isolated export exceeds file limit")
+    total=0
+    for path in entries:
+        if path.is_symlink():raise ValueError("isolated output contains a symlink")
+        info=path.stat()
+        if path.is_file():
+            if info.st_nlink!=1:raise ValueError("isolated output contains a hard link")
+            total+=info.st_size
+        elif not path.is_dir():raise ValueError("isolated output contains a special file")
+        if total>max_bytes:raise ValueError("isolated export exceeds byte limit")
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(snapshot, destination)
@@ -171,11 +186,22 @@ def _export_directory(snapshot: Path, destination: Path) -> None:
 def run_isolated(argv: list[str], cwd: Path, *, timeout: int = 120,
                  output_limit: int = DEFAULT_OUTPUT_LIMIT,
                  export_dirs: tuple[str, ...] = (), input_text: str | None = None,
-                 broker_port: int | None = None, broker_ca_pem: bytes | None = None) -> IsolatedResult:
+                 broker_port: int | None = None, broker_ca_pem: bytes | None = None,
+                 guarded_adapter: bool = False, cancel_requested=None,
+                 export_limit_bytes: int | None = None, synthetic_tool_broker: bool = False, stdout_observer=None) -> IsolatedResult:
+    if stdout_observer is not None and not callable(stdout_observer):raise ValueError('invalid stdout observer')
+    if synthetic_tool_broker and stdout_observer is None:raise ValueError('synthetic tool broker requires an acknowledgement observer')
+    if type(synthetic_tool_broker) is not bool or synthetic_tool_broker and not guarded_adapter:
+        raise ValueError('synthetic tool broker requires guarded adapter execution')
+    if export_limit_bytes is None:export_limit_bytes=MAX_SNAPSHOT_BYTES
+    if type(export_limit_bytes) is not int or not 1<=export_limit_bytes<=MAX_SNAPSHOT_BYTES:
+        raise ValueError("invalid isolated export byte limit")
     if not argv or timeout < 1 or output_limit < 1024:
         raise ValueError("invalid isolated execution request")
     if broker_port is not None and (type(broker_port) is not int or not 1 <= broker_port <= 65535):
         raise ValueError('invalid broker port')
+    if type(guarded_adapter) is not bool or guarded_adapter and broker_port is not None:
+        raise ValueError('guarded adapters cannot receive network brokers')
     if broker_ca_pem is not None and (broker_port is None or not isinstance(broker_ca_pem, bytes) or len(broker_ca_pem) > 16384):
         raise ValueError('invalid task-local broker CA')
     root = cwd.expanduser().resolve()
@@ -211,6 +237,8 @@ def run_isolated(argv: list[str], cwd: Path, *, timeout: int = 120,
         policy = _sandbox_profile(execution_root, home, executable)
         if broker_port is not None:
             policy += f'\n(allow network-outbound (remote tcp "localhost:{broker_port}"))\n'
+        if guarded_adapter:
+            policy += "\n(deny process-fork)\n(deny signal)\n"
         profile.write_text(policy)
         environment = clean_environment(home, executable, execution_root)
         if broker_ca_pem is not None:
@@ -219,67 +247,111 @@ def run_isolated(argv: list[str], cwd: Path, *, timeout: int = 120,
             environment['SSL_CERT_FILE'] = str(ca_file)
         command = [str(sandbox), "-f", str(profile), *command]
         isolation = "macos-sandbox"
+        launch=subprocess.Popen
+        if guarded_adapter:
+            from parent_bound_child import spawn_child
+            supervisor=home/'agent_adapter_supervisor.py'
+            supervisor.write_bytes(Path(__file__).with_name('agent_adapter_supervisor.py').read_bytes())
+            command=[sys.executable,'-I',str(supervisor),str(profile),*command[3:]]
+            if synthetic_tool_broker:command.insert(3,'--synthetic-tool-broker')
+            launch=lambda *args,**kwargs:spawn_child(subprocess.Popen,*args,**kwargs)
 
         input_stream = tempfile.TemporaryFile() if input_text is not None else None
         if input_stream is not None:
             input_stream.write(input_text.encode())
             input_stream.seek(0)
-        process = subprocess.Popen(
-            command, cwd=execution_root, env=environment, shell=False,
-            stdin=input_stream if input_stream is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True, preexec_fn=_limits,
-        )
-        if input_stream is not None:
-            input_stream.close()
-        selector = selectors.DefaultSelector()
-        assert process.stdout is not None and process.stderr is not None
-        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-        captured = {"stdout": bytearray(), "stderr": bytearray()}
-        truncated = {"stdout": False, "stderr": False}
-        deadline = time.monotonic() + timeout
-        timed_out = False
-        resource_exceeded = False
-        resource_check_at = time.monotonic()
-        while selector.get_map():
-            if time.monotonic() >= resource_check_at:
-                resource_check_at = time.monotonic() + 0.5
-                files = [p for p in execution_root.rglob("*") if p.is_file() and not p.is_symlink()]
-                if len(files) > MAX_SNAPSHOT_FILES or sum(p.stat().st_size for p in files) > MAX_SNAPSHOT_BYTES:
-                    resource_exceeded = True
+        ack_reader=ack_writer=None
+        if synthetic_tool_broker:
+            ack_reader,ack_writer=os.pipe()
+            environment['FIELDWORK_BROKER_ACK_FD']=str(ack_reader)
+        try:
+            process = launch(
+                command, cwd=execution_root, env=environment, shell=False,
+                stdin=input_stream if input_stream is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True, preexec_fn=_limits,pass_fds=(ack_reader,) if ack_reader is not None else (),
+            )
+        except BaseException:
+            if ack_writer is not None:os.close(ack_writer)
+            if input_stream is not None:input_stream.close()
+            raise
+        finally:
+            if ack_reader is not None:os.close(ack_reader)
+        try:
+            if input_stream is not None:
+                input_stream.close()
+            selector = selectors.DefaultSelector()
+            assert process.stdout is not None and process.stderr is not None
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            captured = {"stdout": bytearray(), "stderr": bytearray()}
+            truncated = {"stdout": False, "stderr": False}
+            deadline = time.monotonic() + timeout
+            timed_out = False
+            cancelled = False
+            resource_exceeded = False
+            resource_check_at = time.monotonic()
+            while selector.get_map() or process.poll() is None:
+                if cancel_requested is not None and cancel_requested():
+                    cancelled=True
+                    os.killpg(process.pid,signal.SIGKILL)
+                    break
+                if time.monotonic() >= resource_check_at:
+                    resource_check_at = time.monotonic() + 0.5
+                    files = [p for p in execution_root.rglob("*") if p.is_file() and not p.is_symlink()]
+                    if len(files) > MAX_SNAPSHOT_FILES or sum(p.stat().st_size for p in files) > MAX_SNAPSHOT_BYTES:
+                        resource_exceeded = True
+                        os.killpg(process.pid, signal.SIGKILL)
+                        break
+                if time.monotonic() >= deadline:
+                    timed_out = True
                     os.killpg(process.pid, signal.SIGKILL)
                     break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                os.killpg(process.pid, signal.SIGKILL)
-                break
-            for key, _ in selector.select(timeout=min(0.2, max(0, deadline - time.monotonic()))):
-                chunk = os.read(key.fileobj.fileno(), 65536)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                target = captured[key.data]
-                remaining = output_limit - len(target)
-                if remaining > 0:
-                    target.extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    truncated[key.data] = True
-        if timed_out or resource_exceeded:
-            process.wait(timeout=5)
-        else:
-            process.wait()
-        suffix = b"\n[output truncated by Fieldwork]" if any(truncated.values()) else b""
-        decode = lambda data: (bytes(data) + suffix).decode("utf-8", errors="replace")
-        result = IsolatedResult(
-            None if timed_out or resource_exceeded else process.returncode, decode(captured["stdout"]),
-            decode(captured["stderr"]) + ("\n[workspace disk/file limit exceeded]" if resource_exceeded else ""), "resource_limit" if resource_exceeded else ("timeout" if timed_out else "completed"), isolation,
-        )
-        if not timed_out and not resource_exceeded:
-            files = [p for p in execution_root.rglob("*") if p.is_file() and not p.is_symlink()]
-            if len(files) > MAX_SNAPSHOT_FILES or sum(p.stat().st_size for p in files) > MAX_SNAPSHOT_BYTES:
-                return IsolatedResult(None, result.stdout, result.stderr + "\n[workspace disk/file limit exceeded]", "resource_limit", isolation)
-            for relative in export_dirs:
-                if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
-                    raise ValueError("invalid isolated export path")
-                _export_directory(execution_root / relative, root / relative)
-        return result
+                for key, _ in selector.select(timeout=min(0.2, max(0, deadline - time.monotonic()))):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    target = captured[key.data]
+                    remaining = output_limit - len(target)
+                    if remaining > 0:
+                        target.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        truncated[key.data] = True
+                    if key.data=='stdout' and stdout_observer is not None:
+                        if len(chunk)>remaining:raise ValueError('observed stdout exceeded limit')
+                        acknowledgements=stdout_observer(chunk)
+                        if synthetic_tool_broker:
+                            if type(acknowledgements) is not int or not 0<=acknowledgements<=4:raise ValueError('invalid broker acknowledgement count')
+                            if acknowledgements:os.write(ack_writer,b'1'*acknowledgements)
+            if timed_out or resource_exceeded or cancelled:
+                process.wait(timeout=5)
+            else:
+                process.wait()
+            suffix = b"\n[output truncated by Fieldwork]" if any(truncated.values()) else b""
+            decode = lambda data: (bytes(data) + suffix).decode("utf-8", errors="replace")
+            result = IsolatedResult(
+                None if timed_out or resource_exceeded or cancelled else process.returncode, decode(captured["stdout"]),
+                decode(captured["stderr"]) + ("\n[workspace disk/file limit exceeded]" if resource_exceeded else ""), "resource_limit" if resource_exceeded else ("cancelled" if cancelled else ("timeout" if timed_out else "completed")), isolation,
+            )
+            exports={}
+            if not timed_out and not resource_exceeded and not cancelled:
+                files = [p for p in execution_root.rglob("*") if p.is_file() and not p.is_symlink()]
+                if len(files) > MAX_SNAPSHOT_FILES or sum(p.stat().st_size for p in files) > MAX_SNAPSHOT_BYTES:
+                    return IsolatedResult(None, result.stdout, result.stderr + "\n[workspace disk/file limit exceeded]", "resource_limit", isolation)
+                for relative in export_dirs:
+                    if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                        raise ValueError("invalid isolated export path")
+                    _export_directory(execution_root / relative, root / relative,max_bytes=export_limit_bytes)
+                    exports[relative]=(execution_root / relative).is_dir()
+            return IsolatedResult(result.returncode,result.stdout,result.stderr,result.status,result.isolation,exports)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid,signal.SIGKILL)
+                process.wait(timeout=5)
+            if ack_writer is not None:os.close(ack_writer)
+            if guarded_adapter:
+                from parent_bound_child import close_lifetime
+                close_lifetime(process)
+            if process.stdout:process.stdout.close()
+            if process.stderr:process.stderr.close()
+            if 'selector' in locals():selector.close()

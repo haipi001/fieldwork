@@ -89,7 +89,7 @@ def _location(row: sqlite3.Row) -> str:
 def _provider_view(row: sqlite3.Row) -> dict[str, Any]:
     metadata = _load(row["metadata_json"], {})
     safe_metadata = {key: metadata[key] for key in (
-        "priority", "tier", "supports_independence", "cost_micros_per_million_tokens", "max_context_tokens", "input_token_counting"
+        "priority", "tier", "supports_independence", "cost_micros_per_million_tokens", "max_context_tokens", "max_output_tokens", "input_token_counting"
     ) if key in metadata}
     return {
         "id": row["id"], "kind": row["kind"], "name": row["name"],
@@ -162,6 +162,7 @@ class ProviderMetadata(BaseModel):
     supports_independence: bool = False
     cost_micros_per_million_tokens: int = Field(default=0, ge=0, le=10_000_000_000)
     max_context_tokens: int = Field(default=32768, ge=1, le=10_000_000)
+    max_output_tokens: int = Field(default=4000, strict=True, ge=1, le=100_000)
     input_token_counting: Literal['utf8_estimate', 'llama_cpp_server'] = 'utf8_estimate'
 
 
@@ -183,6 +184,7 @@ class ProviderUpdate(BaseModel):
     api_key: str | None = Field(default=None, min_length=8, max_length=16384)
     clear_secret: bool = False
     cost_micros_per_million_tokens: int | None = Field(default=None, strict=True, ge=0, le=10_000_000_000)
+    max_output_tokens: int | None = Field(default=None, strict=True, ge=1, le=100_000)
 
 
 class ProfileConfig(BaseModel):
@@ -302,9 +304,10 @@ def update_provider(provider_id: str, body: ProviderUpdate):
     if body.enabled is not None:
         assignments.append("enabled=?")
         values.append(1 if body.enabled else 0)
-    if body.cost_micros_per_million_tokens is not None:
-        assignments.append("metadata_json=json_set(metadata_json,'$.cost_micros_per_million_tokens',?)")
-        values.append(body.cost_micros_per_million_tokens)
+    metadata_changes={key:getattr(body,key) for key in ('cost_micros_per_million_tokens','max_output_tokens') if getattr(body,key) is not None}
+    if metadata_changes:
+        assignments.append("metadata_json=json_set(metadata_json,"+','.join('?,?' for _ in metadata_changes)+")")
+        for key,value in metadata_changes.items():values.extend(['$.'+key,value])
     if body.api_key or body.clear_secret:
         assignments.append("secret_ref=?")
         values.append(None if body.clear_secret else secret_ref)

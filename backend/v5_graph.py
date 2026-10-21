@@ -736,3 +736,10 @@ def bridge_campaign(campaign_id: str):
         }
     return {"campaign_id": campaign_id, "created": {"nodes": created_nodes, "edges": created_edges},
             "totals": totals, "automatic_promotion": False, "artifacts_copied": False}
+
+
+@router.get('/engagements/{engagement_id}/runs/{run_id}/campaign-source-plan')
+def campaign_source_plan(engagement_id: str, run_id: str):
+    import campaign_materials
+    with campaign_materials.access(), _core().connect() as db:
+        return campaign_materials.public_plan(campaign_materials.plan(db,engagement_id,run_id))

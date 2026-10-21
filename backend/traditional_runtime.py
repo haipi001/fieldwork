@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import subprocess
 import socket
 import tempfile
@@ -250,17 +251,42 @@ def _record_exchange(run: dict, spec: ReplayRequest, result: dict, identity_id: 
     artifact_path = None
     artifact_bytes = None
     artifact_id = None
-    if gateway_action_id:
-        artifact_id = final_core.uid("artifact")
-        artifact_path = ARTIFACT_ROOT / f"{artifact_id}.json"
-        artifact_bytes = json.dumps({
-            "exchange_id": exchange_id, "http_status": int(result["status"]),
-            "body_sha256": result["body_sha256"], "body_bytes": int(result["body_bytes"]),
-        }, sort_keys=True, separators=(",", ":")).encode()
+    artifact_parent = None
+    artifact_created = False
+    projection = source=='guided_login_projection'
+    artifact_kind='http.exchange_metadata'
+    observation_kind='http.exchange';observation_subject='GET HTTP resource'
+    observation_summary=f"HTTP GET response status {int(result['status'])}; body bytes {int(result['body_bytes'])}"
+    observation_source='v6.run_http_read'
+    if projection:
+        from guided_capture import project_response,projection_metadata
+        current=final_core.get_engagement(run['engagement_id'])
+        checked=project_response(spec.url,current['normalized_target'],spec.method,int(result['status']),result['body_preview'].encode())
+        if not identity_id or not checked:raise HTTPException(409,'Ownership projection is not eligible for registration')
+        metadata=projection_metadata(exchange_id,run['id'],identity_id,spec.url,result)
+        artifact_kind='http.ownership_projection'
+        observation_kind='http.ownership_denial' if int(result['status']) in (401,403) else 'http.ownership_projection'
+        observation_subject=spec.url;observation_source='guided_login_projection'
+        observation_summary=final_core.dump({'identity_ref':identity_id,'http_status':int(result['status']),
+            'ownership_fingerprints':metadata['ownership_fingerprints'],'response_sha256':result['body_sha256']})
+        artifact_bytes=json.dumps(metadata,sort_keys=True,separators=(',',':')).encode()
+    elif gateway_action_id:
+        artifact_bytes=json.dumps({'exchange_id':exchange_id,'http_status':int(result['status']),
+            'body_sha256':result['body_sha256'],'body_bytes':int(result['body_bytes'])},sort_keys=True,separators=(',',':')).encode()
+    if artifact_bytes is not None:
+        artifact_id=final_core.uid('artifact')
+        artifact_path=ARTIFACT_ROOT/f"{artifact_id}.json"
     try:
         if artifact_path is not None:
             ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
-            artifact_path.write_bytes(artifact_bytes)
+            if projection:
+                from storage_migration import _open_directory,_plain_directory
+                artifact_parent=_open_directory(_plain_directory(ARTIFACT_ROOT))
+                descriptor=os.open(artifact_path.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=artifact_parent)
+                artifact_created=True
+                with os.fdopen(descriptor,'wb') as stream:stream.write(artifact_bytes);stream.flush();os.fsync(stream.fileno())
+            else:
+                artifact_path.write_bytes(artifact_bytes)
         with final_core.connect() as db:
             db.execute("INSERT INTO http_exchanges VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 exchange_id, run["id"], run["engagement_id"], identity_id,
@@ -269,25 +295,32 @@ def _record_exchange(run: dict, spec: ReplayRequest, result: dict, identity_id: 
                 final_core.dump(result["headers"]), result["body_preview"], result["body_sha256"],
                 int(result["body_bytes"]), source, parent_exchange_id, final_core.utcnow(),
             ))
-            if gateway_action_id:
+            if artifact_id:
                 db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (
-                    artifact_id, run["id"], "http.exchange_metadata", str(artifact_path),
+                    artifact_id, run["id"], artifact_kind, str(artifact_path),
                     hashlib.sha256(artifact_bytes).hexdigest(), "application/json", 1, final_core.utcnow(),
                 ))
                 observation_id = final_core.uid("obs")
                 db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
                     observation_id, run["id"], run["engagement_id"], "traditional",
-                    "http.exchange", "GET HTTP resource",
-                    f"HTTP GET response status {int(result['status'])}; body bytes {int(result['body_bytes'])}",
-                    .5, "v6.run_http_read", artifact_id, final_core.utcnow(),
+                    observation_kind, observation_subject, observation_summary,
+                    .5, observation_source, artifact_id, final_core.utcnow(),
                 ))
-                from v6_http_gateway import link_completed_reads_to_artifact
-                link_completed_reads_to_artifact(db, action_ids=[gateway_action_id],
-                                                 artifact_id=artifact_id, run_id=run["id"], response=result)
+                if projection and observation_kind=='http.ownership_denial':
+                    db.execute('INSERT INTO evidence_v2 VALUES(?,?,?,?,?,?,?,?)',
+                        (final_core.uid('evidence'),observation_id,run['id'],'http.ownership_denial',observation_summary,artifact_id,'counterevidence',final_core.utcnow()))
+                if gateway_action_id:
+                    from v6_http_gateway import link_completed_reads_to_artifact
+                    link_completed_reads_to_artifact(db, action_ids=[gateway_action_id],
+                                                     artifact_id=artifact_id, run_id=run["id"], response=result)
     except Exception:
-        if artifact_path is not None:
+        if projection:
+            if artifact_created:os.unlink(artifact_path.name,dir_fd=artifact_parent)
+        elif artifact_path is not None:
             artifact_path.unlink(missing_ok=True)
         raise
+    finally:
+        if artifact_parent is not None:os.close(artifact_parent)
     return _get_exchange(exchange_id)
 
 

@@ -106,3 +106,5 @@ textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .workflow-counts span{padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px}
 .workflow-items section{padding:16px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}
 .workflow-items h3{margin:0 0 8px;font-size:15px}.workflow-items p{margin:6px 0}
+
+#teamDraftReview summary,#teamDraftReview p{overflow-wrap:anywhere}

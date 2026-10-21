@@ -82,6 +82,46 @@ def _counterevidence_current(db, request, attributes):
     return _sha(context) == attributes.get('counterevidence_sha256', _sha([]))
 
 
+def _reviewed_selection_hash(recorded,job_fingerprint):
+    from candidate_selection import bounded_ids
+    from v5_verification import _sha
+    if recorded.get('requested_candidate_ids') is None:return None
+    requested=bounded_ids(recorded['requested_candidate_ids'])
+    selected=bounded_ids(recorded.get('reviewed_candidate_ids'))
+    if not set(selected).issubset(requested):raise ValueError('Reviewed candidates exceed requested selection')
+    return _sha({'requested':requested,'selected':selected,'job_fingerprint':job_fingerprint})
+
+
+def _batch_checkpoint_matches(recorded,candidate_id,artifact_id):
+    selected=recorded.get('reviewed_candidate_ids')
+    items=recorded.get('items')
+    total=recorded.get('requests_sent')
+    if (not isinstance(selected,list) or not 1<=len(selected)<=3 or any(not isinstance(x,str) for x in selected)
+        or len(set(selected))!=len(selected) or candidate_id not in selected or not isinstance(items,list) or len(items)>100
+        or type(total) is not int or not 10<=total<=len(selected)*10):return False
+    if recorded.get('requested_candidate_ids') is not None:
+        from candidate_selection import bounded_ids
+        try:requested=bounded_ids(recorded['requested_candidate_ids'])
+        except ValueError:return False
+        if not set(selected).issubset(requested):return False
+    seen=set();count=0;matched=False
+    for item in items:
+        if not isinstance(item,dict) or not isinstance(item.get('candidate_id'),str) or item['candidate_id'] in seen:return False
+        seen.add(item['candidate_id'])
+        checkpoint=item.get('replay_checkpoint',{})
+        if not isinstance(checkpoint,dict):return False
+        responses=checkpoint.get('completed_responses',0)
+        if type(responses) is not int or not 0<=responses<=10:return False
+        if responses and item['candidate_id'] not in selected:return False
+        count+=responses
+        if item['candidate_id']==candidate_id:
+            outcome=item.get('auto_verification',{})
+            matched=(responses==10 and checkpoint.get('state')=='responses_complete'
+                     and checkpoint.get('final_artifact_id')==artifact_id and isinstance(outcome,dict)
+                     and outcome.get('artifact_id')==artifact_id and not outcome.get('reused'))
+    return matched and count==total
+
+
 def replay_input(db, request):
     import final_core as f
     import traditional_runtime as http
@@ -110,12 +150,22 @@ def replay_input(db, request):
                 or checkpoint.get('state') not in {'responses_complete', 'failed'} or checkpoint.get('completed_responses') != 10
                 or checkpoint.get('final_artifact_id') != contract['artifact_id']):
             return None
-    elif ((recorded.get('reviewed_execution') is not True or recorded.get('requests_sent') != 10
-            or recorded.get('verification_executed') is not True) or not any(
-        item.get('candidate_id') == candidate['id'] and item.get('auto_verification', {}).get('artifact_id') == contract['artifact_id']
-        for item in recorded.get('items', [])
-    )):
-        return None
+    else:
+        if recorded.get('reviewed_execution') is not True or recorded.get('verification_executed') is not True:
+            return None
+        claim_row=db.execute('SELECT attributes_json FROM research_nodes WHERE id=?',(request['claim_node_id'],)).fetchone()
+        attrs=_load(claim_row['attributes_json'],{}) if claim_row else {}
+        if not isinstance(attrs,dict):return None
+        try:selection_hash=_reviewed_selection_hash(recorded,job['fingerprint'])
+        except ValueError:return None
+        if attrs.get('reviewed_selection_sha256')!=selection_hash:return None
+        if recorded.get('reviewed_candidate_ids') is not None:
+            if job['candidate_id'] is not None or not _batch_checkpoint_matches(recorded,candidate['id'],contract['artifact_id']):
+                return None
+        elif recorded.get('requests_sent')!=10 or not any(
+            item.get('candidate_id')==candidate['id'] and item.get('auto_verification',{}).get('artifact_id')==contract['artifact_id']
+            for item in recorded.get('items',[])):
+            return None
     artifact = db.execute("SELECT * FROM artifacts WHERE id=? AND run_id=? AND kind='http.replay'", (contract['artifact_id'], candidate['run_id'])).fetchone()
     if not artifact:
         return None
@@ -239,10 +289,15 @@ def request_for_job(job_id, candidate_id, artifact_id, *, traditional=False):
         evidence_id, _ = graph._bridge_node(db, campaign_id, source_type='http.replay', source_ref=artifact_id,
             node_type='artifact', title='Supervised two-round HTTP replay', body='Source-ref only; original redacted artifact retained.',
             status='recorded', run_id=candidate['run_id'], attributes={'artifact_id': artifact_id, 'artifact_sha256': artifact['sha256']})
+        selection_attrs={}
+        if not traditional:
+            job=db.execute('SELECT fingerprint,result FROM guided_research_jobs WHERE id=?',(job_id,)).fetchone()
+            digest=_reviewed_selection_hash(verifier._load(job['result'],{}),job['fingerprint']) if job else None
+            if digest is not None:selection_attrs['reviewed_selection_sha256']=digest
         claim_id, _ = graph._bridge_node(db, campaign_id, source_type='reviewed_http_claim', source_ref=artifact_id,
             node_type='claim', title='Selected object read violates the frozen business rule', body='Bounded claim; severity and code root cause remain unproven.',
             status='active', run_id=candidate['run_id'], attributes={'claim_kind': 'http_object_read', 'candidate_id': candidate_id,
-                'verification_contract_sha256': verifier._sha(contract), 'counterevidence_sha256': verifier._sha([]), 'producer_runner_ref': 'traditional-http-supervisor' if traditional else 'guided-http-supervisor'})
+                'verification_contract_sha256': verifier._sha(contract), 'counterevidence_sha256': verifier._sha([]), 'producer_runner_ref': 'traditional-http-supervisor' if traditional else 'guided-http-supervisor',**selection_attrs})
         graph._bridge_edge(db, campaign_id, claim_id, evidence_id, 'tested_by')
         claim = db.execute('SELECT * FROM research_nodes WHERE id=?', (claim_id,)).fetchone()
         request, task, _ = verifier._create_request_transaction(db, claim, verifier.VerifyRequest(

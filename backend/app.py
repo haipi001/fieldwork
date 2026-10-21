@@ -190,6 +190,29 @@ def init_db() -> None:
                     add_ledger_entry(db, "counterevidence_ledger", finding["id"], kind, str(content), "legacy-migration", finding["created_at"])
 
 
+async def research_resume_loop(directory):
+    """Join the exact in-flight scheduler pass before releasing app bindings."""
+    from storage_access import storage_call
+    import research_resume
+    try:
+        while True:
+            pending=asyncio.create_task(asyncio.to_thread(storage_call,directory,research_resume.scheduler_pass))
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                try:await pending
+                except Exception:pass
+                raise
+            except Exception:
+                # A failed status write must not kill future bounded passes.
+                # The last heartbeat becomes stale if storage stays unavailable.
+                pass
+            await asyncio.sleep(5)
+    finally:
+        try:await asyncio.to_thread(storage_call,directory,research_resume.mark_scheduler,'stopped')
+        except Exception:pass
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global research_mutation_lock, research_mutations_active, research_purge_active
@@ -226,9 +249,16 @@ async def lifespan(_: FastAPI):
                         mark_campaign_scheduler(last_tick_at=now(), last_processed=0, last_error=type(error).__name__)
                     await asyncio.sleep(30)
             scheduler_task = asyncio.create_task(scheduler_loop())
+        resume_task=None
+        if not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("FIELDWORK_DISABLE_RESEARCH_RESUME")!="1":
+            resume_task=asyncio.create_task(research_resume_loop(DATA.resolve()))
         try:
             yield
         finally:
+            if resume_task:
+                resume_task.cancel()
+                try:await resume_task
+                except asyncio.CancelledError:pass
             from web3_import_api import shutdown as shutdown_imports
             await shutdown_imports()
             if agent_monitor_task:

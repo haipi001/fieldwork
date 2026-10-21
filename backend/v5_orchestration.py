@@ -130,12 +130,14 @@ def _sync_runner_jobs(db: sqlite3.Connection, runner_id: str | None = None) -> N
 
 
 def recover_expired_leases(database: Any | None = None) -> dict[str, int]:
-    """Requeue expired work transactionally, or fail it after the last attempt."""
+    """Recover expired leases; model calls with possible effects require review."""
     f = _core()
     connection = sqlite3.connect(database) if database is not None else f.connect()
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("BEGIN IMMEDIATE")
+        from v5_runtime_calls import recover_calls
+        recover_calls(connection)
         expired = connection.execute(
             "SELECT * FROM agent_tasks WHERE status IN ('leased','running') "
             "AND lease_expires_at IS NOT NULL AND lease_expires_at<=?", (_now(),),
@@ -144,13 +146,22 @@ def recover_expired_leases(database: Any | None = None) -> dict[str, int]:
         for row in expired:
             status = "queued" if row["attempt"] < row["max_attempts"] else "failed"
             error = None if status == "queued" else _dump({"code": "lease_exhausted", "message": "lease expired after final attempt"})
+            call_states=[item[0] for item in connection.execute("SELECT DISTINCT state FROM runtime_calls WHERE task_id=? AND state IN ('reserved','calling','unknown','settled') ORDER BY state",(row['id'],))]
+            if call_states:
+                # Even settled usage does not prove that the draft/result committed.
+                # Never turn an interrupted model call into an automatic new attempt.
+                status='paused'
+                error=_dump({'code':'model_call_interrupted_review','call_states':call_states,
+                             'automatic_retry':False})
             connection.execute(
                 "UPDATE agent_tasks SET status=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,"
                 "error_json=?,updated_at=? WHERE id=? AND status IN ('leased','running')",
                 (status, error, _now(), row["id"]),
             )
-            counts["requeued" if status == "queued" else "failed"] += 1
-            _emit(connection, row["campaign_id"], row["id"], f"task.{status}", {"reason": "lease_expired"})
+            key="requeued" if status=="queued" else status
+            counts[key]=counts.get(key,0)+1
+            _emit(connection, row["campaign_id"], row["id"], f"task.{status}",
+                  {"reason":"lease_expired_model_call_review" if call_states else "lease_expired"})
         _sync_runner_jobs(connection)
         connection.commit()
         return counts
@@ -228,18 +239,27 @@ def _team_plan(db: sqlite3.Connection, body: TeamPlan) -> dict[str, Any]:
     if count > 100 or body.max_concurrency > count or body.max_cost_micros < count:
         raise HTTPException(422, "team size, concurrency or cost budget is invalid")
     from v5_workers import _node_digest
-    input_rows = db.execute("SELECT * FROM research_nodes WHERE campaign_id=? "
+    eligible_rows = db.execute("SELECT node_type,COUNT(*) AS n FROM research_nodes WHERE campaign_id=? AND (run_id IS NULL OR run_id=?) "
+                               "AND node_type IN ('observation','evidence','counterevidence','claim') AND status NOT IN ('archived','retired','invalidated') "
+                               "AND source_type!='team_research' GROUP BY node_type", (body.campaign_id,body.run_id)).fetchall()
+    eligible_count = sum(row['n'] for row in eligible_rows)
+    counter_count = sum(row['n'] for row in eligible_rows if row['node_type']=='counterevidence')
+    if counter_count > 20:
+        raise HTTPException(409, 'Run counterevidence exceeds the current research input limit; no team was created')
+    input_rows = db.execute("SELECT * FROM research_nodes WHERE campaign_id=? AND (run_id IS NULL OR run_id=?) "
                             "AND node_type IN ('observation','evidence','counterevidence','claim') "
                             "AND status NOT IN ('archived','retired','invalidated') "
                             "AND source_type!='team_research' "
                             "ORDER BY (node_type='counterevidence') DESC,created_at DESC,id LIMIT 20",
-                            (body.campaign_id,)).fetchall()
+                            (body.campaign_id,body.run_id)).fetchall()
     from v5_runtime import _contains_sensitive_key
     cloud_eligible = all(_load(row['attributes_json'], {}).get('sensitivity') == 'public'
                          and not _contains_sensitive_key(_load(row['attributes_json'], {})) for row in input_rows)
     if body.allow_cloud_context and (not body.runtime_profile_id or not cloud_eligible):
         raise HTTPException(409, "cloud context requires a selected profile and explicitly public graph inputs")
     plan = {
+        "research_input_selection": {"run_id":body.run_id,"eligible_count":eligible_count,"selected_count":len(input_rows),
+                                     "omitted_count":eligible_count-len(input_rows),"counterevidence_count":counter_count,"limit":20},
         "cloud_context_approved": body.allow_cloud_context,
         "research_input_hashes": {row["id"]: _node_digest(row) for row in input_rows},
         "campaign_id": body.campaign_id, "run_id": body.run_id,
@@ -582,23 +602,29 @@ def get_task(task_id: str):
 
 @router.get("/tasks")
 def list_tasks(campaign_id: str = Query(min_length=1), status: str | None = None,
+               group_id: str | None = Query(None,min_length=1,max_length=120),
                limit: int = Query(100, ge=1, le=500), cursor: str | None = Query(None, max_length=4096)):
     f = _core()
     clause, params = (" AND status=?", [campaign_id, status]) if status else ("", [campaign_id])
+    if group_id:
+        clause += " AND group_id=?";params.append(group_id)
     if cursor:
         try:
             value = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
-            if (not isinstance(value, list) or len(value) != 5 or value[:2] != [campaign_id, status]
+            if (not isinstance(value, list) or len(value) != (6 if group_id else 5) or value[:2] != [campaign_id, status]
+                    or (group_id is not None and value[5]!=group_id)
                     or type(value[2]) not in (int, float) or not math.isfinite(value[2])
                     or not isinstance(value[3], str) or not isinstance(value[4], str)):
                 raise ValueError("invalid task cursor")
-            priority, created_at, task_id = value[2:]
+            priority, created_at, task_id = value[2:5]
         except (ValueError, TypeError, OverflowError, RecursionError):
             raise HTTPException(422, "invalid cursor for this campaign/status") from None
         clause += " AND (priority<? OR (priority=? AND (created_at>? OR (created_at=? AND id>?))))"
         params.extend([priority, priority, created_at, created_at, task_id])
     params.append(limit + 1)
     with f.connect() as db:
+        if group_id and not db.execute("SELECT 1 FROM research_groups WHERE id=? AND campaign_id=?",(group_id,campaign_id)).fetchone():
+            raise HTTPException(404,"research group not found in this campaign")
         rows = db.execute(
             f"SELECT * FROM agent_tasks WHERE campaign_id=?{clause} ORDER BY priority DESC,created_at,id LIMIT ?", params,
         ).fetchall()
@@ -614,7 +640,7 @@ def list_tasks(campaign_id: str = Query(min_length=1), status: str | None = None
     if has_more:
         last = rows[-1]
         next_cursor = base64.urlsafe_b64encode(json.dumps(
-            [campaign_id, status, last["priority"], last["created_at"], last["id"]],
+            [campaign_id, status, last["priority"], last["created_at"], last["id"]]+([group_id] if group_id else []),
             separators=(",", ":"), allow_nan=False).encode()).decode()
     return {"items": [_task_value(row, usage_rows.get(row["id"]), model_times.get(row['id'])) for row in rows],
             "page": {"has_more": has_more, "next_cursor": next_cursor, "limit": limit}}

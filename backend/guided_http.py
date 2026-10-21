@@ -25,10 +25,10 @@ def ready(identity):
         return False
 
 
-def plan(candidate, exchanges, identities):
+def plan(candidate, exchanges, identities, *, allow_reproduced=False):
     if candidate['mode'] != 'traditional' or candidate['category'].lower() not in {'authorization','authentication','access_control','cwe-639','idor'}:
         return None
-    if candidate['status'] == 'reproduced':
+    if candidate['status'] == 'reproduced' and not allow_reproduced:
         return None
     target = urlsplit(candidate['target'])
     if target.scheme not in ('http','https') or target.username or target.password:

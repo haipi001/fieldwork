@@ -39,8 +39,9 @@
         ${label("API Key（可选）","API key (optional)",input("rcKey","password","minlength=8 maxlength=16384 autocomplete=new-password spellcheck=false"))}
         <div class="form-pair">${label("每百万词元费用（µ）","Cost per million tokens (µ)",number("rcRate",0,0,10000000000))}
           ${label("最大上下文词元","Maximum context tokens",number("rcContext",32768,1,10000000))}</div>
+        ${label("生成输出上限","Generation output token cap",number("rcOutput",4000,1,100000))}
         ${label("输入词元计数","Input token counting",`<select id="rcInputCounting"><option value="utf8_estimate" data-runtime-zh="保守字节预估" data-runtime-en="Conservative byte estimate">${t("保守字节预估","Conservative byte estimate")}</option><option value="llama_cpp_server" data-runtime-zh="本机 llama.cpp 服务端计数" data-runtime-en="Local llama.cpp server count">${t("本机 llama.cpp 服务端计数","Local llama.cpp server count")}</option></select>`)}
-        <p>${copy("输入先计入总额度，输出只使用剩余额度。字节预估不是精确计数；服务端计数需本机 llama.cpp 支持计数接口。","Input uses the total allowance first; generation uses the remainder. Byte estimates are not exact. Server counting requires the local llama.cpp counting endpoint.")}</p>
+        <p>${copy("实际输出上限取生成配置、总额度扣除输入及上下文剩余的最小值。字节预估不是精确计数；服务端计数需本机 llama.cpp 支持计数接口。","Generation uses the minimum of the configured output cap, tokens remaining after input, and remaining context. Byte estimates are not exact. Server counting requires the local llama.cpp counting endpoint.")}</p>
         ${check("rcIndependent","声明支持独立模型路线；独立验证仍需隔离执行与证据","Declare independent model routing support; verification still requires isolation and evidence")}
         ${check("rcProviderAccepted","确认将配置保存至本机后端","Confirm saving configuration to the local backend")}
         ${button("rcProviderSave","保存 Provider","Save provider","submit")}</form></details>
@@ -90,7 +91,7 @@
     const showMessage = (zh,en=zh) => bindings.text($("#rcMessage"),()=>t(zh,en));
     function localize() {
       panel.querySelectorAll("[data-runtime-zh]").forEach(node=>node.textContent=t(node.dataset.runtimeZh,node.dataset.runtimeEn));
-      bindings.apply(); renderProviders(); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();renderEvidence();renderIncident();renderReconciliations();
+      bindings.apply(); renderProviders({preserveEdits:true}); renderRoutes(); renderCalls(); renderSummary();renderEvals();renderDecisions();renderEvidence();renderIncident();renderReconciliations();
     }
     async function send(url, body, method="POST") {
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
@@ -118,8 +119,11 @@
       const prior=new Set([...$(selector).querySelectorAll("input:checked")].map(node=>node.value));
       $(selector).innerHTML=values.map(item=>`<label class="check-line"><input type="checkbox" value="${esc(item.id)}" ${prior.has(item.id)?"checked":""}>${esc(item.name)} · ${esc(item.model)} · ${esc(item.last_health)}</label>`).join("") || `<p>${t("尚无对应 Provider","No matching providers")}</p>`;
     }
-    function renderProviders() {
-      $("#rcProviderActions").innerHTML=providers.map(item=>`<div class="runtime-provider-action"><span><b>${esc(item.name)}</b> · ${esc(item.model)} · ${esc(item.location)} · ${esc(item.last_health)}<small class="cell-subline">${esc(item.base_url)} · ${esc(item.last_health_at||"–")}</small>${item.location==="cloud"&&!(item.metadata?.cost_micros_per_million_tokens>0)?`<small class="cell-subline">${t("尚未设置费用上界，云研究无法启动。","Cloud research cannot start until a positive cost bound is configured.")}</small>`:""}</span><label>${t("每百万词元费用上界（µ）","Cost bound per million tokens (µ)")}<input type="number" min="0" max="10000000000" step="1" data-rc-rate="${esc(item.id)}" value="${esc(item.metadata?.cost_micros_per_million_tokens??0)}"></label><button type="button" data-rc-rate-save="${esc(item.id)}">${t("保存费用上界","Save cost bound")}</button><button type="button" data-rc-health="${esc(item.id)}">${t("检查连接","Check connection")}</button><button type="button" data-rc-toggle="${esc(item.id)}">${item.enabled?t("禁用","Disable"):t("启用","Enable")}</button></div>`).join("");
+    function renderProviders({preserveEdits=false}={}) {
+      const editKey=node=>(node.hasAttribute('data-rc-rate')?'rate:':'output:')+(node.dataset.rcRate||node.dataset.rcOutput);
+      const edits=preserveEdits?new Map([...panel.querySelectorAll('[data-rc-rate],[data-rc-output]')].map(node=>[editKey(node),node.value])):new Map();
+      $("#rcProviderActions").innerHTML=providers.map(item=>`<div class="runtime-provider-action"><span><b>${esc(item.name)}</b> · ${esc(item.model)} · ${esc(item.location)} · ${esc(item.last_health)}<small class="cell-subline">${esc(item.base_url)} · ${esc(item.last_health_at||"–")}</small>${item.location==="cloud"&&!(item.metadata?.cost_micros_per_million_tokens>0)?`<small class="cell-subline">${t("尚未设置费用上界，云研究无法启动。","Cloud research cannot start until a positive cost bound is configured.")}</small>`:""}</span><label>${t("每百万词元费用上界（µ）","Cost bound per million tokens (µ)")}<input type="number" min="0" max="10000000000" step="1" data-rc-rate="${esc(item.id)}" value="${esc(item.metadata?.cost_micros_per_million_tokens??0)}"></label><label>${t("生成输出上限","Generation output token cap")}<input type="number" min="1" max="100000" step="1" data-rc-output="${esc(item.id)}" value="${esc(item.metadata?.max_output_tokens??4000)}"></label><button type="button" data-rc-output-save="${esc(item.id)}">${t("保存输出上限","Save output cap")}</button><button type="button" data-rc-rate-save="${esc(item.id)}">${t("保存费用上界","Save cost bound")}</button><button type="button" data-rc-health="${esc(item.id)}">${t("检查连接","Check connection")}</button><button type="button" data-rc-toggle="${esc(item.id)}">${item.enabled?t("禁用","Disable"):t("启用","Enable")}</button></div>`).join("");
+      panel.querySelectorAll('[data-rc-rate],[data-rc-output]').forEach(node=>{if(edits.has(editKey(node)))node.value=edits.get(editKey(node))});
       panel.querySelectorAll("[data-rc-rate-save]").forEach(node=>node.onclick=()=>{
         const provider=providers.find(item=>item.id===node.dataset.rcRateSave);
         const field=[...panel.querySelectorAll("[data-rc-rate]")].find(item=>item.dataset.rcRate===provider?.id);
@@ -128,6 +132,14 @@
         if(!field.value||!Number.isSafeInteger(rate)||rate<0)return;
         if(!window.confirm(t("保存费用上界？引用旧配置的 Profile 将失效，需要创建新版本。此数值用于保守预算估算，不是服务账单。","Save this cost bound? Profiles bound to the old configuration will become stale and require a new version. This value is a conservative estimate, not a service invoice.")))return;
         mutate(async()=>{await send(`/api/v1/runtime/providers/${encodeURIComponent(provider.id)}`,{cost_micros_per_million_tokens:rate},"PATCH");await refresh();showMessage("费用上界已保存，请创建并选择新的 Profile 版本。","Cost bound saved. Create and select a new profile version.");offerNext("创建新 Profile 版本","Create new profile version",()=>openProfile(provider))},node);
+      });
+      panel.querySelectorAll("[data-rc-output-save]").forEach(node=>node.onclick=()=>{
+        const provider=providers.find(item=>item.id===node.dataset.rcOutputSave);
+        const field=[...panel.querySelectorAll("[data-rc-output]")].find(item=>item.dataset.rcOutput===provider?.id);
+        if(!provider||!field||!field.reportValidity())return;
+        const cap=Number(field.value);if(!field.value||!Number.isSafeInteger(cap)||cap<1||cap>100000)return;
+        if(!window.confirm(t("保存输出上限？实际生成仍受任务总额度和上下文剩余限制。旧Profile将失效，请创建新版本。","Save the output cap? Generation remains bounded by total task tokens and remaining context. Old profiles become stale; create a new version.")))return;
+        mutate(async()=>{await send(`/api/v1/runtime/providers/${encodeURIComponent(provider.id)}`,{max_output_tokens:cap},"PATCH");await refresh();showMessage("输出上限已保存，请创建并选择新的 Profile 版本。","Output cap saved. Create and select a new profile version.");offerNext("创建新 Profile 版本","Create new profile version",()=>openProfile(provider))},node);
       });
       panel.querySelectorAll("[data-rc-health]").forEach(node=>node.onclick=()=>{
         const provider=providers.find(item=>item.id===node.dataset.rcHealth);
@@ -290,7 +302,7 @@
     $("#rcProviderForm").onsubmit=event=>{
       event.preventDefault();if(!$("#rcProviderAccepted").checked)return;
       const body={name:$("#rcProviderName").value.trim(),location:$("#rcLocation").value,kind:$("#rcKind").value,base_url:$("#rcBase").value.trim(),model:$("#rcModel").value.trim(),api_key:$("#rcKey").value||null,
-        metadata:{supports_independence:$("#rcIndependent").checked,cost_micros_per_million_tokens:Number($("#rcRate").value),max_context_tokens:Number($("#rcContext").value),input_token_counting:$("#rcInputCounting").value}};
+        metadata:{supports_independence:$("#rcIndependent").checked,cost_micros_per_million_tokens:Number($("#rcRate").value),max_context_tokens:Number($("#rcContext").value),input_token_counting:$("#rcInputCounting").value,max_output_tokens:Number($("#rcOutput").value)}};
       mutate(async()=>{try{const saved=await send("/api/v1/runtime/providers",body);event.target.reset();await refresh();showMessage("Provider 已保存；请显式检查连接。","Provider saved. Explicitly check its connection.");offerNext("检查刚保存的模型连接","Check the saved model connection",()=>{const control=[...panel.querySelectorAll("[data-rc-health]")].find(node=>node.dataset.rcHealth===saved.id);if(control)control.click()})}finally{$("#rcKey").value="";body.api_key=null}},$("#rcProviderSave"));
     };
     $("#rcProfileForm").onsubmit=event=>{

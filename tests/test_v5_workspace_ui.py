@@ -203,6 +203,8 @@ def test_running_dispatcher_observes_changed_concurrency(client,monkeypatch):
             db.execute("UPDATE agent_tasks SET status='completed',lease_owner=NULL WHERE id=?",(task['id'],))
     monkeypatch.setattr(worker,'_execute',execute)
     worker._stopping.clear()
+    with f.connect() as db:
+        db.execute('INSERT INTO app_metadata VALUES(?,?,?)',('research-execution:'+group['id'],f.dump({'state':'running','runner_id':worker.RUNNER_ID}),f.utcnow()))
     with ThreadPoolExecutor(max_workers=1) as executor:
         job=executor.submit(worker._run_group,group['id'],1)
         try:
@@ -412,6 +414,8 @@ def test_research_executor_drain_finishes_inflight_without_starting_second(clien
         with f.connect() as db:
             db.execute("UPDATE agent_tasks SET status='completed',lease_owner=NULL WHERE id=?",(task['id'],))
     monkeypatch.setattr(worker,'_execute',execute);worker._stopping.clear()
+    with f.connect() as db:
+        db.execute('INSERT INTO app_metadata VALUES(?,?,?)',('research-execution:'+group['id'],f.dump({'state':'running','runner_id':worker.RUNNER_ID}),f.utcnow()))
     with ThreadPoolExecutor(max_workers=1) as executor:
         job=executor.submit(worker._run_group,group['id'],1)
         try:

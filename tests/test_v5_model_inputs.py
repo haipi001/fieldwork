@@ -9,8 +9,8 @@ from tests.test_final import client
 from tests.test_v5_research_worker import team, create, wait_group
 
 
-@pytest.mark.parametrize('count', [10, 10000, True])
-def test_server_count_limits_generation_before_dispatch(client, count):
+@pytest.mark.parametrize('count,total,cap', [(10,1000,None),(10000,1000,None),(True,1000,None),(10,20000,9000)])
+def test_server_count_limits_generation_before_dispatch(client, count,total,cap):
     calls = []
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -32,13 +32,17 @@ def test_server_count_limits_generation_before_dispatch(client, count):
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     try:
         campaign, body = team(client, count=1)
-        body['max_tokens_per_task'] = 1000
+        body['max_tokens_per_task'] = total
         with final_core.connect() as db:
             now = final_core.utcnow()
             db.execute('INSERT INTO runtime_providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', (
                 'counted-model', 'llama_cpp', 'Count protocol fixture', f'http://127.0.0.1:{server.server_port}',
-                'fixture', None, 1, '{"location":"local","input_token_counting":"llama_cpp_server"}',
+                'fixture', None, 1, json.dumps({'location':'local','input_token_counting':'llama_cpp_server'}|({'max_output_tokens':cap} if cap is not None else {})),
                 'healthy', now, now, now))
+        if cap is not None:
+            configured=client.put('/api/v1/runtime/config',json={'name':'Output cap protocol','mode':'offline','config':{'local_provider_ids':['counted-model'],'max_tokens_per_call':total,'max_tokens_per_hour':total}})
+            assert configured.status_code==201,configured.text
+            body['runtime_profile_id']=configured.json()['id']
         group = create(client, body)
         assert client.post(f'/api/v1/workers/research/groups/{group}/start').status_code == 202
         wait_group(group)
@@ -48,11 +52,11 @@ def test_server_count_limits_generation_before_dispatch(client, count):
             if type(count) is int and count == 10:
                 assert tasks[0]['status'] == 'succeeded'
                 assert len(calls) == 2 and calls[1][0] == '/v1/chat/completions'
-                assert calls[1][1]['max_tokens'] == 990
+                assert calls[1][1]['max_tokens'] == (cap or 990)
                 assert calls[0][1]['messages'] == calls[1][1]['messages']
                 recorded = client.get('/api/v1/runtime/calls', params={'campaign_id': campaign['id']}).json()['items'][0]
                 assert recorded['input_counting'] == 'llama_cpp_server'
-                assert recorded['preflight_input_tokens'] == 10 and recorded['output_max_tokens'] == 990
+                assert recorded['preflight_input_tokens'] == 10 and recorded['output_max_tokens'] == (cap or 990)
                 preflight = db.execute('SELECT * FROM runtime_call_inputs').fetchone()
                 assert preflight['strategy'] == 'llama_cpp_server' and preflight['input_tokens'] == 10
                 with pytest.raises(sqlite3.IntegrityError, match='immutable'):
@@ -94,3 +98,38 @@ def test_counting_contract_rejects_other_provider_types(client, location, kind, 
         'location':location,'kind':kind,'base_url':base,'model':'fixture',
         'metadata':{'input_token_counting':'llama_cpp_server'}})
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize('cap,total,context,expected',[(None,20000,32768,4000),(9000,20000,32768,9000),(9000,1000,32768,None),(9000,20000,1000,None)])
+def test_configured_output_cap_stays_within_total_and_context(cap,total,context,expected):
+    from v5_model_inputs import input_plan
+    metadata={'max_context_tokens':context}
+    if cap is not None:metadata['max_output_tokens']=cap
+    row={'model':'fixture','metadata_json':json.dumps(metadata)}
+    result=input_plan(row,[{'role':'user','content':'bounded fixture'}],total)
+    assert result['output_max_tokens']==(expected if expected is not None else min(total,context)-result['input_tokens'])
+    assert result['input_tokens']+result['output_max_tokens']<=min(total,context)
+
+
+@pytest.mark.parametrize('value',[True,0,-1,100001,'8000'])
+def test_invalid_output_cap_never_dispatches(value):
+    from v5_model_inputs import input_plan
+    with pytest.raises(ValueError,match='output token cap'):
+        input_plan({'model':'fixture','metadata_json':json.dumps({'max_output_tokens':value})},[{'role':'user','content':'bounded'}],20000)
+
+
+def test_output_cap_patch_preserves_cost_and_invalidates_bound_profile(client):
+    from tests.test_v5_runtime import provider,profile
+    source=provider(client,'output-cap','local')
+    frozen=profile(client,'offline',local=[source['id']])
+    assert source['metadata']['max_output_tokens']==4000
+    changed=client.patch('/api/v1/runtime/providers/'+source['id'],json={'max_output_tokens':12000,'cost_micros_per_million_tokens':1200000})
+    assert changed.status_code==200,changed.text
+    value=changed.json()
+    assert value['metadata']['max_output_tokens']==12000 and value['metadata']['cost_micros_per_million_tokens']==1200000
+    assert value['metadata']['priority']==source['metadata']['priority'] and value['model']==source['model']
+    assert value['configuration_sha256']!=source['configuration_sha256']
+    profile_row=next(row for row in client.get('/api/v1/runtime/config').json()['profiles'] if row['id']==frozen['id'])
+    assert profile_row['provider_configuration_status']=='stale'
+    assert client.patch('/api/v1/runtime/providers/'+source['id'],json={'max_output_tokens':True}).status_code==422
+    with final_core.connect() as db:assert db.execute('SELECT count(*) FROM runtime_calls').fetchone()[0]==0

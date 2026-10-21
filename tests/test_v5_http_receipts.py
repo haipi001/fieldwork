@@ -272,3 +272,27 @@ def test_modified_receipt_derived_counterevidence_invalidates_negative_receipt(c
     current = client.get('/api/v1/verification/receipts/' + proof['receipt_id']).json()
     assert current['result']['classification'] == 'repaired_negative'
     assert not current['integrity']['current_inputs_match'] and not current['integrity']['promotion_eligible']
+
+
+@pytest.mark.parametrize('fixed,expected',[(False,'verified'),(True,'refuted')])
+def test_ordinary_replay_can_continue_to_reviewed_isolated_receipt(client,monkeypatch,controlled_server,fixed,expected):
+    fixture,state=controlled_server
+    run,candidate,project,calls=prepared_live_candidate(client,monkeypatch,fixture)
+    state['fixed']=fixed
+    ordinary=wait(client,client.post(f'/api/v1/runs/{run}/guided-research',json={'candidate_id':candidate['id'],'execute_ready':True}).json())
+    assert ordinary['result']['reviewed_execution'] is False
+    assert len(calls)==13
+    path=workflow_path(run,candidate)
+    plan=client.get(path+'/execution-plan').json()
+    assert plan['can_execute'],plan['blockers']
+    job=wait(client,client.post(path+'/execute',json={'authorized':True,'source_fingerprint':plan['source_fingerprint']}).json())
+    outcome=job['result']['items'][0]['auto_verification']
+    assert not outcome.get('reused')
+    proof=outcome['independent_verification']
+    assert proof.get('receipt_id'),job
+    receipt=client.get('/api/v1/verification/receipts/'+proof['receipt_id']).json()
+    assert receipt['result']['status']==expected
+    assert len(calls)==23
+    assert receipt['environment']['process_isolation']['network_denied'] is True
+    with core.connect() as db:
+        assert db.execute('SELECT count(*) FROM canonical_findings').fetchone()[0]==0

@@ -168,10 +168,10 @@ def _worker(login_url: str, allowed_hosts_json: str, max_requests_text: str, opt
             try:
                 headers=response.headers
                 length=int(headers.get('content-length','0'))
-                if not 0<length<=65536 or 'application/json' not in headers.get('content-type',''):return
+                if 'content-length' not in headers or not 0<=length<=65536 or 'application/json' not in headers.get('content-type',''):return
                 from guided_capture import project_response
                 value=project_response(response.url,options.get('target_url') or login_url,response.request.method,response.status,response.body())
-                if value and not any(x['url']==value['url'] and x['sha256']==value['sha256'] for x in responses):responses.append(value)
+                if value and not any(x['url']==value['url'] and x['sha256']==value['sha256'] and x.get('status',200)==value['status'] for x in responses):responses.append(value)
             except Exception:
                 pass
         pending_responses=[]
@@ -179,7 +179,7 @@ def _worker(login_url: str, allowed_hosts_json: str, max_requests_text: str, opt
             if not options.get('run_id') or len(pending_responses)>=100:return
             try:
                 headers=response.headers
-                if response.request.method=='GET' and response.status==200 and 'application/json' in headers.get('content-type','') and 0<int(headers.get('content-length','0'))<=65536:
+                if response.request.method=='GET' and response.status in (200,401,403) and 'application/json' in headers.get('content-type','') and 'content-length' in headers and 0<=int(headers['content-length'])<=65536:
                     pending_responses.append(response)
             except Exception:
                 pass
